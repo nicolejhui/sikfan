@@ -1,0 +1,28 @@
+cat > .gitignore << 'EOF'
+# Data
+data/CNFOOD-241/
+data/dishes/
+data/embeddings/
+data/debug_crops/
+data/unlabeled/
+data/macro_cache/
+data/glucose/
+data/*.jpeg
+data/*.jpg
+
+# Model weights
+*.pt
+*.pkl
+
+# Runtime / logs
+*.jsonl
+__pycache__/
+*.pyc
+.DS_Store
+
+# Local config
+.claude/settings.local.json
+
+# Plans
+plans/
+EOF

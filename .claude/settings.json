@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(conda run -n carb_counter python scripts/label_images.py --help)",
+      "Bash(conda run -n carb_counter python -c \"import matplotlib; print\\(matplotlib.__version__\\)\")"
+    ]
+  }
+}

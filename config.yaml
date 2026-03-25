@@ -1,0 +1,5 @@
+segmentation:
+  min_area_pct: 0.015      # starting point; tune down if missing small ingredients
+  max_aspect_ratio: 4.0
+  nms_iou_threshold: 0.4
+  max_crops: 20
