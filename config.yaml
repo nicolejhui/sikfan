@@ -3,3 +3,32 @@ segmentation:
   max_aspect_ratio: 4.0
   nms_iou_threshold: 0.4
   max_crops: 20
+
+component_detection:
+  kmeans_k: 4                    # color palette size for complexity heuristic — tune against real photos
+  kmeans_min_clusters: 3         # >= this many large clusters = mixed bowl candidate
+  large_crop_threshold: 0.25     # mask_pixels / image_pixels threshold for size signal
+  role_confidence_threshold: 0.5 # CLIP score below this = UNCERTAIN for any role
+  role_prompts:
+    base:
+      # universal prompts (commented out for diagnostic run)
+      # - cooked white rice
+      # - cooked grain or brown rice
+      # - noodles or pasta
+      # - porridge or congee
+      - white rice
+      - brown rice
+      - purple rice
+      - noodles
+      - congee
+      - no grain base visible    # sentinel: role excluded from output if top-1
+    protein:
+    - beef
+    - pork
+    - chicken
+    - tofu
+    - no protein visible
+    vegetable:
+      - bok choy
+      - green vegetables
+      - no vegetables visible

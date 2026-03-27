@@ -160,6 +160,7 @@ def segment_meal(
             "crop": Image.fromarray(crop_array),
             "bbox": (xmin, ymin, xmax, ymax),
             "mask_pixels": mask_pixels,
+            "image_pixels": h * w,
         })
 
     crops = _apply_filters(
@@ -180,6 +181,7 @@ def segment_meal(
             "crop": Image.fromarray(image),
             "bbox": (0, 0, w, h),
             "mask_pixels": h * w,
+            "image_pixels": h * w,
         }]
 
     return crops

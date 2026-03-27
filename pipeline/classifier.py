@@ -5,17 +5,51 @@ Classifies food crop images by querying the ChromaDB embedding store.
 No hardcoded class lists. Dish names come exclusively from ChromaDB query results.
 
 Public API:
+    is_food_crop(image, device="mps") -> bool
     classify_crop(image, store, top_k=3)  -> list[dict]
     classify_batch(images, store, top_k=3) -> list[list[dict]]
 """
 
 from __future__ import annotations
 
+import clip
+import torch
 from PIL import Image
 
-from pipeline.embedding_store import EmbeddingStore
+from pipeline.embedding_store import EmbeddingStore, _get_clip
 
 _UNKNOWN = [{"dish_name": "unknown", "score": 0.0}]
+
+_FOOD_PROMPT = "a photo of food"
+_NONFOOD_PROMPT = "a photo of a table, utensil, or background object"
+
+
+def is_food_crop(image: Image.Image, device: str = "mps") -> bool:
+    """
+    Return True if CLIP scores the image higher as food than as background.
+
+    Uses two text prompts and discards the crop if the non-food prompt wins.
+
+    Args:
+        image:  PIL.Image crop.
+        device: Torch device for CLIP inference (default "mps").
+
+    Returns:
+        True if the crop is likely food, False if likely background/utensil.
+    """
+    model, preprocess = _get_clip(device)
+    image_tensor = preprocess(image.convert("RGB")).unsqueeze(0).to(device)
+    text_tokens = clip.tokenize([_FOOD_PROMPT, _NONFOOD_PROMPT]).to(device)
+
+    with torch.no_grad():
+        image_features = model.encode_image(image_tensor)
+        text_features = model.encode_text(text_tokens)
+
+    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+    text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+    sims = (image_features @ text_features.T).squeeze(0)
+    return bool(sims[0] >= sims[1])
 
 
 def classify_crop(

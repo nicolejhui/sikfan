@@ -25,4 +25,7 @@ __pycache__/
 
 # Plans
 plans/
+
+# Classifier / pipeline outputs
+outputs/
 EOF

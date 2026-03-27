@@ -55,22 +55,40 @@ No fixed class lists. Dishes are added dynamically via user confirmation.
 Before implementing any ticket, save the plan to plans/{TICKET-ID}-plan.md
 Always add a decision log and include proposed approaches, what was rejected and why.
 
-## Current Sprint
-Sprint 3 — Embedding Store (FOOD-007, FOOD-008, FOOD-006)
-
 ## Completed
 - Sprint 1: FOOD-001, FOOD-002, FOOD-003
-- Sprint 2: FOOD-004, FOOD-005
+- Sprint 2: FOOD-004, FOOD-005, FOOD-005b
+- Sprint 3: FOOD-007, FOOD-008, FOOD-006
 
-## Up Next After Sprint 3
-- FOOD-005b (component detection skeleton — Part 1 only, no CLIP)
-  - Build complexity detection heuristic (k-means color clustering)
-  - Build large crop threshold check
-  - Output schema with empty components list (dish_name: None, status: pending_clip)
-  - Do NOT wire to ChromaDB or CLIP yet
+## Current Sprint
+Sprint 4 — Confidence & Feedback (FOOD-009, FOOD-010)
 
-## FOOD-005 Notes
-- NMS IoU tuned to 0.4
-- Center-bias scoring added
-- steamed_bun_stuffed correctly returns 16 crops (genuine separate items)
-- Remaining noise handled by CLIP semantic filter in FOOD-006
+## Pipeline State (as of FOOD-005b)
+- Top-1 accuracy: 73.7% on 38 dishes (FOOD-006 standalone test)
+- Full pipeline accuracy lower due to mixed_bowl routing — 
+  8-10 single dishes incorrectly flagged as mixed_bowl and 
+  never reaching classify_crop()
+- Known confusion pairs: red sauce meats, white dough items, 
+  chili oil dishes — see FOOD-011 for systematic report
+- hot_pot and japanese_curry centroids built from 1 image each 
+  — weak embeddings, expect low confidence on these
+
+## Known Pipeline Limitations (do not fix before FOOD-015)
+- Mixed_bowl false positives on large single dishes 
+  (mapo_tofu, rice, scrambled_egg_with_tomato etc.)
+  → Accepted risk: safer than false negatives for T1D app
+  → Will surface as component confirmation in mobile app
+- Fragment crops on close-up professional photos
+  → CLIP semantic filter in FOOD-009 will partially mitigate
+- spicy_pot: all crops discarded by food/not-food filter
+  → Needs more seed images or filter threshold adjustment
+
+## FOOD-009 Context
+- Start thresholds: CONFIDENT >= 0.82, UNCERTAIN 0.65-0.82, 
+  UNKNOWN < 0.65 (defaults from ticket)
+- Real data suggests CONFIDENT threshold may need to be 
+  higher (~0.87) based on confusion pair scores
+- Kimchi not in training data — will correctly surface as UNKNOWN
+- All mixed_bowl components hardcoded to UNCERTAIN regardless 
+  of score — this is intentional for T1D safety
+- Use planning mode before implementing
