@@ -32,3 +32,9 @@ component_detection:
       - bok choy
       - green vegetables
       - no vegetables visible
+
+thresholds:
+  confident: 0.82        # score >= this -> CONFIDENT
+  uncertain: 0.65        # score >= this AND < confident -> UNCERTAIN
+                         # score < uncertain -> UNKNOWN
+  review_queue_path: data/review_queue.jsonl

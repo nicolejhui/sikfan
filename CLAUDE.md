@@ -92,3 +92,6 @@ Sprint 4 — Confidence & Feedback (FOOD-009, FOOD-010)
 - All mixed_bowl components hardcoded to UNCERTAIN regardless 
   of score — this is intentional for T1D safety
 - Use planning mode before implementing
+- 1.7% fragment crops consistently returning false CONFIDENT
+  → Systematic pattern observed across multiple real meal photos
+  → Accepted for now, FOOD-016 LLM fallback long term fix

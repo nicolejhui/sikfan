@@ -1,5 +1,6 @@
 """
 FOOD-006: Open-vocabulary CLIP classifier.
+FOOD-009: Confidence thresholding and unknown detection.
 
 Classifies food crop images by querying the ChromaDB embedding store.
 No hardcoded class lists. Dish names come exclusively from ChromaDB query results.
@@ -8,6 +9,7 @@ Public API:
     is_food_crop(image, device="mps") -> bool
     classify_crop(image, store, top_k=3)  -> list[dict]
     classify_batch(images, store, top_k=3) -> list[list[dict]]
+    apply_threshold(results, thresholds=None, queue_path=None, image_id=None) -> dict
 """
 
 from __future__ import annotations
@@ -22,6 +24,32 @@ _UNKNOWN = [{"dish_name": "unknown", "score": 0.0}]
 
 _FOOD_PROMPT = "a photo of food"
 _NONFOOD_PROMPT = "a photo of a table, utensil, or background object"
+
+# ---------------------------------------------------------------------------
+# FOOD-009: Confidence thresholding helpers
+# ---------------------------------------------------------------------------
+
+_thresholds_cache: dict | None = None
+
+
+def _load_thresholds(config_path: str = "config.yaml") -> dict:
+    global _thresholds_cache
+    if _thresholds_cache is None:
+        import yaml
+        with open(config_path) as f:
+            _thresholds_cache = yaml.safe_load(f)["thresholds"]
+    return _thresholds_cache
+
+
+def _log_to_review_queue(entry: dict, queue_path: str) -> None:
+    import json
+    import os
+    try:
+        os.makedirs(os.path.dirname(queue_path) or ".", exist_ok=True)
+        with open(queue_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass  # logging failure must never block a prediction
 
 
 def is_food_crop(image: Image.Image, device: str = "mps") -> bool:
@@ -109,3 +137,63 @@ def classify_batch(
         else:
             output.append([{"dish_name": r["dish_name"], "score": r["score"]} for r in raw])
     return output
+
+
+def apply_threshold(
+    results: list[dict],
+    thresholds: dict | None = None,
+    queue_path: str | None = None,
+    image_id: str | None = None,
+) -> dict:
+    """
+    Apply confidence thresholds to classify_crop() output.
+
+    Args:
+        results:    Output of classify_crop() — list of {"dish_name", "score"} dicts.
+        thresholds: Optional override dict with keys "confident", "uncertain",
+                    "review_queue_path". If None, loaded from config.yaml singleton.
+        queue_path: Override path for review_queue.jsonl (used in tests).
+        image_id:   Optional identifier logged to review queue for traceability.
+
+    Returns:
+        {
+            "dish_name": str,       # top-1 dish name
+            "confidence": float,    # top-1 score
+            "status": str,          # "CONFIDENT" | "UNCERTAIN" | "UNKNOWN"
+            "candidates": list,     # full top-k from classify_crop() — always present
+        }
+    """
+    import datetime
+
+    cfg = thresholds if thresholds is not None else _load_thresholds()
+    score = results[0]["score"]
+    dish = results[0]["dish_name"]
+
+    if score >= cfg["confident"]:
+        status = "CONFIDENT"
+    elif score >= cfg["uncertain"]:
+        status = "UNCERTAIN"
+    else:
+        status = "UNKNOWN"
+
+    if status in ("UNCERTAIN", "UNKNOWN"):
+        entry = {
+            "timestamp": datetime.datetime.utcnow().isoformat(),
+            "status": status,
+            "dish_name": dish,
+            "confidence": round(score, 4),
+            "candidates": results,
+        }
+        if image_id is not None:
+            entry["image_id"] = image_id
+        _log_to_review_queue(
+            entry,
+            queue_path or cfg.get("review_queue_path", "data/review_queue.jsonl"),
+        )
+
+    return {
+        "dish_name": dish,
+        "confidence": round(score, 4),
+        "status": status,
+        "candidates": results,
+    }
