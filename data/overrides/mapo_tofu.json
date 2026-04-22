@@ -1,0 +1,11 @@
+{
+  "dish_name": "mapo_tofu",
+  "source": "user_override",
+  "reference_weight_g": 100.0,
+  "calories": 150,
+  "carbs_g": 10,
+  "fiber_g": 2,
+  "protein_g": 12,
+  "fat_g": 8,
+  "saved_at": "2026-04-22T03:32:26Z"
+}

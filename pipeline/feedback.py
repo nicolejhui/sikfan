@@ -42,6 +42,14 @@ class FeedbackAction(str, enum.Enum):
     ADD_NEW = "ADD_NEW"   # user types a new dish name
 
 
+def normalize_dish_name(name: str) -> str:
+    """Canonical dish name normalizer shared across the pipeline.
+
+    "Mapo Tofu" → "mapo_tofu", "beef_stew" → "beef_stew"
+    """
+    return name.strip().lower().replace(" ", "_")
+
+
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
@@ -159,8 +167,8 @@ def record_feedback(
                     normalized original_prediction.
     """
     # Normalize labels: "Mapo Tofu" -> "mapo_tofu"
-    dish_name = corrected_label.strip().lower().replace(" ", "_")
-    orig_norm = original_prediction.strip().lower().replace(" ", "_")
+    dish_name = normalize_dish_name(corrected_label)
+    orig_norm = normalize_dish_name(original_prediction)
 
     if action == FeedbackAction.CONFIRM and dish_name != orig_norm:
         raise ValueError(

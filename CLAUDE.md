@@ -59,11 +59,23 @@ Always add a decision log and include proposed approaches, what was rejected and
 - Sprint 1: FOOD-001, FOOD-002, FOOD-003
 - Sprint 2: FOOD-004, FOOD-005, FOOD-005b
 - Sprint 3: FOOD-007, FOOD-008, FOOD-006
+- Sprint 4: FOOD-009, FOOD-010
 
 ## Current Sprint
-Sprint 4 — Confidence & Feedback (FOOD-009, FOOD-010)
+Sprint 5 — Nutrition (FOOD-012, FOOD-013, FOOD-014)
 
-## Pipeline State (as of FOOD-005b)
+## Feedback loop validated (2026-04-15)
+- dried_tofu_sticks: ADD_NEW, UNCERTAIN → CONFIDENT after 3 confirmations
+- braised_beef_noodle: CONFIRM, confidence 0.8519 → 0.9325 after 3 confirmations
+- Both correction_log.jsonl and data/dishes/ enrichment working correctly
+
+## FOOD-012 Notes
+- _PINYIN_FALLBACK hardcoded lookup table in macro_lookup.py
+- Brittle — only covers explicitly listed dishes
+- Long term: replace with smarter query expansion or LLM-generated 
+  search terms (pairs naturally with FOOD-016 LLM fallback)
+  
+<!-- ## Pipeline State (as of FOOD-005b)
 - Top-1 accuracy: 73.7% on 38 dishes (FOOD-006 standalone test)
 - Full pipeline accuracy lower due to mixed_bowl routing — 
   8-10 single dishes incorrectly flagged as mixed_bowl and 
@@ -94,4 +106,4 @@ Sprint 4 — Confidence & Feedback (FOOD-009, FOOD-010)
 - Use planning mode before implementing
 - 1.7% fragment crops consistently returning false CONFIDENT
   → Systematic pattern observed across multiple real meal photos
-  → Accepted for now, FOOD-016 LLM fallback long term fix
+  → Accepted for now, FOOD-016 LLM fallback long term fix -->

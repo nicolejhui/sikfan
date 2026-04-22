@@ -22,6 +22,7 @@ __pycache__/
 
 # Local config
 .claude/settings.local.json
+.env
 
 # Plans
 plans/

@@ -33,6 +33,10 @@ component_detection:
       - green vegetables
       - no vegetables visible
 
+usda:
+  api_key: PLACEHOLDER   # replace with your key from https://fdc.nal.usda.gov/api-guide.html
+                         # or set USDA_API_KEY env var — this file value is the last fallback
+
 thresholds:
   confident: 0.82        # score >= this -> CONFIDENT
   uncertain: 0.65        # score >= this AND < confident -> UNCERTAIN
