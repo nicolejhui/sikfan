@@ -37,6 +37,36 @@ usda:
   api_key: PLACEHOLDER   # replace with your key from https://fdc.nal.usda.gov/api-guide.html
                          # or set USDA_API_KEY env var — this file value is the last fallback
 
+portion_defaults:
+  bucket_thresholds:
+    small_max: 0.15    # ratio < this → small
+    medium_max: 0.35   # ratio < this → medium, else large
+  bowl_total:          # total gram base for mixed-bowl crops
+    small: 300
+    medium: 500
+    large: 700
+  role_weights:        # used to split bowl_total across components
+    base: 2.0          # grain/carb dominates bowl volume
+    protein: 1.0
+    vegetable: 1.0
+    default: 1.0
+  grain:               # per-100g reference: rice, noodles, congee
+    small: 100
+    medium: 180
+    large: 280
+  protein:             # beef, pork, chicken, tofu, fish, egg
+    small: 80
+    medium: 150
+    large: 220
+  vegetable:           # bok choy, spinach, broccoli
+    small: 60
+    medium: 120
+    large: 180
+  default:             # sauces, unknowns, misc
+    small: 90
+    medium: 160
+    large: 240
+
 thresholds:
   confident: 0.82        # score >= this -> CONFIDENT
   uncertain: 0.65        # score >= this AND < confident -> UNCERTAIN
