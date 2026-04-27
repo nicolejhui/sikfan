@@ -18,7 +18,8 @@ CARB-COUNTER/
 ├── .claude/
 │   └── hooks.json    ← new
 ├── CLAUDE.md
-├── TICKETS.md
+├── TICKETS-v2.md
+├── GLUCOSE-TICKETS.md
 ...
 
 ## Project Structure
@@ -60,9 +61,10 @@ Always add a decision log and include proposed approaches, what was rejected and
 - Sprint 2: FOOD-004, FOOD-005, FOOD-005b
 - Sprint 3: FOOD-007, FOOD-008, FOOD-006
 - Sprint 4: FOOD-009, FOOD-010
+- Sprint 5: Nutrition (FOOD-012, FOOD-013, FOOD-014)
+- Sprint 6: QA and E2E pipeline (FOOD-011, FOOD-015)
 
 ## Current Sprint
-Sprint 5 — Nutrition (FOOD-012, FOOD-013, FOOD-014)
 
 ## Feedback loop validated (2026-04-15)
 - dried_tofu_sticks: ADD_NEW, UNCERTAIN → CONFIDENT after 3 confirmations
@@ -75,6 +77,10 @@ Sprint 5 — Nutrition (FOOD-012, FOOD-013, FOOD-014)
 - Long term: replace with smarter query expansion or LLM-generated 
   search terms (pairs naturally with FOOD-016 LLM fallback)
   
+## usage
+Limit your reads to only CLAUDE.md and TICKETS-v2.md and GLUCOSE-TICKETS.md do not read anything else without asking me
+
+
 <!-- ## Pipeline State (as of FOOD-005b)
 - Top-1 accuracy: 73.7% on 38 dishes (FOOD-006 standalone test)
 - Full pipeline accuracy lower due to mixed_bowl routing — 
