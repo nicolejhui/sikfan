@@ -192,6 +192,97 @@ def test_all_nonfood_crops_sentinel(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Tiebreak tests
+# ---------------------------------------------------------------------------
+
+def _make_mock_crop(mask_pixels: int):
+    """Minimal crop_dict matching segment_meal() schema."""
+    from PIL import Image as PILImage
+    return {
+        "crop": PILImage.new("RGB", (64, 64)),
+        "bbox": (0, 0, 64, 64),
+        "mask_pixels": mask_pixels,
+        "image_pixels": 640 * 640,
+    }
+
+
+def test_confident_conflict_size_tiebreak(monkeypatch):
+    """
+    Two CONFIDENT crops with scores within 0.05 of each other → largest mask wins.
+    Mirrors Image 2 from FOOD-009 live tests (mapo_tofu 10.4% vs boiled_chicken 1.7%).
+    """
+    large_crop = _make_mock_crop(50000)
+    small_crop  = _make_mock_crop(3000)
+
+    monkeypatch.setattr(am_module, "segment_meal", lambda path: [large_crop, small_crop])
+    monkeypatch.setattr(am_module, "is_food_crop", lambda image, device="mps": True)
+    monkeypatch.setattr(
+        am_module, "classify_components",
+        lambda crop_dict, device="mps": {"crop_type": "single_dish", "crop": crop_dict["crop"]},
+    )
+    # classify_batch returns results paired with the two crops in order
+    monkeypatch.setattr(
+        am_module, "classify_batch",
+        lambda images, store, top_k=3: [
+            [{"dish_name": "mapo_tofu",     "score": 0.8413}],  # large crop
+            [{"dish_name": "boiled_chicken","score": 0.8309}],  # small crop — gap 0.010 < 0.05
+        ],
+    )
+    monkeypatch.setattr(
+        am_module, "estimate_portion",
+        lambda comp_result, dish_name, config_path="config.yaml": {
+            "macros_scaled": None, "portion_bucket": "medium",
+        },
+    )
+
+    result = analyze_meal(_BREAKFAST)
+    items = result["detected_items"]
+
+    assert len(items) == 1, f"Expected 1 item after tiebreak, got {len(items)}: {items}"
+    assert items[0]["dish_name"] == "mapo_tofu", (
+        f"Expected mapo_tofu (largest crop) to win, got {items[0]['dish_name']}"
+    )
+    assert "_mask_pixels" not in items[0], "Scratch field _mask_pixels must be stripped"
+
+
+def test_confident_conflict_score_wins_outside_band(monkeypatch):
+    """
+    Two CONFIDENT crops with score gap > 0.05 → highest score wins regardless of size.
+    """
+    large_crop = _make_mock_crop(50000)
+    small_crop  = _make_mock_crop(3000)
+
+    monkeypatch.setattr(am_module, "segment_meal", lambda path: [large_crop, small_crop])
+    monkeypatch.setattr(am_module, "is_food_crop", lambda image, device="mps": True)
+    monkeypatch.setattr(
+        am_module, "classify_components",
+        lambda crop_dict, device="mps": {"crop_type": "single_dish", "crop": crop_dict["crop"]},
+    )
+    monkeypatch.setattr(
+        am_module, "classify_batch",
+        lambda images, store, top_k=3: [
+            [{"dish_name": "mapo_tofu",     "score": 0.83}],   # large — gap 0.07 > 0.05
+            [{"dish_name": "boiled_chicken","score": 0.90}],   # small — higher score wins
+        ],
+    )
+    monkeypatch.setattr(
+        am_module, "estimate_portion",
+        lambda comp_result, dish_name, config_path="config.yaml": {
+            "macros_scaled": None, "portion_bucket": "medium",
+        },
+    )
+
+    result = analyze_meal(_BREAKFAST)
+    items = result["detected_items"]
+
+    assert len(items) == 1, f"Expected 1 item after tiebreak, got {len(items)}: {items}"
+    assert items[0]["dish_name"] == "boiled_chicken", (
+        f"Expected boiled_chicken (score gap > 0.05) to win, got {items[0]['dish_name']}"
+    )
+    assert "_mask_pixels" not in items[0], "Scratch field _mask_pixels must be stripped"
+
+
+# ---------------------------------------------------------------------------
 # Timing test
 # ---------------------------------------------------------------------------
 

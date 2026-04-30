@@ -9,6 +9,14 @@ data/macro_cache/
 data/glucose/
 data/*.jpeg
 data/*.jpg
+data/dxcm csv files/
+data/meals
+data/glucose
+data/models/
+data/dxcm_csv_files
+       
+data/embedding_health_report.md
+        
 
 # Model weights
 *.pt
@@ -30,3 +38,5 @@ plans/
 # Classifier / pipeline outputs
 outputs/
 EOF
+debug_results/
+batch_test.py
