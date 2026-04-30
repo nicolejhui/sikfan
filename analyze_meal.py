@@ -63,6 +63,38 @@ def _aggregate_macros(detected_items: list[dict]) -> dict:
     }
 
 
+_TIEBREAK_BAND = 0.05
+
+
+def _tiebreak_confident(candidates: list[dict]) -> list[dict]:
+    """
+    Among multiple CONFIDENT single_dish crops, keep one winner using a score-band
+    + size rule. Non-CONFIDENT crops pass through unchanged alongside the winner.
+
+    Rule:
+      1. Find the max confidence score among CONFIDENT crops.
+      2. All CONFIDENT crops within _TIEBREAK_BAND of that max are "score-peers".
+      3. Among peers, keep the one with the largest _mask_pixels value.
+      4. If exactly one CONFIDENT crop exceeds the band (gap > _TIEBREAK_BAND), it wins.
+
+    The _mask_pixels scratch field is stripped from all returned dicts before returning.
+    If there is 0 or 1 CONFIDENT crop, returns candidates unchanged (minus scratch field).
+    """
+    confident = [c for c in candidates if c["status"] == "CONFIDENT"]
+    rest = [c for c in candidates if c["status"] != "CONFIDENT"]
+
+    if len(confident) <= 1:
+        winner = confident
+    else:
+        max_score = max(c["confidence"] for c in confident)
+        peers = [c for c in confident if max_score - c["confidence"] <= _TIEBREAK_BAND]
+        winner = [max(peers, key=lambda c: c["_mask_pixels"])]
+
+    for item in winner + rest:
+        item.pop("_mask_pixels", None)
+    return winner + rest
+
+
 def _build_review_items(detected_items: list[dict]) -> list[dict]:
     """
     Scan assembled detected_items and return all entries that need user review.
@@ -172,7 +204,7 @@ def analyze_meal(
     # Step 2: Filter non-food and classify each crop as single_dish or
     #         mixed_bowl. Collect into separate lists for batch efficiency.
     # ------------------------------------------------------------------
-    single_dish_results: list[dict] = []   # classify_components() outputs
+    single_dish_results: list[tuple[dict, dict]] = []  # (comp_result, raw_crop_dict)
     mixed_bowl_results: list[dict] = []    # classify_components() outputs
 
     for crop_dict in raw_crops:
@@ -182,7 +214,7 @@ def analyze_meal(
         comp_result = classify_components(crop_dict, device=store._device)
 
         if comp_result["crop_type"] == "single_dish":
-            single_dish_results.append(comp_result)
+            single_dish_results.append((comp_result, crop_dict))
         elif comp_result["crop_type"] == "mixed_bowl":
             # Skip degenerate mixed results with no components at all
             # (all CLIP sentinels fired — nothing detected in the bowl)
@@ -195,10 +227,11 @@ def analyze_meal(
     # Step 3: Single-dish path — one batch GPU pass for all crops
     # ------------------------------------------------------------------
     if single_dish_results:
-        images = [r["crop"] for r in single_dish_results]
+        images = [r["crop"] for r, _ in single_dish_results]
         batch_classifications = classify_batch(images, store, top_k=3)
 
-        for comp_result, clf_results in zip(single_dish_results, batch_classifications):
+        single_dish_candidates: list[dict] = []
+        for (comp_result, crop_dict), clf_results in zip(single_dish_results, batch_classifications):
             threshold = apply_threshold(clf_results)
             dish_name = threshold["dish_name"]
             portion = estimate_portion(
@@ -206,14 +239,17 @@ def analyze_meal(
                 dish_name,
                 config_path=config_path,
             )
-            detected_items.append({
-                "crop_type":  "single_dish",
-                "dish_name":  dish_name,
-                "confidence": threshold["confidence"],
-                "status":     threshold["status"],
-                "macros":     portion["macros_scaled"],
-                "portion":    portion["portion_bucket"],
+            single_dish_candidates.append({
+                "crop_type":   "single_dish",
+                "dish_name":   dish_name,
+                "confidence":  threshold["confidence"],
+                "status":      threshold["status"],
+                "macros":      portion["macros_scaled"],
+                "portion":     portion["portion_bucket"],
+                "_mask_pixels": crop_dict["mask_pixels"],  # scratch field for tiebreak
             })
+
+        detected_items.extend(_tiebreak_confident(single_dish_candidates))
 
     # ------------------------------------------------------------------
     # Step 4: Mixed-bowl path — estimate portions per component
