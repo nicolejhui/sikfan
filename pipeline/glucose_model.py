@@ -332,6 +332,52 @@ def predict_glucose_curve(meal_macros: dict, pre_meal_glucose: int,
     ]
 
 
+def classify_glucose_outcome(curve: list[dict], pre_meal_glucose: int) -> dict:
+    """
+    Translate a GPR-predicted BG curve into a UI classification label.
+
+    Args:
+        curve: list of {'minutes': int, 'predicted_bg': float, ...} dicts
+               (output of predict_glucose_curve())
+        pre_meal_glucose: pre-meal BG reading in mg/dL
+
+    Returns:
+    {
+        "label": "spike" | "steady" | "drop",
+        "predicted_peak_bg": float,
+        "delta_from_baseline": float    # + for spike, - for drop
+    }
+
+    Thresholds (from config.yaml):
+        spike: predicted_peak > pre_meal_glucose + spike_threshold_mgdl
+        drop:  predicted_peak < pre_meal_glucose - drop_threshold_mgdl
+        steady: everything in between
+    """
+    import yaml
+    _config_path = Path(__file__).parent.parent / "config.yaml"
+    with open(_config_path) as f:
+        cfg = yaml.safe_load(f)
+    thresholds = cfg["glucose_classification"]
+    spike_threshold = thresholds["spike_threshold_mgdl"]
+    drop_threshold = thresholds["drop_threshold_mgdl"]
+
+    peak_bg = max(curve, key=lambda p: abs(p["predicted_bg"] - pre_meal_glucose))["predicted_bg"]
+    delta = peak_bg - pre_meal_glucose
+
+    if delta > spike_threshold:
+        label = "spike"
+    elif delta < -drop_threshold:
+        label = "drop"
+    else:
+        label = "steady"
+
+    return {
+        "label": label,
+        "predicted_peak_bg": round(peak_bg, 1),
+        "delta_from_baseline": round(delta, 1),
+    }
+
+
 def should_retrain() -> bool:
     """Return True if 10+ new confirmed meals have been added since last training."""
     if not _META_PATH.exists():

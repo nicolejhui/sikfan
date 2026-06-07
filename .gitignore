@@ -16,7 +16,9 @@ data/models/
 data/dxcm_csv_files
        
 data/embedding_health_report.md
-        
+analyze_Meal_ debug_results/
+data/pipeline_runs/
+pipeline/run_full_pipeline.py        
 
 # Model weights
 *.pt

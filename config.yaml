@@ -67,6 +67,10 @@ portion_defaults:
     medium: 160
     large: 240
 
+glucose_classification:
+  spike_threshold_mgdl: 40    # predicted peak delta above pre-meal BG → spike
+  drop_threshold_mgdl: 20     # predicted peak delta below pre-meal BG → drop
+
 thresholds:
   confident: 0.82        # score >= this -> CONFIDENT
   uncertain: 0.65        # score >= this AND < confident -> UNCERTAIN

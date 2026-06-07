@@ -9,11 +9,19 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pipeline.glucose_model import predict_glucose_curve
+from pipeline.glucose_model import classify_glucose_outcome, predict_glucose_curve
 from pipeline.glucose_model import should_retrain as _model_should_retrain
 from pipeline.glucose_overlay import generate_overlay
 from pipeline.glucose_store import get_meal_logs, get_pre_meal_glucose
 from pipeline.meal_tracker import attach_cgm_window
+
+class MealNotFoundError(Exception):
+    """Raised when meal_id is not found in meal_logs.json."""
+
+
+class MissingCGMDataError(Exception):
+    """Raised when no pre-meal glucose source is available for the meal."""
+
 
 _METADATA_FILE = Path(__file__).parent / "data" / "models" / "training_metadata.json"
 _MODEL_PATH = Path(__file__).parent / "data" / "models" / "glucose_model.joblib"
@@ -105,7 +113,7 @@ def _get_pre_meal_state(meal: dict) -> tuple[int, str]:
     if readings:
         return int(readings[0]["glucose_mgdl"]), meal.get("pre_meal_trend", "flat")
 
-    raise ValueError(f"No pre-meal glucose available for {meal['meal_id']}")
+    raise MissingCGMDataError(f"No pre-meal glucose available for {meal['meal_id']}")
 
 
 def _extract_macros(meal: dict) -> dict:
@@ -180,7 +188,7 @@ def analyze_glucose(meal_id: str) -> dict:
     meals = get_meal_logs()
     meal = next((m for m in meals if m["meal_id"] == meal_id), None)
     if meal is None:
-        raise ValueError(f"meal_id '{meal_id}' not found in meal_logs.json")
+        raise MealNotFoundError(f"meal_id '{meal_id}' not found in meal_logs.json")
 
     # --- Cold-start guard ---
     if not _MODEL_PATH.exists():
@@ -208,11 +216,15 @@ def analyze_glucose(meal_id: str) -> dict:
     curve = predict_glucose_curve(macros, pre_glucose, pre_trend)
 
     peak_point = max(curve, key=lambda p: p["predicted_bg"])
+    model_confidence = _model_confidence()
+    outcome = classify_glucose_outcome(curve, pre_glucose)
+    outcome["confidence"] = model_confidence
     prediction = {
         "curve": curve,
         "predicted_peak_bg": float(peak_point["predicted_bg"]),
         "predicted_time_to_peak_minutes": int(peak_point["minutes"]),
-        "model_confidence": _model_confidence(),
+        "model_confidence": model_confidence,
+        "outcome": outcome,
     }
 
     # --- Actuals (only when CGM window is complete) ---

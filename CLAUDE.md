@@ -65,6 +65,48 @@ Always add a decision log and include proposed approaches, what was rejected and
 - Sprint 6: QA and E2E pipeline (FOOD-011, FOOD-015)
 
 ## Current Sprint
+Epic 8 — Local API Layer (FastAPI wrapper around analyze_meal + analyze_glucose)
+
+## Frozen API Schemas (do not change without versioning)
+
+### analyze_meal(image_path) → dict
+Stable since FOOD-015. See TICKETS-v2.md for full schema.
+
+### analyze_glucose(meal_id) → dict
+Stable since GLUC-009. Full shape:
+```
+{
+    "meal_id": str,
+    "meal_timestamp": str,
+    "dishes": list,
+    "total_carbs_g": float,
+    "pre_meal_glucose": int,
+    "pre_meal_trend": str,
+    "prediction": {
+        "curve": [{"minutes": int, "predicted_bg": float,
+                   "confidence_lower": float, "confidence_upper": float}],
+        "predicted_peak_bg": float,
+        "predicted_time_to_peak_minutes": int,
+        "model_confidence": "high" | "medium" | "low",
+        "outcome": {
+            "label": "spike" | "steady" | "drop",
+            "confidence": "high" | "medium" | "low",
+            "predicted_peak_bg": float,
+            "delta_from_baseline": float
+        }
+    },
+    "actuals": None | {
+        "curve": [{"minutes": int, "glucose_mgdl": int, "timestamp": str}],
+        "actual_peak_bg": float,
+        "time_to_peak_minutes": int,
+        "tir_ratio": float,
+        "mard": float,
+        "chart_path": str
+    },
+    "retrain_triggered": bool
+}
+```
+Schema changes after GLUC-009 require incrementing the API version in Epic 8.
 
 ## Feedback loop validated (2026-04-15)
 - dried_tofu_sticks: ADD_NEW, UNCERTAIN → CONFIDENT after 3 confirmations
