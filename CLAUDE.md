@@ -1,4 +1,4 @@
-# GlycoLens - Carb Counter
+# SikFan - Carb Counter
 
 ## Environment
 <!-- - Conda env: carb_counter

@@ -15,6 +15,9 @@ from ultralytics import FastSAM
 
 _fastsam_model = None
 
+# Auto-detect device: MPS on Apple Silicon, CPU elsewhere (e.g. Fly.io Linux)
+_DEVICE: str = "mps" if torch.backends.mps.is_available() else "cpu"
+
 # Defaults — mirrors config.yaml segmentation section
 _MIN_AREA_PCT = 0.015
 _MAX_ASPECT_RATIO = 4.0
@@ -126,7 +129,7 @@ def segment_meal(
         Returns an empty list if no regions pass the filters.
     """
     model = _get_model(model_path)
-    results = model(image_path, device="mps", retina_masks=True, imgsz=1024, conf=0.4, iou=0.9)
+    results = model(image_path, device=_DEVICE, retina_masks=True, imgsz=1024, conf=0.4, iou=0.9)
 
     if results[0].masks is None:
         if verbose:

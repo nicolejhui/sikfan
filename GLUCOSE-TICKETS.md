@@ -1,4 +1,4 @@
-# GlycoLens — Blood Glucose Pipeline Engineering Tickets
+# SikFan — Blood Glucose Pipeline Engineering Tickets
 
 > These tickets cover the personal glucose response model and post-meal tracking overlay.
 > They are intentionally scoped to work WITHOUT live Dexcom API integration at this stage.

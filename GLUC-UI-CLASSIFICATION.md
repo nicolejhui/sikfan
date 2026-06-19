@@ -1,4 +1,4 @@
-# GlycoLens — Glucose UI Classification Layer
+# SikFan — Glucose UI Classification Layer
 
 > **Context:** These changes are required before starting App Epics (Epic 8+).
 > They add a UI-facing classification ("spike" / "steady" / "drop") on top of

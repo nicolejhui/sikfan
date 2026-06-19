@@ -21,6 +21,9 @@ from torchvision import transforms as _T
 _COLLECTION_NAME = "dishes"
 _EMBEDDINGS_DIR = "data/embeddings"
 
+# Auto-detect device: MPS on Apple Silicon, CPU elsewhere (e.g. Fly.io Linux)
+_DEVICE: str = "mps" if torch.backends.mps.is_available() else "cpu"
+
 # Lazy singletons
 _clip_model = None
 _clip_preprocess = None
@@ -53,7 +56,7 @@ _CLIP_NORMALIZE = _T.Normalize(
 _TO_TENSOR = _T.ToTensor()
 
 
-def _get_clip(device: str = "mps"):
+def _get_clip(device: str = _DEVICE):
     global _clip_model, _clip_preprocess
     if _clip_model is None:
         _clip_model, _clip_preprocess = clip.load("ViT-B/32", device=device)
@@ -75,7 +78,7 @@ def _get_collection(embeddings_dir: str = _EMBEDDINGS_DIR) -> chromadb.Collectio
 
 def _encode_image(
     image: Union[Image.Image, str],
-    device: str = "mps",
+    device: str = _DEVICE,
 ) -> list[float]:
     """Return a unit-norm CLIP ViT-B/32 embedding as a plain Python list."""
     model, preprocess = _get_clip(device)
@@ -105,7 +108,7 @@ class EmbeddingStore:
     def __init__(
         self,
         embeddings_dir: str = _EMBEDDINGS_DIR,
-        device: str = "mps",
+        device: str = _DEVICE,
     ):
         self._embeddings_dir = embeddings_dir
         self._device = device

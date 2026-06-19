@@ -1,4 +1,4 @@
-# GlycoLens — App & Integration Epics (Phase 3)
+# SikFan — App & Integration Epics (Phase 3)
 
 > These epics cover building the mobile app and integrating the food detection
 > and glucose models built in Phase 1 (FOOD-001–015) and Phase 2 (GLUC-001–006).
@@ -49,7 +49,7 @@ any mobile app work begins.
 ## Epic 9 — Mobile App (iOS)
 
 **Goal**
-Build the iOS app that is the user-facing layer of GlycoLens. Camera capture,
+Build the iOS app that is the user-facing layer of SikFan. Camera capture,
 macro display, BG prediction curve, and the confirmation/correction feedback UI.
 
 **Recommended Stack: React Native**

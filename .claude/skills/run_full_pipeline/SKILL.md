@@ -1,4 +1,4 @@
-# Skill: Run Full GlycoLens Pipeline
+# Skill: Run Full SikFan Pipeline
 
 Execute the full image processing and metabolic analysis pipeline on an unlabeled meal photo.
 

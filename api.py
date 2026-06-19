@@ -1,5 +1,5 @@
 """
-GlycoLens FastAPI server — Epic 8 API Layer.
+SikFan FastAPI server — Epic 8 API Layer.
 
 Run:  uvicorn api:app --port 8000
 Docs: http://localhost:8000/docs
@@ -15,11 +15,12 @@ import shutil
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from PIL import Image
 from pydantic import BaseModel
 
@@ -47,6 +48,37 @@ def _cleanup_old_crops(days: int = 7) -> None:
             shutil.rmtree(meal_dir, ignore_errors=True)
 
 
+def _sweep_old_meal_images(days: int = 7) -> None:
+    """Delete data/meals/{meal_id}/ for unlogged meals older than TTL days.
+
+    Only logged meals are retained long-term. Unconfirmed uploads from
+    analysis sessions that were never logged are cleaned up after 7 days.
+    """
+    meals_dir = Path("data/meals")
+    if not meals_dir.exists():
+        return
+
+    # Collect meal_ids that have been logged.
+    logged_ids: set[str] = set()
+    if _MEAL_LOGS_PATH.exists():
+        text = _MEAL_LOGS_PATH.read_text().strip()
+        if text:
+            try:
+                logged_ids = {entry["meal_id"] for entry in json.loads(text)}
+            except Exception:
+                pass
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    for meal_dir in meals_dir.iterdir():
+        if not meal_dir.is_dir():
+            continue
+        if meal_dir.name in logged_ids:
+            continue
+        mtime = datetime.fromtimestamp(meal_dir.stat().st_mtime, tz=timezone.utc)
+        if mtime < cutoff:
+            shutil.rmtree(meal_dir, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # Module-level state (set once at startup, read-only thereafter)
 # ---------------------------------------------------------------------------
@@ -70,16 +102,19 @@ async def lifespan(app: FastAPI):
     Path("data/uploads").mkdir(parents=True, exist_ok=True)
     Path("data/job_status").mkdir(parents=True, exist_ok=True)
     Path("data/crops").mkdir(parents=True, exist_ok=True)
+    Path("data/meals").mkdir(parents=True, exist_ok=True)
 
     # Sweep crop directories older than 7 days (meals never confirmed).
     _cleanup_old_crops(days=7)
+    # Sweep meal image directories older than 7 days for unlogged meals.
+    _sweep_old_meal_images(days=7)
 
     # Step 1+2: FastSAM + CLIP.
     # Kept in one block — if either fails the server is degraded and cannot
     # run meal analysis, so models_loaded covers both.
     try:
         _get_model()          # loads FastSAM-s.pt → pipeline.segmentation singleton
-        _get_clip("mps")      # loads CLIP ViT-B/32 → pipeline.embedding_store singleton
+        _get_clip()           # loads CLIP ViT-B/32 → pipeline.embedding_store singleton (device auto-detected)
         _models_loaded = True
     except Exception:
         pass  # health will return 503 with models_loaded: false
@@ -94,7 +129,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="GlycoLens", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="SikFan", version="1.0.0", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +186,7 @@ class MealResult(BaseModel):
     meal_id: str
     dishes: list[DishResult]
     total_carbs_g: float
+    image_url: str | None = None  # "/meal-image/{meal_id}"; None for pre-API-009 status files
 
 
 class JobStatusResponse(BaseModel):
@@ -229,6 +265,7 @@ class GlucoseResponse(BaseModel):
     prediction: GlucosePrediction
     actuals: GlucoseActuals | None
     retrain_triggered: bool
+    image_url: str  # "/meal-image/{meal_id}"
 
 
 # --- POST /confirm-dish ---
@@ -338,6 +375,7 @@ def _run_analysis(meal_id: str, image_path: Path, status_path: Path) -> None:
             "meal_id": meal_id,
             "dishes": dish_results,
             "total_carbs_g": result["total_macros"].get("carbs_g", 0.0),
+            "image_url": f"/meal-image/{meal_id}",
         }
         status_data["status"] = "complete"
         status_data["completed_at"] = datetime.now(timezone.utc).isoformat()
@@ -381,8 +419,14 @@ async def analyze_meal_route(background_tasks: BackgroundTasks, file: UploadFile
     image_path = Path("data/uploads") / f"{meal_id}.jpg"
     status_path = Path("data/job_status") / f"{meal_id}.json"
 
-    # Save upload before returning — route handler owns this write
-    image_path.write_bytes(await file.read())
+    # Read once, write to both locations before returning.
+    image_bytes = await file.read()
+    image_path.write_bytes(image_bytes)
+
+    # Persist original for GET /meal-image/{meal_id} (survives on Fly.io volume).
+    meal_dir = Path("data/meals") / meal_id
+    meal_dir.mkdir(parents=True, exist_ok=True)
+    (meal_dir / "original.jpg").write_bytes(image_bytes)
 
     # Write initial job status (pending, logged: false)
     _write_job_status(status_path, {
@@ -412,10 +456,17 @@ _MEAL_LOGS_PATH = Path("data/glucose/meal_logs.json")
 
 
 def _append_meal_log(entry: dict) -> None:
-    """Append a single meal log entry as a JSONL line (O(1), append-only)."""
+    """Append a meal log entry to meal_logs.json (JSON array, compatible with glucose_store.py)."""
     _MEAL_LOGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(_MEAL_LOGS_PATH, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    existing: list = []
+    if _MEAL_LOGS_PATH.exists():
+        text = _MEAL_LOGS_PATH.read_text().strip()
+        if text:
+            existing = json.loads(text)
+    existing.append(entry)
+    tmp = _MEAL_LOGS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(existing))
+    os.replace(tmp, _MEAL_LOGS_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -512,6 +563,11 @@ def get_glucose(meal_id: str):
                 "message": "No CGM reading found near this meal time. Enter a manual pre-meal BG to enable glucose prediction.",
             },
         )
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "glucose_model_not_ready", "message": str(exc)},
+        )
     except Exception:
         raise HTTPException(
             status_code=503,
@@ -538,6 +594,7 @@ def get_glucose(meal_id: str):
         prediction=GlucosePrediction(**result["prediction"]),
         actuals=actuals,
         retrain_triggered=result["retrain_triggered"],
+        image_url=f"/meal-image/{result['meal_id']}",
     )
 
 
@@ -636,7 +693,12 @@ def confirm_dish(body: ConfirmDishRequest):
 
     chromadb_updated: bool
 
-    if crop_path.exists():
+    # UNKNOWN dishes have no ChromaDB entry — record_feedback/_apply_gate would crash.
+    # For CONFIRM on UNKNOWN, skip the centroid update and fall through to the
+    # metadata-only path below. CORRECT/ADD_NEW are unaffected (they create new entries).
+    dish_is_unknown = dish_entry.get("status") == "UNKNOWN" and action == FeedbackAction.CONFIRM
+
+    if crop_path.exists() and not dish_is_unknown:
         # Full feedback loop: centroid update + correction log via record_feedback().
         crop_img = Image.open(crop_path).convert("RGB")
         record_feedback(
@@ -682,3 +744,19 @@ def confirm_dish(body: ConfirmDishRequest):
         updated_label=updated_label,
         chromadb_updated=chromadb_updated,
     )
+
+
+# ---------------------------------------------------------------------------
+# API-009 route
+# ---------------------------------------------------------------------------
+
+@app.get("/meal-image/{meal_id}", dependencies=[Depends(verify_api_key)])
+async def get_meal_image(meal_id: str):
+    """Return the original meal photo for a given meal_id."""
+    image_path = Path("data/meals") / meal_id / "original.jpg"
+    if not image_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "meal_not_found", "message": "No image found for this meal ID."},
+        )
+    return FileResponse(image_path, media_type="image/jpeg")

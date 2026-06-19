@@ -18,7 +18,7 @@ import clip
 import torch
 from PIL import Image
 
-from pipeline.embedding_store import EmbeddingStore, _get_clip
+from pipeline.embedding_store import EmbeddingStore, _DEVICE, _get_clip
 
 _UNKNOWN = [{"dish_name": "unknown", "score": 0.0}]
 
@@ -52,7 +52,7 @@ def _log_to_review_queue(entry: dict, queue_path: str) -> None:
         pass  # logging failure must never block a prediction
 
 
-def is_food_crop(image: Image.Image, device: str = "mps") -> bool:
+def is_food_crop(image: Image.Image, device: str = _DEVICE) -> bool:
     """
     Return True if CLIP scores the image higher as food than as background.
 

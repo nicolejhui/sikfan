@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Meal bootstrapping tool for GlycoLens glucose training data.
+Meal bootstrapping tool for SikFan glucose training data.
 
 Usage:
     python scripts/log_meals.py
@@ -247,7 +247,7 @@ def main():
     )
     unprocessed = [p for p in all_images if p.name not in processed]
 
-    print("\nGlycoLens — Meal Bootstrap Tool")
+    print("\nSikFan — Meal Bootstrap Tool")
     print("=" * 40)
     print(f"CGM readings loaded : {len(_load_json(CGM_FILE))}")
     print(f"Existing meal logs  : {len(meal_logs)}")

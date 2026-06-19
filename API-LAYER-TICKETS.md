@@ -762,13 +762,13 @@ Containerize the FastAPI app and configure Fly.io for deployment. Produce all de
 config files and the two ChromaDB management scripts. No actual deploy yet — that is API-008.
 
 ### Acceptance Criteria
-- [ ] `Dockerfile` builds successfully (`docker build -t glycolens-api .`)
+- [ ] `Dockerfile` builds successfully (`docker build -t sikfan-api .`)
 - [ ] `Dockerfile` uses `python:3.11-slim`, installs `requirements-api.txt`, copies project files
 - [ ] `fly.toml` configures: app name, region sjc, internal port 8080, health check on `/health`
-- [ ] `fly.toml` has `[[mounts]]` section active, mounting `glycolens_data` volume at `/app/data`
+- [ ] `fly.toml` has `[[mounts]]` section active, mounting `sikfan_data` volume at `/app/data`
 - [ ] `fly.toml` sets `min_machines_running = 1` (keep warm — model load is slow)
 - [ ] `API_KEY` secret documented as required (set via `fly secrets set API_KEY=<value>`)
-- [ ] Local docker run works: `docker run -p 8000:8080 -e API_KEY=testkey glycolens-api`
+- [ ] Local docker run works: `docker run -p 8000:8080 -e API_KEY=testkey sikfan-api`
 - [ ] `GET /health` returns 200 inside the container
 - [ ] `scripts/predeploy.sh` exists, prints ChromaDB count, writes `deploy_snapshot/embeddings/`, exits non-zero if `data/embeddings/` is absent
 - [ ] `scripts/sync_from_fly.sh` exists, pulls live container ChromaDB, verifies count > 0 before swapping, exits non-zero if pull is empty
@@ -804,7 +804,7 @@ CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8080"]
 
 ### fly.toml
 ```toml
-app = "glycolens-api"
+app = "sikfan-api"
 primary_region = "sjc"
 
 [build]
@@ -821,7 +821,7 @@ primary_region = "sjc"
     timeout = "5s"
 
 [[mounts]]
-  source = "glycolens_data"
+  source = "sikfan_data"
   destination = "/app/data"
 
 [env]
@@ -922,8 +922,8 @@ echo "Run 'bash scripts/predeploy.sh && fly deploy' to ship it."
 ### Deploy workflow
 ```bash
 # First deploy — create the persistent volume before deploying
-fly volumes create glycolens_data --region sjc --size 1
-fly launch --name glycolens-api --region sjc --no-deploy
+fly volumes create sikfan_data --region sjc --size 1
+fly launch --name sikfan-api --region sjc --no-deploy
 fly secrets set API_KEY=$(openssl rand -hex 32)
 bash scripts/predeploy.sh
 fly deploy
@@ -934,7 +934,7 @@ put -r deploy_snapshot/embeddings /app/data/embeddings
 EOF
 
 # Verify seed succeeded — chromadb_ready must be true before proceeding
-curl -s https://glycolens-api.fly.dev/health | python3 -c "
+curl -s https://sikfan-api.fly.dev/health | python3 -c "
 import sys, json
 h = json.load(sys.stdin)
 assert h['chromadb_ready'], 'ChromaDB seed failed — check volume and retry sftp'
@@ -957,7 +957,7 @@ bash scripts/sync_from_fly.sh && bash scripts/predeploy.sh && fly deploy
 
 ### Fly.io notes
 - `fly secrets set API_KEY=<value>` — run once after `fly launch`
-- `fly volumes create glycolens_data --region sjc --size 1` — run before first deploy; creates the persistent volume
+- `fly volumes create sikfan_data --region sjc --size 1` — run before first deploy; creates the persistent volume
 - Volume is mounted at `/app/data` — `meal_logs.json`, `correction_log.jsonl`, `data/embeddings/`, and `data/job_status/` all survive `fly deploy`
 - After first deploy, seed the volume with embeddings via `fly ssh sftp put` (the Dockerfile COPY is shadowed by the mount in production)
 - `deploy_snapshot/` should be in `.gitignore` (build artifact, not source)
@@ -993,11 +993,11 @@ Side-effects: `data/embeddings/` replaced with Fly.io container state. `data/emb
 
 **Case 3 — Docker build and local health check**
 ```bash
-docker build -t glycolens-api .
-docker run -d -p 8000:8080 -e API_KEY=testkey --name glycolens-test glycolens-api
+docker build -t sikfan-api .
+docker run -d -p 8000:8080 -e API_KEY=testkey --name sikfan-test sikfan-api
 sleep 5
 curl -s http://localhost:8000/health
-docker stop glycolens-test && docker rm glycolens-test
+docker stop sikfan-test && docker rm sikfan-test
 ```
 Expected HTTP status: `200`
 Expected response schema:
@@ -1032,10 +1032,10 @@ every endpoint. This ticket is the Epic 8 gate — all prior tickets must pass f
 ```bash
 #!/usr/bin/env bash
 set -e
-BASE_URL="${1:-https://glycolens-api.fly.dev}"
+BASE_URL="${1:-https://sikfan-api.fly.dev}"
 KEY="${API_KEY:?API_KEY env var required}"
 
-echo "=== GlycoLens API Smoke Test ==="
+echo "=== SikFan API Smoke Test ==="
 echo "Target: $BASE_URL"
 
 # 1. Health
@@ -1102,8 +1102,8 @@ echo "=== All 7 checks passed ==="
 ### Deploy commands
 ```bash
 # First deploy
-fly volumes create glycolens_data --region sjc --size 1
-fly launch --name glycolens-api --region sjc --no-deploy
+fly volumes create sikfan_data --region sjc --size 1
+fly launch --name sikfan-api --region sjc --no-deploy
 fly secrets set API_KEY=$(openssl rand -hex 32)
 bash scripts/predeploy.sh
 fly deploy
@@ -1115,14 +1115,14 @@ bash scripts/predeploy.sh && fly deploy
 bash scripts/sync_from_fly.sh && bash scripts/predeploy.sh && fly deploy
 
 # Run smoke test
-bash scripts/smoke_test.sh https://glycolens-api.fly.dev
+bash scripts/smoke_test.sh https://sikfan-api.fly.dev
 ```
 
 ### Verification Blueprint
 
 **Gate test**
 ```bash
-bash scripts/smoke_test.sh https://glycolens-api.fly.dev
+bash scripts/smoke_test.sh https://sikfan-api.fly.dev
 ```
 Expected output: `=== All 7 checks passed ===`
 Side-effects to verify:
@@ -1137,7 +1137,7 @@ Side-effects to verify:
 **sync_from_fly.sh gate**
 ```bash
 # Confirm a dish via live API first
-curl -s -X POST https://glycolens-api.fly.dev/confirm-dish \
+curl -s -X POST https://sikfan-api.fly.dev/confirm-dish \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"meal_id":"<uuid>","crop_id":"<crop_id>","action":"CONFIRM"}'
@@ -1159,7 +1159,7 @@ Side-effects: `data/embeddings/` updated with live container state.
 ### Fly.io notes
 - First deploy will be slow (~5min) due to model files in image. Subsequent deploys faster.
 - `fly scale vm shared-cpu-2x` if model inference times out on default shared-cpu-1x.
-- Check `fly logs --app glycolens-api` if health check fails after deploy.
+- Check `fly logs --app sikfan-api` if health check fails after deploy.
 
 ---
 
@@ -1175,3 +1175,158 @@ Side-effects: `data/embeddings/` updated with live container state.
 | API-006 | POST /confirm-dish              | `api.py`, `correction_log.jsonl`       | API-007 |
 | API-007 | Fly.io config (no deploy)       | `Dockerfile`, `fly.toml`, `scripts/`   | API-008 |
 | API-008 | Deploy + E2E smoke test (GATE)  | `scripts/smoke_test.sh`                | Epic 9  |
+
+# API-009 Patch
+# Append the ticket below to API-LAYER-TICKETS.md (before the Ticket Summary table),
+# and add the summary row to the table.
+
+---
+
+## API-009 — GET /meal-image/{meal_id} (meal photo retrieval)
+
+### Goal
+Persist the original meal photo at upload time and expose it via a dedicated endpoint so the mobile app can lazy-load meal images in the meal log and analysis screens without adding payload to analysis responses.
+
+### Acceptance Criteria
+- [ ] `POST /analyze-meal` saves the original upload to `data/meals/{meal_id}/original.jpg` before returning 200
+- [ ] `data/meals/` directory created on first run (`mkdir exist_ok`)
+- [ ] `GET /meal-image/{meal_id}` returns the image as `FileResponse` with `media_type="image/jpeg"`
+- [ ] HTTP 404 with `meal_not_found` if no image exists for that `meal_id`
+- [ ] HTTP 401 if `X-API-Key` missing or wrong
+- [ ] `image_url` field added to `MealResult` and `GlucoseResponse` Pydantic models, set to `"/meal-image/{meal_id}"`
+- [ ] Original image persisted to volume (survives deploys) — `data/meals/` falls under existing Fly.io volume mount
+- [ ] TTL sweep at startup cleans `data/meals/{meal_id}/` for meal_ids not in `meal_logs.json` older than 7 days
+
+### Files to create/modify
+- `api.py` — add `GET /meal-image/{meal_id}` route; modify `POST /analyze-meal` handler to persist original; add `image_url` to `MealResult` and `GlucoseResponse`
+- `fly.toml` — confirm `data/meals/` falls under existing volume mount (no change needed if mount is `data/`)
+
+### Pydantic model changes
+
+```python
+class MealResult(BaseModel):
+    meal_id: str
+    dishes: list[DishResult]
+    total_carbs_g: float
+    image_url: str           # "/meal-image/{meal_id}"
+
+class GlucoseResponse(BaseModel):
+    meal_id: str
+    meal_timestamp: str
+    dishes: list[GlucoseDishEntry]
+    total_carbs_g: float
+    pre_meal_glucose: int
+    pre_meal_trend: str
+    prediction: GlucosePrediction
+    actuals: GlucoseActuals | None
+    retrain_triggered: bool
+    image_url: str           # "/meal-image/{meal_id}"
+```
+
+### Implementation notes
+
+**Saving the original (in `POST /analyze-meal` route handler, before returning 200):**
+```python
+meal_dir = Path(f"data/meals/{meal_id}")
+meal_dir.mkdir(parents=True, exist_ok=True)
+image_path = meal_dir / "original.jpg"
+image_path.write_bytes(await file.read())
+```
+Save happens in the route handler (not the background task) so the image is available immediately. `data/uploads/{meal_id}.jpg` continues to exist for `analyze_meal()` — the original save is a separate write.
+
+**Endpoint:**
+```python
+from fastapi.responses import FileResponse
+
+@app.get("/meal-image/{meal_id}", dependencies=[Depends(verify_api_key)])
+async def get_meal_image(meal_id: str):
+    image_path = Path(f"data/meals/{meal_id}/original.jpg")
+    if not image_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "meal_not_found", "message": "No image found for this meal ID."}
+        )
+    return FileResponse(image_path, media_type="image/jpeg")
+```
+
+**TTL sweep (add to startup lifespan):**
+```python
+def sweep_old_meal_images(meal_logs_path: Path, meals_dir: Path, max_age_days: int = 7):
+    logged_ids = {entry["meal_id"] for entry in load_meal_logs(meal_logs_path)}
+    cutoff = datetime.utcnow() - timedelta(days=max_age_days)
+    for meal_dir in meals_dir.iterdir():
+        if meal_dir.is_dir() and meal_dir.name not in logged_ids:
+            mtime = datetime.utcfromtimestamp(meal_dir.stat().st_mtime)
+            if mtime < cutoff:
+                shutil.rmtree(meal_dir)
+```
+Runs once at startup alongside the existing crop TTL sweep. Keeps storage bounded — only logged meals with recent images are retained.
+
+### State Lifecycle
+
+**`data/meals/{meal_id}/original.jpg`**
+
+| Action | Who | When |
+|---|---|---|
+| Create | Route handler (`POST /analyze-meal`) | Before returning 200 |
+| Read | `GET /meal-image/{meal_id}` | On request |
+| Delete | Startup TTL sweep | If meal_id not in `meal_logs.json` and older than 7 days |
+
+### Error matrix addition
+
+| Endpoint | `code` | `message` |
+|---|---|---|
+| `GET /meal-image/{meal_id}` | `meal_not_found` | `"No image found for this meal ID."` |
+
+### Verification Blueprint
+
+**Case 1 — successful image retrieval**
+```bash
+# Submit a meal and get meal_id
+MEAL_ID=$(curl -sf -X POST https://<app>.fly.dev/analyze-meal \
+  -H "X-API-Key: $API_KEY" \
+  -F "file=@data/assorted_breakfast.jpeg" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['meal_id'])")
+
+# Fetch the image immediately (no need to wait for analysis)
+curl -sf -H "X-API-Key: $API_KEY" \
+  https://<app>.fly.dev/meal-image/$MEAL_ID \
+  --output /tmp/test_meal.jpg
+file /tmp/test_meal.jpg
+```
+Expected HTTP status: `200`
+Expected: `file` command reports JPEG image data.
+Side-effects: `data/meals/{meal_id}/original.jpg` exists on server.
+
+**Case 2 — unknown meal_id**
+```bash
+curl -s -H "X-API-Key: $API_KEY" https://<app>.fly.dev/meal-image/nonexistent-id
+```
+Expected HTTP status: `404`
+Expected response:
+```json
+{"detail": {"code": "meal_not_found", "message": "No image found for this meal ID."}}
+```
+
+**Case 3 — image_url present in analysis response**
+```bash
+# After analysis completes
+curl -sf -H "X-API-Key: $API_KEY" https://<app>.fly.dev/meal-status/$MEAL_ID \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['image_url'])"
+```
+Expected output: `/meal-image/<meal_id>`
+
+**Case 4 — auth rejection**
+```bash
+curl -s https://<app>.fly.dev/meal-image/$MEAL_ID
+```
+Expected HTTP status: `401`
+
+---
+
+## Ticket Summary — updated row to add
+
+Replace the existing Ticket Summary table footer with:
+
+| API-008 | Deploy + E2E smoke test (GATE)  | `scripts/smoke_test.sh`                | Epic 9  |
+| API-009 | GET /meal-image/{meal_id}       | `api.py`, `data/meals/`                | Epic 9  |

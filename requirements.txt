@@ -1,0 +1,11 @@
+torch
+torchvision
+Pillow
+chromadb
+openai-clip
+ultralytics
+numpy
+pandas
+scikit-learn
+matplotlib
+requests

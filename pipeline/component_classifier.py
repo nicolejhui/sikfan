@@ -23,6 +23,9 @@ import numpy as np
 import torch
 from PIL import Image
 
+# Auto-detect device: MPS on Apple Silicon, CPU elsewhere (e.g. Fly.io Linux)
+_DEVICE: str = "mps" if torch.backends.mps.is_available() else "cpu"
+
 # ---------------------------------------------------------------------------
 # CLIP lazy singleton
 # ---------------------------------------------------------------------------
@@ -148,7 +151,7 @@ def _classify_roles(
 
 def classify_components(
     crop_dict: dict,
-    device: str = "mps",
+    device: str = _DEVICE,
     role_prompts: dict | None = None,
     kmeans_k: int = 4,
     kmeans_min_clusters: int = 3,

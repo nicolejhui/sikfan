@@ -3,7 +3,18 @@
     "allow": [
       "Bash(conda run -n carb_counter python scripts/label_images.py --help)",
       "Bash(conda run -n carb_counter python -c \"import matplotlib; print\\(matplotlib.__version__\\)\")",
-      "Bash(python scripts/verify_food009.py)"
+      "Bash(python scripts/verify_food009.py)",
+      "Bash(flyctl machines:*)",
+      "Bash(flyctl logs:*)",
+      "Bash(flyctl deploy:*)",
+      "Bash(source ~/.sikfan_env)",
+      "Bash(bash scripts/smoke_test.sh https://sikfan-api.fly.dev)",
+      "Bash(ls /Users/nicolehui/carb-counter/data/*.jpeg /Users/nicolehui/carb-counter/data/*.jpg)",
+      "Bash(find /Users/nicolehui/carb-counter -name assorted_breakfast* -o -name *.jpeg)",
+      "Bash(ls /Users/nicolehui/carb-counter/data/meals/*.jpeg)",
+      "Bash(grep -v \"^$\")",
+      "Bash(fly status:*)",
+      "Bash(bash scripts/predeploy.sh)"
     ]
   }
 }

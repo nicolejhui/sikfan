@@ -1,4 +1,4 @@
-# GlycoLens — Food Detection Model Engineering Tickets (v2)
+# SikFan — Food Detection Model Engineering Tickets (v2)
 
 > All tickets follow the FastSAM → CLIP → ChromaDB pipeline.
 > No hardcoded class lists anywhere. Dishes are added dynamically.
