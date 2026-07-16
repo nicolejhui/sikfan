@@ -1,0 +1,47 @@
+{
+  "expo": {
+    "name": "SikFan",
+    "slug": "sikfan",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": false,
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0F0A06"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.sikfan.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "SikFan uses your camera to scan meals.",
+        "NSPhotoLibraryUsageDescription": "SikFan accesses your photo library to select meal images.",
+        "NSMicrophoneUsageDescription": "SikFan needs microphone access for camera recording."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0F0A06"
+      },
+      "permissions": [
+        "CAMERA",
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE"
+      ],
+      "package": "com.sikfan.app"
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single",
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-font",
+      "expo-asset"
+    ],
+    "experiments": {}
+  }
+}

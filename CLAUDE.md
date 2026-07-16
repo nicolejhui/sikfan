@@ -120,7 +120,7 @@ Schema changes after GLUC-009 require incrementing the API version in Epic 8.
   search terms (pairs naturally with FOOD-016 LLM fallback)
   
 ## usage
-Limit your reads to only CLAUDE.md and TICKETS-v2.md and GLUCOSE-TICKETS.md do not read anything else without asking me
+Limit your reads to only CLAUDE.md and MOBILE-TICKETS.md do not read anything else without asking me
 
 
 <!-- ## Pipeline State (as of FOOD-005b)

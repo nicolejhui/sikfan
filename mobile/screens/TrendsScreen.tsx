@@ -1,0 +1,24 @@
+import React from 'react';
+import { View, Text, StyleSheet } from 'react-native';
+import { defaultPalette } from '../constants/theme';
+
+export default function TrendsScreen() {
+  return (
+    <View style={styles.container}>
+      <Text style={styles.label}>Trends — coming soon</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: defaultPalette.background,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  label: {
+    color: defaultPalette.textMuted,
+    fontSize: 16,
+  },
+});
