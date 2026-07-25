@@ -49,8 +49,8 @@ Bootstrap the React Native project with Expo managed workflow, React Navigation 
 Wire up the three Zustand store slices that all screens read from and write to. No business logic yet — just the shape, actions, and TypeScript types.
 
 **Acceptance Criteria**
-- [ ] `store/mealStore.ts` with state: `status` (`idle | uploading | analyzing | done | error`), `mealId`, `mealTimestamp`, `dishes` (full `DishResult[]` from `MealResult`), `dishName`, `dishNative`, `confidence`, `portion`, `verdict`, `macros`, `prediction`; actions: `startScan`, `setResult`, `reset`
-- [ ] `store/glucoseStore.ts` with state: `preMealGlucose`, `preMealTrend`, `readings` (array of `{minutes, glucose_mgdl}`), `actuals` (`GlucoseActuals | null` — the full actuals object from `GlucoseResponse.actuals`, needed for MOB-011 summary cards), `pollCount` (number, tracks intervals fired), `pollingHandle` (interval ID or null), `pollingActive`; actions: `startPolling(mealId)`, `stopPolling`, `appendReading`
+- [ ] `store/mealStore.ts` with state: `status` (`idle | uploading | analyzing | done | error`), `mealId`, `mealTimestamp`, `dishes` (full `DishResult[]` from `MealResult`), `dishName`, `confidence`, `portion` (`number | null`), `portionBucket` (`string | null`), `macros`; actions: `startScan`, `setResult`, `reset`
+- [ ] `store/glucoseStore.ts` with state: `preMealGlucose`, `preMealTrend`, `prediction` (`GlucosePrediction | null`), `verdict` (`'spike' | 'steady' | 'drop' | null`), `readings` (array of `{minutes, glucose_mgdl}`), `actuals` (`GlucoseActuals | null` — the full actuals object from `GlucoseResponse.actuals`, needed for MOB-011 summary cards), `pollCount` (number, tracks intervals fired), `pollingHandle` (interval ID or null), `pollingActive`; actions: `setPrediction(prediction, preMealGlucose, preMealTrend)`, `startPolling(mealId)`, `stopPolling`, `appendReading`, `reset`
 - [ ] `store/historyStore.ts` with state: `meals` (array of `LoggedMeal` — a combined shape that must include: all fields from `MealResult` (`meal_id`, `dishes`, `total_carbs_g`, `image_url`) + `meal_timestamp: string` from `POST /log-meal` response + `verdict: "spike" | "steady" | "drop" | null` from `GlucoseResponse.prediction.outcome.label` once glucose is fetched); actions: `addMeal`, `updateVerdict(mealId, verdict)`, `clearHistory`
 - [ ] All three stores typed with TypeScript interfaces that mirror the frozen API schemas in `CLAUDE.md`
 - [ ] Each store exported from `store/index.ts`
@@ -60,7 +60,8 @@ Wire up the three Zustand store slices that all screens read from and write to. 
 - Use `zustand` with `immer` middleware for nested state mutations: `npm install zustand immer`
 - `pollingHandle` in glucoseStore stores the return value of `setInterval` — it must survive re-renders because it lives in the store, not in a component
 - `mealStore` keeps `dishes: DishResult[]` for the full multi-dish list (required by Results screen macros card). `dishName`/`confidence`/`macros` are the primary/top dish fields used for the AnalyzingScreen chip. Do not nest `prediction` inside individual dish entries — the glucose prediction comes from a separate `GET /glucose/{meal_id}` call and lives at the top level of the store.
-- `dishNative` (native script, e.g. "紅燒牛肉麵") is **not returned by any API endpoint** — `DishResult.name` is always the normalized ASCII slug (e.g. `"braised_beef_noodle"`). For MVP, `dishNative` must be resolved client-side via a hardcoded lookup table keyed on dish name; leave it `null` if the name is not in the table. This is a known API gap to address post-MVP.
+- `dishNative` (native script) is dropped for MVP — display English names only. `DishResult.name` is always the normalized ASCII slug (e.g. `"braised_beef_noodle"`); no client-side lookup table needed.
+- `portion_g` and `portion_bucket` are `number | null` and `string | null` — the pipeline may not estimate portion for all crops. Use `formatPortion(portionBucket, portion)` from `store/types.ts` to render the display string; omit the field if the result is empty.
 
 **Dependencies:** MOB-001
 
@@ -111,7 +112,7 @@ Implement the Home screen as shown in the design: greeting, scan CTA, and a rece
 **Acceptance Criteria**
 - [ ] Top bar: greeting "Good [morning/afternoon/evening], [name]" based on local time; SikFan wordmark with brand-coloured "Fan"; avatar circle with user initial
 - [ ] Scan CTA button: taps navigate to CameraScreen (modal); shows camera icon, "Scan a meal" title, subtitle "See its blood-sugar impact before you eat"
-- [ ] Recent meals list (from `historyStore.meals`, most recent first): each row shows food placeholder thumbnail, dish name, native script, verdict chip (colour-coded), relative timestamp, sparkline
+- [ ] Recent meals list (from `historyStore.meals`, most recent first): each row shows food placeholder thumbnail, dish name (English), verdict chip (colour-coded), relative timestamp, sparkline
 - [ ] "Meal log" section header taps navigate to Log tab
 - [ ] "See all" link navigates to Log tab
 - [ ] Empty state: when `historyStore.meals` is empty, show a muted prompt to scan a first meal
@@ -165,7 +166,7 @@ Implement the 4-step analysis loading screen with animated scan beam, step-by-st
 - [ ] 4 steps advance automatically at ~1-second intervals: Scan → Identify → Portion → Model glucose response (MVP label: "Predicting carbs, macros & impact")
 - [ ] Progress bar fills as steps advance (25% / 50% / 75% / 100%)
 - [ ] Step labels below progress bar (Scan / Identify / Portion / Model), active steps brighter
-- [ ] After ~1.15 s, detected dish chip animates in at the bottom of the image: dish name, native script, confidence %; uses check icon in green circle
+- [ ] After ~1.15 s, detected dish chip animates in at the bottom of the image: dish name (English), confidence %; uses check icon in green circle
 - [ ] When `mealStore.status === 'done'`, navigate to ResultsScreen automatically
 - [ ] When `mealStore.status === 'error'`, navigate back to CameraScreen with an error toast
 - [ ] The actual `submitMeal(imageUri)` API call is dispatched on mount via `mealStore.startScan`; this screen is purely the loading state
@@ -186,7 +187,7 @@ Implement the Results screen: dish header, verdict banner, Victory Native CGM pr
 
 **Acceptance Criteria**
 - [ ] Back button in top bar navigates to the originating screen (Home or Log)
-- [ ] DishHeader: food placeholder thumbnail (56×56, radius 14), dish name, native script, confidence badge with sparkles icon, portion label, edit button (non-functional in MVP)
+- [ ] DishHeader: food placeholder thumbnail (56×56, radius 14), dish name (English), confidence badge with sparkles icon, portion label (rendered via `formatPortion(portionBucket, portion)` — omitted if null), edit button (non-functional in MVP)
 - [ ] VerdictBanner: coloured tint background, VerdictMark icon (arrow-up / wave / arrow-down), verdict word ("Spikes" / "Stabilizes" / "Drops"), peak-rise delta (e.g. "+48")
 - [ ] CGM chart using Victory Native: x-axis = minutes (0 to 180), y-axis = mg/dL; `VictoryLine` for predicted curve, `VictoryArea` for confidence band (upper/lower from GPR), `VictoryAxis` for both axes; chart height 186
 - [ ] Stat strip below chart: Peak (`prediction.predicted_peak_bg` mg/dL), Peak at (`prediction.predicted_time_to_peak_minutes` min), Settles (derived: `prediction.curve[prediction.curve.length - 1].predicted_bg` mg/dL — the last point on the 180-min curve; no explicit "settles" field exists in the API)
@@ -195,7 +196,7 @@ Implement the Results screen: dish header, verdict banner, Victory Native CGM pr
 - [ ] Edit button on DishHeader opens the confirm/correct bottom sheet (MOB-010 stub)
 - [ ] Left icon button in action row (bolt icon) is non-functional in MVP
 - [ ] Pre-bolus / InsulinCard is NOT rendered in MVP mode
-- [ ] All data read from `mealStore` — no prop drilling
+- [ ] Meal data (dishes, macros, portion, image) read from `mealStore`; prediction, verdict, and curve read from `glucoseStore` — no prop drilling
 
 **Implementation Notes**
 - Install: `npm install victory-native react-native-svg` (Victory Native requires SVG peer dep)
@@ -220,7 +221,7 @@ Implement the Meal Log screen: two-column grid of past meals, grouped by Today /
 - [ ] Grid: 2 columns, 11px gap, each card is 1:1 aspect-ratio photo placeholder with:
   - Verdict chip (top-left): icon + verdict word, white glass background
   - "NEW" badge (top-right) on the most recent entry (`historyStore.meals[0]`)
-  - Caption scrim at bottom: dish name, native script, time
+  - Caption scrim at bottom: dish name (English), time
 - [ ] Tapping any card navigates to ResultsScreen, which loads that meal's data from the store
 - [ ] TabBar renders with Log tab active
 - [ ] Camera FAB in tab bar navigates to CameraScreen (modal)
@@ -245,7 +246,7 @@ Implement the 5-minute polling loop that calls `analyzeGlucose` after a meal is 
 - [ ] Each poll calls `analyzeGlucose(mealId)` from the API client; if `actuals` is non-null: (a) appends new readings from `actuals.curve` to `glucoseStore.readings` (deduplicates by `minutes`), and (b) writes the full `actuals` object to `glucoseStore.actuals` (overwrites each poll — MOB-011 summary cards read from here)
 - [ ] Polling stops automatically after 180 minutes (36 intervals) — the interval is cleared and `pollingActive` is set to `false`
 - [ ] `glucoseStore.stopPolling()` clears the interval immediately regardless of elapsed time
-- [ ] `startPolling` is called automatically from `historyStore.addMeal` — no screen needs to call it directly
+- [ ] `startPolling` is called automatically when a meal is logged — MOB-009 modifies `historyStore.addMeal` to call `useGlucoseStore.getState().startPolling(meal.meal_id)` after appending; no screen needs to call it directly
 - [ ] ResultsScreen's CGM chart adds a second `VictoryLine` (solid, slightly thicker) for actual CGM readings when `glucoseStore.readings.length > 0`, and `VictoryScatter` dots for each reading point
 - [ ] Polling is NOT started in MVP mode (`MVP_MODE = true`) — the polling call is guarded by the same constant used elsewhere
 
@@ -266,7 +267,7 @@ Build the confirm/correct bottom sheet that appears when the user taps the edit 
 
 **Acceptance Criteria**
 - [ ] Tapping the edit button on DishHeader opens a modal bottom sheet
-- [ ] Bottom sheet shows: detected dish name + native script, confidence badge, two primary actions ("Looks right ✓" and "Correct it"), and a dismiss handle
+- [ ] Bottom sheet shows: detected dish name (English), confidence badge, two primary actions ("Looks right ✓" and "Correct it"), and a dismiss handle
 - [ ] "Looks right" taps close the sheet and show a brief toast "Confirmed" — no API call in MVP
 - [ ] "Correct it" reveals a text input pre-filled with the dish name and a "Save correction" button — tapping Save shows "Saved" toast and closes the sheet — no API call in MVP
 - [ ] Both actions log to console (`console.log('[MOB-010 stub] confirm/correct:')`) so Epic 10 can grep for the integration point
@@ -289,7 +290,7 @@ Build the dedicated post-meal tracking screen that renders the live BG trace ove
 **Acceptance Criteria**
 - [ ] Screen is navigable from the Results screen via a "Track this meal" link that appears after "Log this meal" is tapped
 - [ ] Header shows dish name, log timestamp, and elapsed time since meal (e.g. "32 min ago")
-- [ ] Victory Native chart: same axes as Results (0–180 min, mg/dL); shows prediction curve + confidence band from `mealStore.prediction`; overlays actual CGM readings from `glucoseStore.readings` as a solid `VictoryLine` + `VictoryScatter` dots
+- [ ] Victory Native chart: same axes as Results (0–180 min, mg/dL); shows prediction curve + confidence band from `glucoseStore.prediction`; overlays actual CGM readings from `glucoseStore.readings` as a solid `VictoryLine` + `VictoryScatter` dots
 - [ ] Live status chip below chart: "Tracking · updates every 5 min" while polling is active; "Tracking complete" when `glucoseStore.pollingActive === false`
 - [ ] Summary cards below chart (visible once readings arrive): actual peak bg (`glucoseStore.actuals.actual_peak_bg`), time to peak (`glucoseStore.actuals.time_to_peak_minutes`), TIR ratio (`glucoseStore.actuals.tir_ratio`) — all from `glucoseStore.actuals` (`GlucoseActuals`) which is populated by MOB-009 when `GlucoseResponse.actuals` is non-null
 - [ ] "Done" button navigates to Home; triggers `glucoseStore.stopPolling()` if still active

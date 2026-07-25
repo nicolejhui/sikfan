@@ -180,6 +180,8 @@ class DishResult(BaseModel):
     protein_g: float
     fat_g: float
     calories: float
+    portion_g: float | None = None
+    portion_bucket: str | None = None  # "small" | "medium" | "large"; None if not estimated
 
 
 class MealResult(BaseModel):
@@ -325,6 +327,8 @@ def _build_dish_results(detected_items: list[dict]) -> list[dict]:
                 "protein_g": macros.get("protein_g", 0.0),
                 "fat_g": macros.get("fat_g", 0.0),
                 "calories": macros.get("calories", 0.0),
+                "portion_g": item.get("portion_g") or None,
+                "portion_bucket": item.get("portion") or None,  # pipeline stores bucket under "portion"
             })
         elif item["crop_type"] == "mixed_bowl":
             for j, comp in enumerate(item.get("components", [])):
@@ -338,6 +342,8 @@ def _build_dish_results(detected_items: list[dict]) -> list[dict]:
                     "protein_g": macros.get("protein_g", 0.0),
                     "fat_g": macros.get("fat_g", 0.0),
                     "calories": macros.get("calories", 0.0),
+                    "portion_g": comp.get("portion_g") or None,
+                    "portion_bucket": comp.get("portion_bucket") or None,
                 })
     return dishes
 

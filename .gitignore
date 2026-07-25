@@ -32,6 +32,15 @@ __pycache__/
 # Local config
 .claude/settings.local.json
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+secrets.json
+credentials.json
+*_credentials.json
+service-account*.json
 
 # Plans
 plans/
