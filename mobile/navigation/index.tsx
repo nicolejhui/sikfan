@@ -108,8 +108,8 @@ function MainTabs() {
       screenOptions={{
         headerShown: false,
         tabBarStyle: styles.tabBar,
-        tabBarActiveTintColor: defaultPalette.primary,
-        tabBarInactiveTintColor: defaultPalette.textMuted,
+        tabBarActiveTintColor: defaultPalette.brand,
+        tabBarInactiveTintColor: defaultPalette.inkFaint,
         tabBarShowLabel: true,
         tabBarLabelStyle: styles.tabBarLabel,
       }}
@@ -215,7 +215,7 @@ export default function RootNavigator() {
 const styles = StyleSheet.create({
   tabBar: {
     backgroundColor: defaultPalette.surface,
-    borderTopColor: defaultPalette.border,
+    borderTopColor: defaultPalette.hair,
     borderTopWidth: 1,
     height: Platform.OS === 'ios' ? 88 : 64,
     paddingBottom: Platform.OS === 'ios' ? 28 : 8,
@@ -239,7 +239,7 @@ const styles = StyleSheet.create({
     borderRadius: 32,
     backgroundColor: defaultPalette.surface,
     borderWidth: 4,
-    borderColor: defaultPalette.background,
+    borderColor: defaultPalette.canvas,
     alignItems: 'center',
     justifyContent: 'center',
     // Subtle shadow so FAB appears lifted
@@ -253,7 +253,7 @@ const styles = StyleSheet.create({
     width: 52,
     height: 52,
     borderRadius: 26,
-    backgroundColor: defaultPalette.primary,
+    backgroundColor: defaultPalette.brand,
     alignItems: 'center',
     justifyContent: 'center',
   },

@@ -65,7 +65,16 @@ Always add a decision log and include proposed approaches, what was rejected and
 - Sprint 6: QA and E2E pipeline (FOOD-011, FOOD-015)
 
 ## Current Sprint
-Epic 8 — Local API Layer (FastAPI wrapper around analyze_meal + analyze_glucose)
+Epic 9 — Mobile App (React Native MVP). MOB-001–MOB-004 done, see docs/MOBILE-TICKETS.md.
+
+## Mobile Ticket Verification (required)
+Run the `/mobile_ticket_check` skill after implementing any MOB-* ticket, before marking it complete — do not rely on `tsc` alone. It runs `expo-doctor`, `tsc --noEmit`, and a clean-cache Metro restart with bundling verification. MOB-005 shipped two dependency-drift breakages (`viewManagersMetadata of null`, then a `babel-preset-expo` hoisting failure) that `tsc` never caught and cost a full debugging session — see `.claude/skills/mobile_ticket_check/SKILL.md` for details.
+
+## Mobile Design System — Source of Truth
+- Upstream: Claude Design project "SikFan" (project id `23216dca-776e-4021-ae6d-814c5407e7e2`), file `theme.jsx`. This is the canonical definition of every color token, palette (sunrise/matcha/mist), and verdict color group.
+- In-repo mirror: `mobile/constants/theme.ts` — ported field-for-field from `theme.jsx` (same palette names, hex values, and `{fg, deep, tint, ring}` verdict-group shape). Keep it in sync if `theme.jsx` changes.
+- Rule for every mobile ticket: import colors from `constants/theme.ts` (`defaultPalette.canvas/surface/ink/inkSoft/inkFaint/brand/hair/shadow`, `verdictColor()`) — never hardcode a hex value in a screen. MOB-001's original `theme.ts` was built without checking `theme.jsx` and used invented dark/neon colors that didn't match the design at all; that was corrected during MOB-004.
+- If a new screen needs a color/spacing token not yet in `theme.ts`, pull it from `theme.jsx` (via the Design MCP or by asking Nicole) rather than guessing.
 
 ## Frozen API Schemas (do not change without versioning)
 

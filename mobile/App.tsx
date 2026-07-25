@@ -13,15 +13,15 @@ export default function App() {
   // FontError is a non-critical failure — the OS fallback font renders instead.
   if (!fontsLoaded && !fontError) {
     return (
-      <View style={{ flex: 1, backgroundColor: defaultPalette.background, alignItems: 'center', justifyContent: 'center' }}>
-        <ActivityIndicator color={defaultPalette.primary} />
+      <View style={{ flex: 1, backgroundColor: defaultPalette.canvas, alignItems: 'center', justifyContent: 'center' }}>
+        <ActivityIndicator color={defaultPalette.brand} />
       </View>
     );
   }
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
-      <StatusBar style="light" />
+      <StatusBar style="dark" />
       <RootNavigator />
     </GestureHandlerRootView>
   );

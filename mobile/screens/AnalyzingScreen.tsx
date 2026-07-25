@@ -13,12 +13,12 @@ export default function AnalyzingScreen() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: defaultPalette.background,
+    backgroundColor: defaultPalette.canvas,
     alignItems: 'center',
     justifyContent: 'center',
   },
   label: {
-    color: defaultPalette.textMuted,
+    color: defaultPalette.inkFaint,
     fontSize: 16,
   },
 });

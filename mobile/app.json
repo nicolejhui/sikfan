@@ -6,12 +6,6 @@
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
-    "newArchEnabled": false,
-    "splash": {
-      "image": "./assets/splash.png",
-      "resizeMode": "contain",
-      "backgroundColor": "#0F0A06"
-    },
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.sikfan.app",
@@ -40,7 +34,28 @@
     },
     "plugins": [
       "expo-font",
-      "expo-asset"
+      "expo-asset",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "SikFan uses your camera to scan meals."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "SikFan accesses your photo library to select meal images."
+        }
+      ],
+      "expo-status-bar",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash.png",
+          "resizeMode": "contain",
+          "backgroundColor": "#0F0A06"
+        }
+      ]
     ],
     "experiments": {}
   }

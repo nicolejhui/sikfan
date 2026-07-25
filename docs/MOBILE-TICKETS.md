@@ -110,14 +110,14 @@ Build a typed fetch wrapper around the Epic 8 FastAPI endpoints so screens can c
 Implement the Home screen as shown in the design: greeting, scan CTA, and a recent meals list that reads from `historyStore`.
 
 **Acceptance Criteria**
-- [ ] Top bar: greeting "Good [morning/afternoon/evening], [name]" based on local time; SikFan wordmark with brand-coloured "Fan"; avatar circle with user initial
-- [ ] Scan CTA button: taps navigate to CameraScreen (modal); shows camera icon, "Scan a meal" title, subtitle "See its blood-sugar impact before you eat"
-- [ ] Recent meals list (from `historyStore.meals`, most recent first): each row shows food placeholder thumbnail, dish name (English), verdict chip (colour-coded), relative timestamp, sparkline
-- [ ] "Meal log" section header taps navigate to Log tab
-- [ ] "See all" link navigates to Log tab
-- [ ] Empty state: when `historyStore.meals` is empty, show a muted prompt to scan a first meal
-- [ ] Live CGM card is NOT rendered in MVP mode (controlled by a `MVP_MODE` constant in `constants.ts`)
-- [ ] TabBar renders with Home tab active
+- [x] Top bar: greeting "Good [morning/afternoon/evening], [name]" based on local time; SikFan wordmark with brand-coloured "Fan"; avatar circle with user initial
+- [x] Scan CTA button: taps navigate to CameraScreen (modal); shows camera icon, "Scan a meal" title, subtitle "See its blood-sugar impact before you eat"
+- [x] Recent meals list (from `historyStore.meals`, most recent first): each row shows food placeholder thumbnail, dish name (English), verdict chip (colour-coded), relative timestamp, sparkline
+- [x] "Meal log" section header taps navigate to Log tab
+- [x] "See all" link navigates to Log tab
+- [x] Empty state: when `historyStore.meals` is empty, show a muted prompt to scan a first meal
+- [x] Live CGM card is NOT rendered in MVP mode (controlled by a `MVP_MODE` constant in `constants.ts`)
+- [x] TabBar renders with Home tab active
 
 **Implementation Notes**
 - `MVP_MODE = true` in `constants/config.ts` for this sprint — flip to `false` to unlock CGM card post-MVP
