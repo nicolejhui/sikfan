@@ -70,7 +70,7 @@ Epic 8 — Local API Layer (FastAPI wrapper around analyze_meal + analyze_glucos
 ## Frozen API Schemas (do not change without versioning)
 
 ### analyze_meal(image_path) → dict
-Stable since FOOD-015. See TICKETS-v2.md for full schema.
+Stable since FOOD-015. See docs/TICKETS-v2.md for full schema.
 
 ### analyze_glucose(meal_id) → dict
 Stable since GLUC-009. Full shape:
@@ -120,7 +120,7 @@ Schema changes after GLUC-009 require incrementing the API version in Epic 8.
   search terms (pairs naturally with FOOD-016 LLM fallback)
   
 ## usage
-Limit your reads to only CLAUDE.md and MOBILE-TICKETS.md do not read anything else without asking me
+Limit your reads to only CLAUDE.md and docs/MOBILE-TICKETS.md do not read anything else without asking me
 
 
 <!-- ## Pipeline State (as of FOOD-005b)
