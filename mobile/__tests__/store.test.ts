@@ -1,3 +1,8 @@
+jest.mock('../api/meals', () => ({
+  submitMeal: jest.fn(() => new Promise(() => {})),
+  pollMealStatus: jest.fn(),
+}));
+
 import { useMealStore } from '../store/mealStore';
 import { useGlucoseStore } from '../store/glucoseStore';
 import { useHistoryStore } from '../store/historyStore';

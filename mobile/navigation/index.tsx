@@ -34,7 +34,7 @@ export type LogStackParamList = {
 };
 
 export type CameraStackParamList = {
-  Camera: undefined;
+  Camera: { error?: string } | undefined;
   Analyzing: undefined;
 };
 

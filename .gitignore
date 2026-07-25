@@ -1,22 +1,7 @@
 # Data
-data/CNFOOD-241/
-data/dishes/
-data/embeddings/
-data/debug_crops/
-data/unlabeled/
-data/macro_cache/
-data/glucose/
-data/*.jpeg
-data/*.jpg
-data/dxcm csv files/
-data/meals
-data/glucose
-data/models/
-data/dxcm_csv_files
+data/
 
-data/embedding_health_report.md
 analyze_Meal_ debug_results/
-data/pipeline_runs/
 pipeline/run_full_pipeline.py
 
 # Model weights

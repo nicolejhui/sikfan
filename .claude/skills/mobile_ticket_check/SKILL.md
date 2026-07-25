@@ -13,6 +13,9 @@ allowed-tools:
   - Bash(tail *)
   - Bash(grep *)
   - Bash(sleep *)
+  - Bash(curl *)
+  - Bash(cat *)
+  - Bash(conda run *)
 ---
 
 # /mobile_ticket_check — Post-ticket mobile sanity check
@@ -93,6 +96,40 @@ Reload, or press `r` in the Metro terminal) — or reload it yourself if you
 have `claude-in-chrome`-equivalent simulator control available. Report what
 you observed in the bundler log, not a guess about whether it will work.
 
+## 5. Backend connectivity (only for tickets that call the API — MOB-003+)
+
+Any ticket that exercises `submitMeal`/`pollMealStatus`/`logMeal`/etc. needs a
+live backend. "Fetch failed" or "Could not connect to server" in the app
+almost always means one of these two things, not a bug in the mobile code:
+
+```
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/health --max-time 5
+```
+
+- **No output / connection refused** → nothing is listening on 8000. Start it
+  from the repo root (not `mobile/`), in the `carb_counter` conda env:
+  ```
+  conda run -n carb_counter uvicorn api:app --port 8000
+  ```
+  Run this with the Bash tool's `run_in_background` (or a backgrounded shell
+  the harness tracks) — a bare trailing `&` in a one-off Bash call can get
+  reaped when that call's shell exits, silently leaving nothing running.
+- **200 but the app still 401s** → `API_KEY` in the root `.env` (server) and
+  `EXPO_PUBLIC_API_KEY` in `mobile/.env` (client) must match exactly. Neither
+  file is committed; check both exist and agree before assuming the code is
+  wrong. `mobile/.env` also needs `EXPO_PUBLIC_API_URL=http://localhost:8000`
+  for local dev vs. the deployed `sikfan-api.fly.dev` Fly app — local is the
+  default for active ticket work so edits to `api.py`/pipeline code don't need
+  a deploy cycle; switch to Fly only to test the deployed environment
+  specifically.
+- Changing `mobile/.env` requires a Metro restart (step 3) to pick up the new
+  `EXPO_PUBLIC_*` values — editing it alone does not affect an already-running
+  bundler.
+
+If everything above checks out and you still see a client-side crash on
+upload (not a connection error), see the `FormDataPart` note below — that's
+an Expo SDK compatibility issue, not a connectivity one.
+
 ## Why this exists (incident notes)
 
 During MOB-005 (camera screen), adding `expo-camera`/`expo-image-picker`
@@ -111,3 +148,22 @@ surfaced two unrelated, silent breakages:
 Neither would have been caught by `tsc` or by reading the diff. `expo-doctor`
 catches (1) directly; explicit dependencies (rather than relying on hoisting)
 prevent (2).
+
+During MOB-006 (analyzing screen), wiring `submitMeal` to a real image upload
+surfaced a third, also-silent breakage plus a plain misconfiguration:
+
+3. `formData.append('file', { uri, name, type })` — the classic React Native
+   file-part shape used in the MOB-003 implementation notes — throws
+   `Unsupported FormDataPart implementation` under SDK 56's `expo/fetch`
+   ("winter") runtime. That runtime only serializes strings and `Blob`/`File`
+   instances; the plain `{uri, name, type}` object isn't one. Fix: build the
+   part from `expo-file-system`'s `File` class instead, which implements
+   `Blob` —
+   ```ts
+   formData.append('file', new File(imageUri) as unknown as Blob, 'meal.jpg');
+   ```
+   `tsc` and `expo-doctor` both stay green through this; it only shows up at
+   runtime on an actual upload, so exercise the real upload path (not just a
+   bundle check) before marking an upload-touching ticket complete.
+4. Separately, "Fetch failed" / "Could not connect to server" was just the
+   FastAPI backend not running locally — see step 5 above.

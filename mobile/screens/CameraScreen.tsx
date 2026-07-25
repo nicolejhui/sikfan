@@ -1,23 +1,29 @@
-import React, { useRef, useState } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Platform } from 'react-native';
+import React, { useEffect, useRef, useState } from 'react';
+import { View, Text, StyleSheet, TouchableOpacity, Platform, Animated } from 'react-native';
 import { CameraView, useCameraPermissions, type CameraCapturedPicture } from 'expo-camera';
 import * as ImagePicker from 'expo-image-picker';
 import { Ionicons } from '@expo/vector-icons';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, useRoute } from '@react-navigation/native';
 import type { StackNavigationProp } from '@react-navigation/stack';
+import type { RouteProp } from '@react-navigation/native';
 
 import { useMealStore } from '../store/mealStore';
 import type { CameraStackParamList } from '../navigation';
 
 type Nav = StackNavigationProp<CameraStackParamList, 'Camera'>;
+type Route = RouteProp<CameraStackParamList, 'Camera'>;
 
 export default function CameraScreen() {
   const navigation = useNavigation<Nav>();
+  const route = useRoute<Route>();
   const startScan = useMealStore((s) => s.startScan);
+  const reset = useMealStore((s) => s.reset);
   const [permission, requestPermission] = useCameraPermissions();
   const [flashOn, setFlashOn] = useState(false);
   const [capturing, setCapturing] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
   const cameraRef = useRef<CameraView>(null);
+  const toastAnim = useRef(new Animated.Value(0)).current;
 
   React.useEffect(() => {
     if (!permission) return;
@@ -25,6 +31,20 @@ export default function CameraScreen() {
       requestPermission();
     }
   }, [permission]);
+
+  useEffect(() => {
+    const error = route.params?.error;
+    if (!error) return;
+    reset();
+    setToastMessage(error);
+    navigation.setParams({ error: undefined });
+
+    Animated.sequence([
+      Animated.timing(toastAnim, { toValue: 1, duration: 200, useNativeDriver: true }),
+      Animated.delay(2200),
+      Animated.timing(toastAnim, { toValue: 0, duration: 200, useNativeDriver: true }),
+    ]).start(() => setToastMessage(null));
+  }, [route.params?.error]);
 
   function goToAnalyzing(uri: string) {
     startScan(uri);
@@ -109,6 +129,23 @@ export default function CameraScreen() {
           <Ionicons name="camera-reverse-outline" size={26} color="rgba(255,255,255,0.35)" />
         </View>
       </View>
+
+      {toastMessage && (
+        <Animated.View
+          style={[
+            styles.toast,
+            {
+              opacity: toastAnim,
+              transform: [
+                { translateY: toastAnim.interpolate({ inputRange: [0, 1], outputRange: [12, 0] }) },
+              ],
+            },
+          ]}
+        >
+          <Ionicons name="alert-circle" size={16} color="#fff" style={{ marginRight: 8 }} />
+          <Text style={styles.toastLabel}>{toastMessage}</Text>
+        </Animated.View>
+      )}
     </View>
   );
 }
@@ -207,5 +244,24 @@ const styles = StyleSheet.create({
     height: 60,
     borderRadius: 999,
     backgroundColor: '#fff',
+  },
+  toast: {
+    position: 'absolute',
+    bottom: Platform.OS === 'ios' ? 140 : 116,
+    left: 24,
+    right: 24,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 14,
+    backgroundColor: 'rgba(30,20,20,0.92)',
+  },
+  toastLabel: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '500',
+    flexShrink: 1,
   },
 });

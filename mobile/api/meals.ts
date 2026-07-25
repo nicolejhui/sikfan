@@ -4,11 +4,7 @@ import type { JobStatusResponse, LogMealResponse } from './types';
 
 export async function submitMeal(imageUri: string): Promise<{ meal_id: string; status: string }> {
   const formData = new FormData();
-  formData.append('file', {
-    uri: imageUri,
-    name: 'meal.jpg',
-    type: 'image/jpeg',
-  } as unknown as Blob);
+  formData.append('file', new File(imageUri) as unknown as Blob, 'meal.jpg');
 
   return apiFetchJson('/analyze-meal', { method: 'POST', body: formData });
 }
