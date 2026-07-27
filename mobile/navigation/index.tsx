@@ -25,12 +25,12 @@ export type RootStackParamList = {
 
 export type HomeStackParamList = {
   Home: undefined;
-  Results: undefined;
+  Results: { mealId?: string } | undefined;
 };
 
 export type LogStackParamList = {
   MealLog: undefined;
-  Results: undefined;
+  Results: { mealId?: string } | undefined;
 };
 
 export type CameraStackParamList = {

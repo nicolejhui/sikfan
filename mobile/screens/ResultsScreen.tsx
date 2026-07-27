@@ -4,12 +4,24 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { VictoryChart, VictoryLine, VictoryArea, VictoryAxis } from 'victory-native';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, useRoute } from '@react-navigation/native';
 
 import { defaultPalette, verdictColor, spacing, radius, fontSize, fontWeight } from '../constants/theme';
 import { useMealStore, useGlucoseStore, useHistoryStore } from '../store';
 import { formatPortion, verdictWord } from '../store/types';
 import { analyzeGlucose } from '../api/glucose';
+
+function sumMacros(dishes: { carbs_g: number; protein_g: number; fat_g: number; calories: number }[]) {
+  return dishes.reduce(
+    (acc, d) => ({
+      carbs_g: acc.carbs_g + d.carbs_g,
+      protein_g: acc.protein_g + d.protein_g,
+      fat_g: acc.fat_g + d.fat_g,
+      calories: acc.calories + d.calories,
+    }),
+    { carbs_g: 0, protein_g: 0, fat_g: 0, calories: 0 }
+  );
+}
 
 const CHART_HEIGHT = 186;
 
@@ -34,26 +46,45 @@ function MacroBar({ label, value, max, color }: { label: string; value: number; 
 
 export default function ResultsScreen() {
   const navigation = useNavigation();
+  const route = useRoute();
+  const routeMealId = (route.params as { mealId?: string } | undefined)?.mealId;
 
-  const mealId = useMealStore((s) => s.mealId);
-  const dishName = useMealStore((s) => s.dishName);
-  const confidence = useMealStore((s) => s.confidence);
-  const portion = useMealStore((s) => s.portion);
-  const portionBucket = useMealStore((s) => s.portionBucket);
-  const macros = useMealStore((s) => s.macros);
-  const dishes = useMealStore((s) => s.dishes);
-  const mealTimestamp = useMealStore((s) => s.mealTimestamp);
+  const scanMealId = useMealStore((s) => s.mealId);
+  const scanDishName = useMealStore((s) => s.dishName);
+  const scanConfidence = useMealStore((s) => s.confidence);
+  const scanPortion = useMealStore((s) => s.portion);
+  const scanPortionBucket = useMealStore((s) => s.portionBucket);
+  const scanMacros = useMealStore((s) => s.macros);
+  const scanDishes = useMealStore((s) => s.dishes);
+  const scanMealTimestamp = useMealStore((s) => s.mealTimestamp);
+
+  // A meal opened from the Meal Log grid carries its own mealId in route
+  // params; pull its data from historyStore instead of the in-progress scan.
+  const loggedMeal = useHistoryStore((s) =>
+    routeMealId ? s.meals.find((m) => m.meal_id === routeMealId) : undefined
+  );
+
+  const mealId = loggedMeal ? loggedMeal.meal_id : scanMealId;
+  const primaryDish = loggedMeal?.dishes[0];
+  const dishName = loggedMeal ? primaryDish?.name ?? null : scanDishName;
+  const confidence = loggedMeal ? primaryDish?.confidence ?? null : scanConfidence;
+  const portion = loggedMeal ? primaryDish?.portion_g ?? null : scanPortion;
+  const portionBucket = loggedMeal ? primaryDish?.portion_bucket ?? null : scanPortionBucket;
+  const macros = loggedMeal ? sumMacros(loggedMeal.dishes) : scanMacros;
+  const dishes = loggedMeal ? loggedMeal.dishes : scanDishes;
+  const mealTimestamp = loggedMeal ? loggedMeal.meal_timestamp : scanMealTimestamp;
 
   const prediction = useGlucoseStore((s) => s.prediction);
-  const verdict = useGlucoseStore((s) => s.verdict);
+  const storeVerdict = useGlucoseStore((s) => s.verdict);
   const setPrediction = useGlucoseStore((s) => s.setPrediction);
+  const verdict = loggedMeal ? loggedMeal.verdict : storeVerdict;
 
   const addMeal = useHistoryStore((s) => s.addMeal);
 
   const [toastVisible, setToastVisible] = useState(false);
 
   useEffect(() => {
-    if (!mealId || prediction) return;
+    if (!mealId) return;
     let cancelled = false;
     (async () => {
       try {
@@ -66,7 +97,7 @@ export default function ResultsScreen() {
       }
     })();
     return () => { cancelled = true; };
-  }, [mealId, prediction]);
+  }, [mealId]);
 
   const colors = verdictColor(verdict);
 

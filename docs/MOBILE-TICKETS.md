@@ -348,3 +348,27 @@ Let the user anchor the glucose projection to their actual current reading befor
 - The `MVP_MODE` flag does not affect this feature — manual BG entry is the primary (and only) input method in MVP mode
 
 **Dependencies:** MOB-002, MOB-006, MOB-007, MOB-010
+
+---
+
+### MOB-013 — Real meal photos in thumbnails
+
+**Goal**
+Replace the placeholder boxes used for meal thumbnails on Home, Results, and Meal Log with the actual captured/analyzed photo. `getMealImage` (MOB-003) already fetches the image and writes it to a local `file://` URI, but no screen currently calls it, and `LoggedMeal.image_url` is hardcoded to `null` when a meal is logged — this ticket closes that gap end-to-end.
+
+**Acceptance Criteria**
+- [ ] `mealStore` retains the captured photo's local URI (from `CameraScreen`'s `startScan(uri)`) for the duration of a scan, so `AnalyzingScreen` and `ResultsScreen` can render it immediately without a network round-trip
+- [ ] `ResultsScreen.handleLog` passes a real value for `image_url` (the captured local URI, or the API's `image_url` from `MealResult` if present) instead of hardcoding `null` when calling `historyStore.addMeal`
+- [ ] `HomeScreen`'s `MealRow` thumbnail renders the meal's actual photo via `<Image source={{uri: meal.image_url}}>`, falling back to the existing placeholder `View` when `image_url` is null (e.g. meals logged before this ticket shipped)
+- [ ] `ResultsScreen`'s `DishHeader` thumbnail (56×56) renders the actual photo the same way, with the same placeholder fallback
+- [ ] `MealLogScreen`'s grid tiles render the actual photo as the card background (replacing `cardPhoto`), with the same placeholder fallback; the verdict chip, NEW badge, and caption scrim continue to render on top
+- [ ] For meals where only a remote `image_url` is available (no local URI — e.g. app was restarted since the meal was logged), the thumbnail lazily calls `getMealImage(meal_id)` and caches the resulting local URI so repeated renders don't re-fetch
+- [ ] Broken/missing image fetches (404, network error) fall back to the placeholder `View` rather than a broken `<Image>` icon or crash
+
+**Implementation Notes**
+- `LoggedMeal.image_url` is already typed as `string | null` in `store/types.ts` — no type changes needed, just start populating it
+- Prefer the locally captured `file://` URI over a `getMealImage` round-trip whenever it's still available (same session) — only fall back to the network fetch for older/reloaded state
+- A small `useMealThumbnail(meal: LoggedMeal)` hook (in `hooks/` or colocated with `store/`) is a reasonable place to centralize the "local URI, else fetch-and-cache, else placeholder" logic so Home/Results/Log don't each reimplement it
+- Cache fetched URIs in a plain in-memory `Map<mealId, uri>` (module-level, not in Zustand) — thumbnails are a rendering concern, not app state that needs to survive reloads
+
+**Dependencies:** MOB-002, MOB-003, MOB-004, MOB-005, MOB-007, MOB-008
