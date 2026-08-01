@@ -4,10 +4,12 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import Svg, { Polyline } from 'react-native-svg';
 import { useNavigation } from '@react-navigation/native';
+import type { StackNavigationProp } from '@react-navigation/stack';
 
 import { defaultPalette, verdictColor, spacing, radius, fontSize, fontWeight } from '../constants/theme';
 import { useHistoryStore } from '../store';
 import { verdictWord, type LoggedMeal } from '../store/types';
+import type { HomeStackParamList } from '../navigation';
 
 const USER_NAME = 'Mina';
 
@@ -48,12 +50,12 @@ function Sparkline({ color }: { color: string }) {
   );
 }
 
-function MealRow({ meal }: { meal: LoggedMeal }) {
+function MealRow({ meal, onPress }: { meal: LoggedMeal; onPress: () => void }) {
   const dishName = meal.dishes[0]?.name ?? 'Unknown dish';
   const color = verdictColor(meal.verdict);
 
   return (
-    <View style={styles.mealRow}>
+    <TouchableOpacity style={styles.mealRow} onPress={onPress} activeOpacity={0.7}>
       <View style={styles.thumbnail} />
       <View style={styles.mealInfo}>
         <Text style={styles.mealName} numberOfLines={1}>{dishName}</Text>
@@ -63,16 +65,17 @@ function MealRow({ meal }: { meal: LoggedMeal }) {
         <Text style={[styles.verdictChipText, { color: color.deep }]}>{verdictWord(meal.verdict)}</Text>
       </View>
       <Sparkline color={color.fg} />
-    </View>
+    </TouchableOpacity>
   );
 }
 
 export default function HomeScreen() {
-  const navigation = useNavigation();
+  const navigation = useNavigation<StackNavigationProp<HomeStackParamList, 'Home'>>();
   const meals = useHistoryStore((s) => s.meals);
 
   const goToCamera = () => navigation.getParent()?.navigate('CameraModal' as never);
   const goToLogTab = () => navigation.getParent()?.navigate('LogTab' as never);
+  const openMeal = (mealId: string) => navigation.navigate('Results', { mealId });
 
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
@@ -113,7 +116,9 @@ export default function HomeScreen() {
           <Text style={styles.emptyStateText}>Scan your first meal to see it here.</Text>
         </View>
       ) : (
-        meals.map((meal) => <MealRow key={meal.meal_id} meal={meal} />)
+        meals.map((meal) => (
+          <MealRow key={meal.meal_id} meal={meal} onPress={() => openMeal(meal.meal_id)} />
+        ))
       )}
       </ScrollView>
     </SafeAreaView>

@@ -3,15 +3,22 @@ jest.mock('../api/meals', () => ({
   pollMealStatus: jest.fn(),
 }));
 
+const mockAnalyzeGlucose = jest.fn();
+jest.mock('../api/glucose', () => ({
+  analyzeGlucose: (...args: unknown[]) => mockAnalyzeGlucose(...args),
+}));
+
 import { useMealStore } from '../store/mealStore';
 import { useGlucoseStore } from '../store/glucoseStore';
 import { useHistoryStore } from '../store/historyStore';
-import type { GlucosePrediction, LoggedMeal } from '../store/types';
+import type { GlucoseActuals, GlucosePrediction, LoggedMeal } from '../store/types';
 
 beforeEach(() => {
   useMealStore.getState().reset();
+  useGlucoseStore.getState().stopPolling();
   useGlucoseStore.getState().reset();
   useHistoryStore.getState().clearHistory();
+  mockAnalyzeGlucose.mockReset();
 });
 
 // mealStore
@@ -93,4 +100,81 @@ test('clearHistory empties the list', () => {
   useHistoryStore.getState().addMeal(meal);
   useHistoryStore.getState().clearHistory();
   expect(useHistoryStore.getState().meals).toHaveLength(0);
+});
+
+// glucoseStore polling (MOB-009)
+const mockActuals: GlucoseActuals = {
+  curve: [{ minutes: 5, glucose_mgdl: 112, timestamp: '2026-07-25T12:05:00Z' }],
+  actual_peak_bg: 150,
+  time_to_peak_minutes: 45,
+  tir_ratio: 0.9,
+  mard: 5.1,
+  chart_path: '',
+};
+
+describe('glucoseStore polling', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+
+  afterEach(() => {
+    useGlucoseStore.getState().stopPolling();
+    jest.useRealTimers();
+  });
+
+  test('startPolling sets pollingActive and polls every 5 minutes', async () => {
+    mockAnalyzeGlucose.mockResolvedValue({ actuals: null });
+    useGlucoseStore.getState().startPolling('meal_001');
+    expect(useGlucoseStore.getState().pollingActive).toBe(true);
+
+    await jest.advanceTimersByTimeAsync(300_000);
+    expect(mockAnalyzeGlucose).toHaveBeenCalledWith('meal_001');
+    expect(mockAnalyzeGlucose).toHaveBeenCalledTimes(1);
+    expect(useGlucoseStore.getState().pollCount).toBe(1);
+  });
+
+  test('appends and dedupes readings when actuals arrive', async () => {
+    mockAnalyzeGlucose.mockResolvedValue({ actuals: mockActuals });
+    useGlucoseStore.getState().startPolling('meal_001');
+
+    await jest.advanceTimersByTimeAsync(300_000);
+    await jest.advanceTimersByTimeAsync(300_000);
+
+    const s = useGlucoseStore.getState();
+    expect(s.readings).toHaveLength(1);
+    expect(s.actuals?.actual_peak_bg).toBe(150);
+  });
+
+  test('stopPolling clears the interval immediately', async () => {
+    mockAnalyzeGlucose.mockResolvedValue({ actuals: null });
+    useGlucoseStore.getState().startPolling('meal_001');
+    useGlucoseStore.getState().stopPolling();
+
+    await jest.advanceTimersByTimeAsync(300_000);
+    expect(mockAnalyzeGlucose).not.toHaveBeenCalled();
+    expect(useGlucoseStore.getState().pollingActive).toBe(false);
+  });
+
+  test('polling stops automatically after 36 intervals (180 minutes)', async () => {
+    mockAnalyzeGlucose.mockResolvedValue({ actuals: null });
+    useGlucoseStore.getState().startPolling('meal_001');
+
+    await jest.advanceTimersByTimeAsync(300_000 * 36);
+    expect(useGlucoseStore.getState().pollingActive).toBe(false);
+    expect(mockAnalyzeGlucose).toHaveBeenCalledTimes(36);
+
+    await jest.advanceTimersByTimeAsync(300_000);
+    expect(mockAnalyzeGlucose).toHaveBeenCalledTimes(36);
+  });
+});
+
+describe('historyStore.addMeal polling integration', () => {
+  afterEach(() => {
+    useGlucoseStore.getState().stopPolling();
+  });
+
+  test('does not start polling in MVP mode', () => {
+    useHistoryStore.getState().addMeal(meal);
+    expect(useGlucoseStore.getState().pollingActive).toBe(false);
+  });
 });

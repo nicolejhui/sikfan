@@ -1,15 +1,17 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { View, Text, StyleSheet, ScrollView, TouchableOpacity } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
-import { VictoryChart, VictoryLine, VictoryArea, VictoryAxis } from 'victory-native';
+import { VictoryChart, VictoryLine, VictoryArea, VictoryAxis, VictoryScatter } from 'victory-native';
+import type { BottomSheetModal } from '@gorhom/bottom-sheet';
 import { useNavigation, useRoute } from '@react-navigation/native';
 
 import { defaultPalette, verdictColor, spacing, radius, fontSize, fontWeight } from '../constants/theme';
 import { useMealStore, useGlucoseStore, useHistoryStore } from '../store';
 import { formatPortion, verdictWord } from '../store/types';
 import { analyzeGlucose } from '../api/glucose';
+import ConfirmDishSheet from '../components/ConfirmDishSheet';
 
 function sumMacros(dishes: { carbs_g: number; protein_g: number; fat_g: number; calories: number }[]) {
   return dishes.reduce(
@@ -65,7 +67,7 @@ export default function ResultsScreen() {
   );
 
   const mealId = loggedMeal ? loggedMeal.meal_id : scanMealId;
-  const primaryDish = loggedMeal?.dishes[0];
+  const primaryDish = loggedMeal ? loggedMeal.dishes[0] : scanDishes[0];
   const dishName = loggedMeal ? primaryDish?.name ?? null : scanDishName;
   const confidence = loggedMeal ? primaryDish?.confidence ?? null : scanConfidence;
   const portion = loggedMeal ? primaryDish?.portion_g ?? null : scanPortion;
@@ -77,11 +79,37 @@ export default function ResultsScreen() {
   const prediction = useGlucoseStore((s) => s.prediction);
   const storeVerdict = useGlucoseStore((s) => s.verdict);
   const setPrediction = useGlucoseStore((s) => s.setPrediction);
+  const readings = useGlucoseStore((s) => s.readings);
   const verdict = loggedMeal ? loggedMeal.verdict : storeVerdict;
 
   const addMeal = useHistoryStore((s) => s.addMeal);
+  const updateHistoryDishName = useHistoryStore((s) => s.updateDishName);
+  const updateScanDishName = useMealStore((s) => s.updateDishName);
 
-  const [toastVisible, setToastVisible] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+  const showToast = (message: string, duration = 1300) => {
+    setToast(message);
+    setTimeout(() => setToast(null), duration);
+  };
+
+  const cropId = primaryDish?.crop_id ?? null;
+  const canEdit = !!mealId && !!cropId;
+  const sheetRef = useRef<BottomSheetModal>(null);
+
+  // Guards against double-tapping "Log this meal": the ref catches a second
+  // tap landing before the first commit re-renders (synchronous, unlike
+  // state); the selector catches re-visiting an already-logged meal's screen.
+  const hasLoggedRef = useRef(false);
+  const alreadyLogged = useHistoryStore((s) => !!mealId && s.meals.some((m) => m.meal_id === mealId));
+
+  const handleCorrected = (correctedName: string) => {
+    if (!cropId) return;
+    if (loggedMeal) {
+      updateHistoryDishName(loggedMeal.meal_id, cropId, correctedName);
+    } else {
+      updateScanDishName(cropId, correctedName);
+    }
+  };
 
   useEffect(() => {
     if (!mealId) return;
@@ -110,10 +138,13 @@ export default function ResultsScreen() {
 
   const settles = prediction?.curve.length ? prediction.curve[prediction.curve.length - 1].predicted_bg : null;
 
+  const actualData = readings.map((r) => ({ x: r.minutes, y: r.glucose_mgdl }));
+
   const macroMax = macros ? Math.max(macros.carbs_g, macros.protein_g, macros.fat_g, macros.calories / 4) : 0;
 
   const handleLog = () => {
-    if (!mealId) return;
+    if (!mealId || hasLoggedRef.current || alreadyLogged) return;
+    hasLoggedRef.current = true;
     addMeal({
       meal_id: mealId,
       dishes,
@@ -122,9 +153,8 @@ export default function ResultsScreen() {
       meal_timestamp: mealTimestamp ?? new Date().toISOString(),
       verdict,
     });
-    setToastVisible(true);
+    showToast('Logged to your day');
     setTimeout(() => {
-      setToastVisible(false);
       (navigation.getParent() as { navigate: (name: string, params?: object) => void } | undefined)
         ?.navigate('MainTabs', { screen: 'LogTab', params: { screen: 'MealLog' } });
     }, 1300);
@@ -161,7 +191,11 @@ export default function ResultsScreen() {
               )}
             </View>
           </View>
-          <TouchableOpacity style={styles.editButton}>
+          <TouchableOpacity
+            style={[styles.editButton, !canEdit && styles.editButtonDisabled]}
+            onPress={() => sheetRef.current?.present()}
+            disabled={!canEdit}
+          >
             <Ionicons name="pencil" size={16} color={defaultPalette.inkSoft} />
           </TouchableOpacity>
         </View>
@@ -196,6 +230,19 @@ export default function ResultsScreen() {
                 data={curveData}
                 style={{ data: { stroke: colors.fg, strokeWidth: 2 } }}
               />
+              {readings.length > 0 && (
+                <VictoryLine
+                  data={actualData}
+                  style={{ data: { stroke: colors.deep, strokeWidth: 3 } }}
+                />
+              )}
+              {readings.length > 0 && (
+                <VictoryScatter
+                  data={actualData}
+                  size={3}
+                  style={{ data: { fill: colors.deep } }}
+                />
+              )}
             </VictoryChart>
           </View>
         )}
@@ -231,16 +278,33 @@ export default function ResultsScreen() {
           <TouchableOpacity style={styles.boltButton}>
             <Ionicons name="flash-outline" size={20} color={defaultPalette.inkSoft} />
           </TouchableOpacity>
-          <TouchableOpacity style={styles.logButton} onPress={handleLog} activeOpacity={0.85}>
-            <Text style={styles.logButtonText}>Log this meal</Text>
+          <TouchableOpacity
+            style={[styles.logButton, alreadyLogged && styles.logButtonDisabled]}
+            onPress={handleLog}
+            activeOpacity={0.85}
+            disabled={alreadyLogged}
+          >
+            <Text style={styles.logButtonText}>{alreadyLogged ? 'Logged' : 'Log this meal'}</Text>
           </TouchableOpacity>
         </View>
       </ScrollView>
 
-      {toastVisible && (
+      {toast && (
         <View style={styles.toast}>
-          <Text style={styles.toastText}>Logged to your day</Text>
+          <Text style={styles.toastText}>{toast}</Text>
         </View>
+      )}
+
+      {mealId && cropId && (
+        <ConfirmDishSheet
+          sheetRef={sheetRef}
+          mealId={mealId}
+          cropId={cropId}
+          dishName={dishName}
+          confidence={confidence}
+          onToast={showToast}
+          onCorrected={handleCorrected}
+        />
       )}
     </SafeAreaView>
   );
@@ -328,6 +392,9 @@ const styles = StyleSheet.create({
     backgroundColor: defaultPalette.surfaceSoft,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  editButtonDisabled: {
+    opacity: 0.4,
   },
   verdictBanner: {
     flexDirection: 'row',
@@ -439,6 +506,9 @@ const styles = StyleSheet.create({
     backgroundColor: defaultPalette.brand,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  logButtonDisabled: {
+    opacity: 0.5,
   },
   logButtonText: {
     color: '#fff',

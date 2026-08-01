@@ -78,6 +78,40 @@ any screen can cancel it if needed.
  
 ---
  
+## Decision 4 — POST /confirm-dish request shape: omit `corrected_label` on CONFIRM
+
+**Choice:** When building the `POST /confirm-dish` request body client-side,
+omit the `corrected_label` key entirely for `action: "CONFIRM"` rather than
+sending `corrected_label: null`.
+
+**What this determines:**
+MOB-010's stub (and Epic 10's real `api/confirm.ts` call that replaces it)
+build the payload as a discriminated union — `{meal_id, crop_id, action:
+"CONFIRM"}` with no `corrected_label` key vs. `{meal_id, crop_id, action:
+"CORRECT" | "ADD_NEW", corrected_label: string}` — instead of always
+including the key and setting it to `null`/`""` when not applicable.
+
+**Why:**
+`ConfirmDishRequest` in `api.py` declares `corrected_label: str | None =
+None` (Pydantic default, so the key is optional), and every tested CONFIRM
+curl example in `docs/API-LAYER-TICKETS.md` (the acceptance-test commands,
+not the illustrative JSON block in `docs/CONTRACT.md`) omits the key
+entirely: `{"meal_id":"...","crop_id":"...","action":"CONFIRM"}`. Sending
+`corrected_label: null` would still parse correctly server-side (Pydantic
+treats missing-key and explicit-null identically for an `Optional` field
+with a `None` default), but omission is the convention actually exercised by
+this codebase's own tests, so client requests should match it rather than
+introduce a second valid-but-untested shape.
+
+**Note this is a different convention from response payloads:** `DishResult`
+(`portion_g`, `portion_bucket`) and `MealResult.image_url` are outbound
+*response* fields with no `exclude_none` set, so the server does serialize
+those as explicit `"field": null` when absent. That convention governs
+server→client responses only — it does not extend to client→server request
+bodies, where omission is what's actually tested.
+
+---
+ 
 ## Summary Table
  
 | Decision | Choice | Rejected Alternatives |
@@ -85,3 +119,4 @@ any screen can cancel it if needed.
 | State management | Zustand (centralized) | Redux, Context API / local state |
 | Charting library | Victory Native | Recharts, react-native-svg-charts |
 | CGM refresh | Polling every 5 min | WebSockets, APNs push notifications |
+| `/confirm-dish` request shape | Omit `corrected_label` on CONFIRM | Explicit `corrected_label: null` on CONFIRM |

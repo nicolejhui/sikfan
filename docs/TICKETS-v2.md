@@ -676,6 +676,97 @@ As a developer, I want a single function that accepts a meal photo path and retu
 
 ---
 
+## Epic 6: Macro Lookup Follow-ups (Post-MVP)
+
+> Surfaced 2026-07-31 while debugging zero-macro results in the mobile app
+> (MOB-010 testing). Both tickets touch `pipeline/macro_lookup.py`.
+
+### FOOD-016 — Replace `_PINYIN_FALLBACK` hardcoded table with confirmation-time USDA pinning
+
+**User Story**
+As a developer, I want new dishes to get correct USDA macro matches automatically as they're confirmed, instead of only the ~24 dishes someone thought to hand-list in a fallback table, so macro lookup scales the same way the dish taxonomy itself scales.
+
+**Why this exists / the problem**
+`macro_lookup.py`'s `_PINYIN_FALLBACK` dict is a hardcoded `dict[str, str]` of dish-name → alternate-search-string overrides, used when the primary USDA FNDDS search returns 0 results (e.g. `"mapo tofu"` → `"mapo tofu spicy"`). It violates this project's own architecture rule (`CLAUDE.md`: "No fixed class lists. Dishes are added dynamically via user confirmation") — any dish not explicitly listed gets no fallback, no matter how the pipeline recognizes it. `boiled_chicken` (not in the table) and, prior to this fix, many pinyin-derived names all silently fail the same way.
+
+**Acceptance Criteria**
+- `POST /confirm-dish` (`CONFIRM` / `CORRECT` / `ADD_NEW`) resolves and stores a USDA `fdc_id` on the dish's ChromaDB metadata at confirmation time, not at lookup time
+- `lookup_macros()` checks for a pinned `fdc_id` on the confirmed dish first; if present, fetches that exact USDA record directly (no search, no fallback table)
+- `_PINYIN_FALLBACK` dict is deleted once the pinning path is in place
+- Dishes with no pinned `fdc_id` yet (not-yet-confirmed / legacy) fall through to the existing search-then-no_results path, so nothing regresses for the transition period
+- Existing `data/macro_cache/*.json` entries remain valid — this only changes how new pins are established
+- **A `CORRECT` action (dish name changed, not just confirmed) re-runs macro lookup for the *new* label** — the old dish's cached macros must not silently persist under the corrected name. `POST /confirm-dish` re-resolves `fdc_id`/`carbs_g`/etc. for `corrected_label` before writing the ChromaDB update, exactly as if it were a fresh `ADD_NEW`
+- `ConfirmDishResponse` gains a field indicating whether the meal's `total_carbs_g` changed as a result of the correction (e.g. `macros_changed: bool`) — this is what the mobile client uses to decide whether it needs to re-fetch glucose (see mobile-side note below)
+- If the corrected macro total differs meaningfully from what the glucose prediction was computed against, flag the meal's existing prediction as stale rather than silently leaving a mismatched chart on screen — exact staleness threshold and recompute-vs-flag behavior TBD at implementation time, but "do nothing" is not acceptable here since a stale curve is actively misleading, same failure mode as FOOD-017
+
+**Implementation Notes**
+- The natural point to resolve the USDA match is inside the `POST /confirm-dish` route (`api.py`) — a human is already confirming/naming the dish at that exact moment
+- Store `fdc_id` alongside the existing ChromaDB dish metadata (`dish_name`, `cuisine_type`, `date_added`, `confirmed_count` from FOOD-007)
+- If the confirming user needs to pick among ambiguous USDA candidates, reuse `lookup_macros()`'s existing top-3 `candidates` list rather than building new UI
+- This supersedes the "FOOD-016 LLM fallback" idea mentioned in `CLAUDE.md`'s FOOD-012 notes — an LLM-generated query expansion is still a viable fallback for dishes where no reasonable USDA match exists at all, but should be scoped as a separate ticket if still wanted, not conflated with this one
+- **Mobile-side implication (Epic 10, not this ticket):** once `POST /confirm-dish` is real, `ConfirmDishSheet`'s `handleSaveCorrection` must not stop at a local cosmetic name update (what the Epic 9 stub does) — on a successful response it should re-fetch `GET /meal-status/{meal_id}` (updated macros) and, if `macros_changed` is true, `GET /glucose/{meal_id}` (updated prediction), rather than trusting the pre-correction values already in `mealStore`/`glucoseStore`
+
+**Dependencies:** FOOD-010 (confirmation loop), FOOD-012 (macro lookup)
+
+---
+
+### FOOD-017 — Fix macro lookup `None` → `0.0` coercion masking no-match results
+
+**User Story**
+As a developer, I want a genuine "no macro data found" result to be visibly distinguishable from "this dish has zero carbs/protein/fat/calories," so the app doesn't silently show wrong nutrition info as if it were real.
+
+**Why this exists / the problem**
+`macro_lookup._build_result()` returns `calories=None, carbs_g=None, ...` when USDA search finds nothing (`source: "no_results"`). Somewhere between that and the `/analyze-meal` response, those `None`s become explicit `0.0`s — confirmed via `GET /meal-status/{meal_id}` returning `"carbs_g": 0.0` for `boiled_chicken`/`dumplings`, both of which had no successful USDA match. A `0.0` reads as "this food has no carbs," not "we don't know" — meaning `total_carbs_g` and the mobile Macros card can silently understate a meal's real carb load.
+
+**Acceptance Criteria**
+- Trace where `MacroResult.carbs_g == None` gets converted to `0.0` (likely in `analyze_meal.py`'s crop-to-`DishResult` mapping)
+- `DishResult` fields for a dish with `source: "no_results"` surface as `None`/null on the wire (matching the existing `portion_g`/`portion_bucket` null convention), not `0.0`
+- `total_carbs_g` aggregation either excludes unresolved dishes or the response otherwise flags that the total is incomplete — silently summing `None`-as-`0` into a total the user trusts is the actual bug impact, not just a display nit
+- Add a regression test with a dish name guaranteed to 0-result USDA search, asserting `carbs_g is None` end-to-end through `/analyze-meal`
+
+**Implementation Notes**
+- This is independent of FOOD-016 — fix this regardless of whether/when the pinning replacement lands, since it's a correctness bug, not a coverage gap
+- Mobile-side (`MOB-007` Results screen) already renders `Macros` unconditionally once `macros` is non-null; once this returns `None` per-field, that screen will need a small follow-up to show "—" instead of `0` for unresolved dishes — file as a MOB-* ticket once this lands, not bundled in here
+
+**Dependencies:** FOOD-012
+
+---
+
+## Epic 7: Embedding Quality Follow-ups (Post-MVP)
+
+> Surfaced 2026-07-31 while reviewing a live scan: the noodle/beef components of
+> a `braised_beef_noodle` bowl matched at confidence 0.27 / 0.23 — well below
+> even the `UNCERTAIN` band's usual range — while a visually similar
+> `marinated_egg` crop from the same photo matched confidently. Prompted the
+> question of whether CLIP's frozen embeddings need adaptation for this dish
+> vocabulary, as an axis separate from FOOD-010's per-dish confirmation loop.
+
+### FOOD-018 — Train a lightweight projection head on frozen CLIP embeddings
+
+**User Story**
+As a developer, I want the embeddings driving dish matching to better separate my specific dish vocabulary, so low-confidence/confused matches (like `beef` at 0.228) become rarer without needing a full model fine-tune.
+
+**Why this exists / the problem**
+The pipeline currently does zero-shot CLIP: embeddings come straight from the frozen `openai/clip` ViT-B/32 encoder, and the only adaptation mechanism is FOOD-010's rolling-average centroid update per dish (`new_centroid = (old*n + new)/(n+1)`) — which improves *where a dish's centroid sits* but not *how separable the underlying embedding space is* for dishes CLIP wasn't trained to distinguish well (e.g. visually similar Chinese dishes, per the confusion-pair note already in FOOD-011). A live scan surfaced this concretely: the actual noodle+beef bowl in a `braised_beef_noodle` photo matched at 0.27/0.23 confidence, while a separately-segmented `marinated_egg` crop from the same photo matched confidently at 0.83.
+
+**Acceptance Criteria**
+- A small trainable projection layer (linear or shallow MLP) sits on top of the frozen CLIP image encoder's output
+- Projection head is trained with a metric-learning loss (e.g. triplet loss or ArcFace) using confirmed dish photos as positive/negative pairs — dishes confirmed via FOOD-010's loop are the training signal, no new labeling process required
+- ChromaDB stores the *projected* embedding (post-projection-head), not the raw CLIP embedding — this is a storage-format change, so existing embeddings need re-encoding, not just appending
+- Training runs on MPS in a reasonable time for the current dataset size (tens of dishes, ~10+ photos each)
+- A before/after comparison on the existing confusion pairs flagged by FOOD-011 (similarity > 0.88) shows measurable separation improvement
+- CLIP itself remains frozen — this ticket does not fine-tune or LoRA-adapt CLIP's own weights (see Implementation Notes for why, and where that heavier option is deferred to)
+
+**Implementation Notes**
+- Deliberately the lighter of two options considered: full CLIP fine-tuning (or a LoRA adapter on CLIP's vision tower) was the alternative, rejected for now because it needs meaningfully more data per class than this project currently has, requires a real train/validation split, and risks overfitting or forgetting CLIP's general visual knowledge on a small personal dataset. A frozen-CLIP + trained-projection-head approach needs far fewer examples per dish and can't damage CLIP's base representation. Revisit full fine-tuning only if the projection head plateaus and confusion pairs persist.
+- This is complementary to, not a replacement for, FOOD-010's confirmation loop — centroids still matter for per-dish positioning; this ticket changes the space they live in
+- Re-encoding existing ChromaDB embeddings through the new projection head is a one-time migration step — needs a script, not just a training run
+- Natural trigger for retraining: after every N new confirmations (mirrors FOOD-011's "every 50 new meal logs" QA cadence) rather than on every single confirmation
+
+**Dependencies:** FOOD-006 (CLIP classifier), FOOD-007 (ChromaDB), FOOD-010 (confirmation loop — training data source), FOOD-011 (confusion-pair detection — defines what "better" means here)
+
+---
+
 ## Build Order Summary
 
 | Sprint | Tickets | Goal |

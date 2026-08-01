@@ -1,6 +1,10 @@
 import { create } from 'zustand';
 import { immer } from 'zustand/middleware/immer';
 import type { ActualReading, GlucoseActuals, GlucosePrediction, Verdict } from './types';
+import { analyzeGlucose } from '../api/glucose';
+
+const POLL_INTERVAL_MS = 300_000;
+const MAX_POLLS = 36; // 36 * 5 min = 180 min
 
 interface GlucoseState {
   preMealGlucose: number | null;
@@ -50,9 +54,29 @@ export const useGlucoseStore = create<GlucoseState & GlucoseActions>()(
         s.preMealTrend = preMealTrend;
       }),
 
-    startPolling: (_mealId: string) => {
-      // MOB-009 wires up MVP_MODE guard and real interval
-      set((s) => { s.pollingActive = true; });
+    startPolling: (mealId: string) => {
+      const existing = get().pollingHandle;
+      if (existing !== null) clearInterval(existing);
+
+      set((s) => { s.pollingActive = true; s.pollCount = 0; });
+
+      const tick = async () => {
+        try {
+          const res = await analyzeGlucose(mealId);
+          if (res.actuals) {
+            get().appendReading(res.actuals.curve, res.actuals);
+          }
+        } catch {
+          // a single failed poll shouldn't stop tracking
+        }
+        set((s) => { s.pollCount += 1; });
+        if (get().pollCount >= MAX_POLLS) {
+          get().stopPolling();
+        }
+      };
+
+      const handle = setInterval(tick, POLL_INTERVAL_MS);
+      set((s) => { s.pollingHandle = handle; });
     },
 
     stopPolling: () => {
@@ -69,7 +93,6 @@ export const useGlucoseStore = create<GlucoseState & GlucoseActions>()(
           }
         }
         s.actuals = actuals;
-        s.pollCount += 1;
       }),
 
     reset: () => set(() => ({ ...initial })),

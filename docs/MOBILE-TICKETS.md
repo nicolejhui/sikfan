@@ -277,6 +277,10 @@ Build the confirm/correct bottom sheet that appears when the user taps the edit 
 - Use `@gorhom/bottom-sheet` (`npm install @gorhom/bottom-sheet`) — it handles keyboard avoidance and swipe-to-dismiss out of the box
 - The stub's `console.log` should output the full correction payload shape that `POST /confirm-dish` will eventually receive: `{meal_id, crop_id, action: "CONFIRM" | "CORRECT" | "ADD_NEW", corrected_label}` — makes Epic 10 integration a straight substitution. Note: the identifier is `crop_id` (e.g. `"crop_0"`), not `dish_name`; `corrected_label` is the field name for the new dish name on CORRECT/ADD_NEW actions
 - Do not import the API client in this ticket; keep the stub self-contained
+- Implementation shipped a client-side-only optimistic name update (`mealStore.updateDishName` / `historyStore.updateDishName`, wired via `ConfirmDishSheet`'s `onCorrected` prop) so the corrected name is visible in `DishHeader` immediately for testing — this is cosmetic only, does not touch macros/glucose, and is explicitly superseded by the Epic 10 note below
+
+**Epic 10 wiring note (do not implement in MOB-010, tracked for the real integration):**
+A correction changes the dish's macros (see `FOOD-016`'s updated acceptance criteria — `CORRECT` re-runs USDA lookup for the new label server-side) and can invalidate the glucose prediction, which was computed against the *pre-correction* `total_carbs_g`. When `POST /confirm-dish` becomes real, `handleSaveCorrection` must not stop at the local cosmetic update this ticket ships — on a successful response it should re-fetch `GET /meal-status/{meal_id}` for updated macros, and if the response's `macros_changed` flag is true, re-fetch `GET /glucose/{meal_id}` for an updated prediction, rather than leaving the pre-correction values in `mealStore`/`glucoseStore` on screen.
 
 **Dependencies:** MOB-007
 

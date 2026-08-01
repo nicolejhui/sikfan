@@ -23,6 +23,7 @@ interface MealState {
 interface MealActions {
   startScan: (imageUri: string) => void;
   setResult: (result: Partial<MealState>) => void;
+  updateDishName: (cropId: string, name: string) => void;
   reset: () => void;
 }
 
@@ -103,6 +104,12 @@ export const useMealStore = create<MealState & MealActions>()(
       void runScan(imageUri, set, get);
     },
     setResult: (result) => set((s) => { Object.assign(s, result); }),
+    updateDishName: (cropId, name) =>
+      set((s) => {
+        const dish = s.dishes.find((d) => d.crop_id === cropId);
+        if (dish) dish.name = name;
+        if (s.dishes[0]?.crop_id === cropId) s.dishName = name;
+      }),
     reset: () => set(() => ({ ...initial })),
   }))
 );
