@@ -27,8 +27,10 @@ from pydantic import BaseModel
 from analyze_meal import analyze_meal as _analyze_meal
 from glucose_analysis import MealNotFoundError, MissingCGMDataError
 from glucose_analysis import analyze_glucose as _analyze_glucose
+from glucose_analysis import analyze_glucose_preview as _analyze_glucose_preview
 from pipeline.embedding_store import EmbeddingStore, _get_clip
 from pipeline.feedback import FeedbackAction, _append_correction_log, normalize_dish_name, record_feedback
+from pipeline.glucose_store import save_cgm_reading
 from pipeline.segmentation import _get_model, segment_meal
 
 _log = logging.getLogger(__name__)
@@ -268,6 +270,17 @@ class GlucoseResponse(BaseModel):
     actuals: GlucoseActuals | None
     retrain_triggered: bool
     image_url: str  # "/meal-image/{meal_id}"
+
+
+# --- POST /manual-glucose (API-011) ---
+
+class ManualGlucoseRequest(BaseModel):
+    meal_id: str
+    glucose_mgdl: int
+
+
+class ManualGlucoseResponse(BaseModel):
+    status: str
 
 
 # --- POST /confirm-dish ---
@@ -510,7 +523,11 @@ def log_meal(body: LogMealRequest):
             detail={"code": "already_logged", "message": "This meal has already been logged."},
         )
 
-    meal_timestamp = datetime.now(timezone.utc).isoformat()
+    # Reuse scan-time timestamp (API-010) so a pre-log preview and the
+    # post-log tracked prediction share the same CGM anchor — using
+    # datetime.now() here instead would let the two disagree on "when this
+    # meal happened," visibly shifting the curve the instant it's logged.
+    meal_timestamp = job.get("created_at") or datetime.now(timezone.utc).isoformat()
 
     # Build GLUC-001-compatible dish entries from job_status result, matched by name.
     result_dishes = {d["name"]: d for d in (job.get("result") or {}).get("dishes", [])}
@@ -534,7 +551,20 @@ def log_meal(body: LogMealRequest):
         "total_carbs_g": round(total_carbs, 2),
         "pre_meal_glucose_mgdl": None,
         "pre_meal_trend": None,
-        "cgm_window": [],
+        # Dict, not []: pipeline/meal_tracker.py's attach_cgm_window() and
+        # pipeline/glucose_model.py's should_retrain() both call
+        # .get("status") on this — matches the exact "pending" shape
+        # attach_cgm_window() itself would set before any real CGM data
+        # exists (meal_tracker.py:138-146). A bare [] crashed should_retrain()
+        # on the first analyze_glucose() call for any freshly-logged meal.
+        "cgm_window": {
+            "status": "pending",
+            "readings": [],
+            "peak_glucose": None,
+            "time_to_peak_minutes": None,
+            "return_to_baseline_minutes": None,
+            "area_under_curve": None,
+        },
     }
 
     # Step 3: append → step 4: flip logged: true (atomic).
@@ -548,14 +578,70 @@ def log_meal(body: LogMealRequest):
     return LogMealResponse(meal_id=body.meal_id, logged=True, meal_timestamp=meal_timestamp)
 
 # ---------------------------------------------------------------------------
+# API-011 route
+# ---------------------------------------------------------------------------
+
+@app.post("/manual-glucose", response_model=ManualGlucoseResponse, dependencies=[Depends(verify_api_key)])
+def manual_glucose(body: ManualGlucoseRequest):
+    """No-CGM fallback: record a manually-entered pre-meal glucose reading.
+
+    Stored as a regular CGM reading (source: "manual") in the same store
+    real CGM data lives in — GET /glucose/{meal_id} needs no changes to pick
+    it up; get_pre_meal_glucose() already does a source-agnostic nearest-
+    reading lookup. Forward-compatible with a future real CGM integration
+    by construction, not by a special case that'll need removing later.
+    """
+    status_path = Path("data/job_status") / f"{body.meal_id}.json"
+    if not status_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "meal_not_found", "message": "No analysis job found for this meal ID. Run /analyze-meal first."},
+        )
+
+    job = json.loads(status_path.read_text())
+
+    try:
+        save_cgm_reading({
+            "timestamp": job["created_at"],
+            "glucose_mgdl": body.glucose_mgdl,
+            "trend": "flat",  # no trend arrow inferable from a single manual point
+            "source": "manual",
+        })
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_glucose_value", "message": str(exc)},
+        )
+
+    return ManualGlucoseResponse(status="ok")
+
+# ---------------------------------------------------------------------------
 # API-005 route
 # ---------------------------------------------------------------------------
 
+def _resolve_glucose_result(meal_id: str) -> dict:
+    """Logged path first; falls back to the preview path (API-010) if the
+    meal hasn't been logged yet. Exceptions from whichever path actually
+    runs propagate to the caller for the route's single exception→HTTP map."""
+    try:
+        return _analyze_glucose(meal_id)
+    except MealNotFoundError:
+        return _analyze_glucose_preview(meal_id)
+
+
 @app.get("/glucose/{meal_id}", response_model=GlucoseResponse, dependencies=[Depends(verify_api_key)])
 def get_glucose(meal_id: str):
-    """Return the full glucose prediction (and actuals if available) for a logged meal."""
+    """Return the glucose prediction for a meal.
+
+    Tries the logged path first (full CGM-window tracking, actuals, retrain
+    trigger). If the meal hasn't been logged yet, falls back to the preview
+    path (API-010) — a prediction anchored to scan time, available as soon
+    as analysis completes, with actuals always null. Same URL, same
+    response schema either way; only accuracy/completeness improves once
+    the meal is actually logged.
+    """
     try:
-        result = _analyze_glucose(meal_id)
+        result = _resolve_glucose_result(meal_id)
     except MealNotFoundError:
         raise HTTPException(
             status_code=404,
@@ -580,13 +666,7 @@ def get_glucose(meal_id: str):
             detail={"code": "glucose_model_error", "message": "Glucose prediction failed due to a server error. Try again shortly."},
         )
 
-    dishes = [
-        GlucoseDishEntry(
-            name=d["dish_name"],
-            carbs_g=float(d["macros"].get("carbs_g", 0.0)),
-        )
-        for d in result["dishes"]
-    ]
+    dishes = [GlucoseDishEntry(**d) for d in result["dishes"]]
 
     actuals = GlucoseActuals(**result["actuals"]) if result["actuals"] else None
 

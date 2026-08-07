@@ -393,7 +393,11 @@ def should_retrain() -> bool:
     meals = get_meal_logs()
     new_complete = sum(
         1 for m in meals
-        if m.get("cgm_window", {}).get("status") == "complete"
+        # cgm_window is normally a dict ({"status": ..., "readings": [...]});
+        # guard against legacy/malformed entries where it's still a bare []
+        # (pre-fix log_meal wrote this) rather than crashing on .get().
+        if isinstance(m.get("cgm_window"), dict)
+        and m["cgm_window"].get("status") == "complete"
         and m["timestamp"] > last_trained_ts  # compare by timestamp, not insertion order
     )
     return new_complete >= 10

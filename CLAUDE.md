@@ -117,6 +117,45 @@ Stable since GLUC-009. Full shape:
 ```
 Schema changes after GLUC-009 require incrementing the API version in Epic 8.
 
+## Glucose Prediction — Pre-log Anchor (confirmed 2026-08-06)
+Four user stories confirmed with Nicole, driving `API-010`, `API-011`, and
+the rewritten `MOB-012` (see `docs/API-LAYER-TICKETS.md` and
+`docs/MOBILE-TICKETS.md` for full ticket detail, `plans/API-010-plan.md` /
+`plans/API-011-plan.md` for decision logs):
+
+1. **CGM connected, happy path:** As a user, given my CGM is connected to
+   SikFan, when I take a picture of a meal, then I should see glucose
+   impact, macro breakdown, and dish name — automatically, no manual step.
+2. **CGM connected, recent reading:** As a user, given my CGM is connected
+   but the last reading was 5–10 min ago, then my pre-meal glucose should be
+   the most recent reading (so long as it's within 15 min), and I should
+   still get macro breakdown, glucose impact, and dish name on scan.
+3. **No CGM, gate the impact:** As a user, given I don't have my CGM
+   connected, when I take a picture of a meal, I should see an option to
+   manually enter my blood glucose — and only then see glucose impact, macro
+   breakdown, and dish name. Macro breakdown and dish name are **never**
+   gated behind a glucose anchor; only glucose-impact UI is.
+4. **No fake baseline:** if there is no CGM value, do not show glucose
+   impact at all (not even dimmed/placeholder) — show the manual-entry
+   option instead. There is no default/fallback baseline glucose value.
+
+**Resulting architecture decision:** manual glucose entry (`API-011`) is not
+a special-case parameter on `GET /glucose/{meal_id}` — it's stored as a
+regular CGM reading (`source: "manual"` in `data/glucose/cgm_readings.json`,
+via the existing `save_cgm_reading()`), so a future real CGM integration
+needs zero changes to the prediction path. `pipeline/glucose_store.py`'s
+`_VALID_SOURCES = {"dexcom_csv", "manual"}` already anticipated this.
+
+**Gating change to the frozen `analyze_glucose` contract:** `GET
+/glucose/{meal_id}` (`API-010`) no longer requires the meal to be logged
+first — it works as soon as `POST /analyze-meal` completes, anchored to
+`job_status.created_at` (scan time) instead of requiring `POST /log-meal`'s
+timestamp. The response *schema* is unchanged (still the frozen GLUC-009
+shape below); only when it returns 200 vs 404 changes. `POST /log-meal` was
+also changed to reuse `job_status.created_at` as `meal_timestamp` (not
+`datetime.now()` at tap time), so a pre-log preview and the post-log tracked
+prediction share the same anchor and produce a continuous curve.
+
 ## Feedback loop validated (2026-04-15)
 - dried_tofu_sticks: ADD_NEW, UNCERTAIN → CONFIDENT after 3 confirmations
 - braised_beef_noodle: CONFIRM, confidence 0.8519 → 0.9325 after 3 confirmations

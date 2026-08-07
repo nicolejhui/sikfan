@@ -1324,6 +1324,177 @@ Expected HTTP status: `401`
 
 ---
 
+## API-010 — Glucose prediction before logging (scan-time anchor)
+
+### Goal
+`GET /glucose/{meal_id}` currently requires the meal to be logged
+(`POST /log-meal`) first — it 404s (`meal_not_found`) on any meal that's only
+been analyzed, not logged. Change it to return a prediction as soon as
+`POST /analyze-meal` completes, anchored to scan time (`job_status.created_at`)
+rather than log time, so the mobile Results screen can show glucose impact
+*before* the user commits to logging. Full design + decision log:
+`plans/API-010-plan.md`.
+
+### Acceptance Criteria
+- [ ] `GET /glucose/{meal_id}` returns 200 with a full prediction immediately
+      after `POST /analyze-meal` completes, without requiring `/log-meal` first
+- [ ] Preview response uses `job_status.created_at` as `meal_timestamp` and
+      sums macros from `job_status.result.dishes` (not `meal_logs.json`)
+- [ ] Preview response always has `actuals: null` and `retrain_triggered: false`
+      — no CGM window is attached or persisted pre-log
+- [ ] Once a meal is logged, `GET /glucose/{meal_id}` transitions to the
+      existing logged path (CGM window attach, actuals, retrain) automatically
+      — same URL, same schema, no separate preview endpoint or response flag
+- [ ] `POST /log-meal`'s `meal_timestamp` is changed to equal the meal's
+      `job_status.created_at`, not the time `/log-meal` was called — so the
+      pre-log preview and the post-log prediction share the same CGM anchor
+      and produce a continuous curve (no visible jump the moment a meal is logged)
+- [ ] 422 `no_pre_meal_glucose` and 404 `meal_not_found` behavior unchanged
+      for both the preview and logged paths
+- [ ] Existing GLUC-009 `GlucoseResponse` schema fields unchanged — this is a
+      gating/source-of-truth change, not a schema change; no Pydantic model edits
+
+### Implementation Notes
+- `analyze_glucose()`'s prediction assembly (`predict_glucose_curve` +
+  `classify_glucose_outcome` + peak/confidence packaging) should be extracted
+  into a shared helper reused by both the existing logged path and a new
+  `analyze_glucose_preview(meal_id)` function — avoid duplicating that logic
+- `attach_cgm_window()` (`pipeline/meal_tracker.py`) requires the meal to
+  already exist in `meal_logs.json` and writes back into it — it cannot run
+  against a `job_status` file. The preview path must not call it; `actuals`
+  stays `null` until the meal is actually logged and tracked
+- Do NOT write a provisional entry to `meal_logs.json` at scan/preview time —
+  that file is the training corpus (`_should_retrain()`/`train_model()`
+  iterate it), so unlogged previews (retaken/discarded photos) would need to
+  be filtered out of every training consumer. Read `job_status` directly for
+  the preview instead; a preview that's never logged leaves no trace
+- `job_status`'s `result.dishes` (`DishResult`: `crop_id, name, confidence,
+  status, carbs_g, protein_g, fat_g, calories, portion_g, portion_bucket`) is
+  a different shape from `meal_logs.json`'s `dishes` (`{dish_name,
+  portion_size, macros: {...}}`) — map explicitly, don't assume interchangeable
+- Aside, not introduced by this ticket: `/log-meal`'s macros dict never
+  included `fiber_g`, so `total_fiber_g` has always been `0` for every logged
+  meal today. The preview path (also missing `fiber_g` on `DishResult`) is no
+  worse than the existing status quo — not in scope to fix here
+
+### Files to create/modify
+- `glucose_analysis.py` — add `analyze_glucose_preview()`, extract shared
+  prediction-assembly helper
+- `api.py` — `GET /glucose/{meal_id}` route falls back to the preview path on
+  `MealNotFoundError`; `POST /log-meal` reuses `job_status.created_at`
+
+### Verification Blueprint
+
+**Case 1 — preview before logging**
+```bash
+# After /analyze-meal completes but before /log-meal is called
+curl -s -w "\nHTTP %{http_code}\n" -H "X-API-Key: $API_KEY" https://<app>.fly.dev/glucose/$MEAL_ID
+```
+Expected HTTP status: `200`, `actuals: null`, `retrain_triggered: false`,
+`meal_timestamp` equal to the job's `created_at`.
+
+**Case 2 — continuity after logging**
+```bash
+PREVIEW=$(curl -s -H "X-API-Key: $API_KEY" https://<app>.fly.dev/glucose/$MEAL_ID)
+curl -sf -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d "{\"meal_id\":\"$MEAL_ID\",\"confirmed_dishes\":[...]}" https://<app>.fly.dev/log-meal
+LOGGED=$(curl -s -H "X-API-Key: $API_KEY" https://<app>.fly.dev/glucose/$MEAL_ID)
+```
+Expected: `PREVIEW.prediction` and `LOGGED.prediction` match (same curve) —
+only `actuals` differs (still `null` until CGM window completes).
+
+**Case 3 — no CGM data near scan time**
+```bash
+curl -s -w "\nHTTP %{http_code}\n" -H "X-API-Key: $API_KEY" https://<app>.fly.dev/glucose/$MEAL_ID_NO_CGM
+```
+Expected HTTP status: `422`, `{"code": "no_pre_meal_glucose", ...}` — unchanged.
+
+### Dependencies
+GLUC-006 (`analyze_glucose`), API-002 (`job_status` + `created_at`), API-004
+(`/log-meal`), API-005 (`GET /glucose/{meal_id}`)
+
+---
+
+## API-011 — POST /manual-glucose (no-CGM fallback, forward-compatible with real CGM)
+
+### Goal
+When `GET /glucose/{meal_id}` 422s with `no_pre_meal_glucose` (no real CGM
+reading near scan time — the expected case for most MVP users, who have no
+CGM connected), let the user manually enter their current blood glucose on
+the Results screen (`MOB-012`) and get a real prediction from it. Designed so
+a future live CGM integration requires **zero changes** to this endpoint or
+to `GET /glucose/{meal_id}` — full design + decision log: `plans/API-011-plan.md`.
+
+### Acceptance Criteria
+- [ ] `POST /manual-glucose` accepts `{meal_id: str, glucose_mgdl: int}` and
+      writes a reading into `data/glucose/cgm_readings.json` via the existing
+      `save_cgm_reading()` — `timestamp: now()`, `trend: "flat"` (no trend
+      arrow is inferable from a single manual point), `source: "manual"`
+- [ ] Does **not** call `predict_glucose_curve` directly and does not compute
+      or return a prediction itself — it only writes the reading. The client
+      re-fetches `GET /glucose/{meal_id}` afterward, which resolves normally
+      because `get_pre_meal_glucose()` now finds the just-written reading —
+      completely unchanged code path, no override parameter, no branching on
+      "was this manual"
+- [ ] `glucose_mgdl` validated same as any CGM reading: integer, 20–600
+      range (existing `_validate_cgm` in `pipeline/glucose_store.py`, reused
+      as-is — no new validation logic)
+- [ ] 400 if `glucose_mgdl` out of range or non-integer
+- [ ] 404 if `meal_id` has no `job_status` record
+- [ ] 401 if auth missing
+
+### Implementation Notes
+- **This is the whole point of the ticket:** manual entries are stored
+  exactly the way a real CGM feed's readings would be — same file, same
+  shape, same `save_cgm_reading()` call, differing only in `source`. When
+  real CGM integration ships later, live readings land in the same store the
+  same way; the manual-entry code path and the future-live-CGM code path are
+  unified by construction. Do not build this as a special case on `GET
+  /glucose/{meal_id}` (e.g. a `?pre_meal_glucose=` override param) — that
+  would need to be torn out again once real CGM exists. `pipeline/
+  glucose_store.py`'s `_VALID_SOURCES = {"dexcom_csv", "manual"}` already
+  anticipated this exact duality
+- `meal_id` in the request body is used only to look up `job_status.created_at`
+  as the reading's `timestamp` anchor (so it lands within the 15-minute
+  window `get_pre_meal_glucose` searches) — it is not stored on the CGM
+  reading itself; `cgm_readings.json` has no concept of "which meal" a
+  reading belongs to, same as real CGM data wouldn't
+- `trend: "flat"` is a deliberate default, not a guess at the user's real
+  trend — `MOB-012`'s mobile-side `preMealTrend` is explicitly `null` on
+  manual entry ("no trend arrow"), but the CGM store's `_validate_cgm`
+  requires one of the five valid trend strings. `"flat"` is the safest
+  neutral default for a single-point manual reading
+
+### Files to create/modify
+- `api.py` — add `POST /manual-glucose` route, calling
+  `pipeline.glucose_store.save_cgm_reading()`
+
+### Verification Blueprint
+
+**Case 1 — manual entry unblocks a previously-422ing preview**
+```bash
+curl -s -w "\nHTTP %{http_code}\n" -H "X-API-Key: $API_KEY" https://<app>.fly.dev/glucose/$MEAL_ID_NO_CGM
+# 422 no_pre_meal_glucose
+curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d "{\"meal_id\":\"$MEAL_ID_NO_CGM\",\"glucose_mgdl\":118}" https://<app>.fly.dev/manual-glucose
+curl -s -w "\nHTTP %{http_code}\n" -H "X-API-Key: $API_KEY" https://<app>.fly.dev/glucose/$MEAL_ID_NO_CGM
+```
+Expected: first call `422`, third call `200` with `pre_meal_glucose: 118`,
+`pre_meal_trend: "flat"`, and a real prediction curve.
+
+**Case 2 — out-of-range value**
+```bash
+curl -s -w "\nHTTP %{http_code}\n" -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d "{\"meal_id\":\"$MEAL_ID\",\"glucose_mgdl\":900}" https://<app>.fly.dev/manual-glucose
+```
+Expected HTTP status: `400`.
+
+### Dependencies
+API-002 (`job_status` + `created_at`), API-010 (`GET /glucose/{meal_id}`
+preview path this feeds into), `pipeline/glucose_store.save_cgm_reading`
+
+---
+
 ## Ticket Summary — updated row to add
 
 Replace the existing Ticket Summary table footer with:

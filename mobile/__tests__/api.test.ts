@@ -109,3 +109,17 @@ test.each([401, 404, 422])('throws ApiError on a %i response', async (status) =>
   await expect(pollMealStatus('meal_1')).rejects.toBeInstanceOf(ApiError);
   await expect(pollMealStatus('meal_1')).rejects.toMatchObject({ status, message: 'nope' });
 });
+
+test('ApiError unwraps this backend\'s {detail: {code, message}} error shape', async () => {
+  (global.fetch as jest.Mock).mockResolvedValue(
+    mockJsonResponse(422, {
+      detail: { code: 'no_pre_meal_glucose', message: 'No CGM reading found near this meal time.' },
+    })
+  );
+
+  await expect(analyzeGlucose('meal_1')).rejects.toMatchObject({
+    status: 422,
+    code: 'no_pre_meal_glucose',
+    message: 'No CGM reading found near this meal time.',
+  });
+});

@@ -25,6 +25,7 @@ class MissingCGMDataError(Exception):
 
 _METADATA_FILE = Path(__file__).parent / "data" / "models" / "training_metadata.json"
 _MODEL_PATH = Path(__file__).parent / "data" / "models" / "glucose_model.joblib"
+_JOB_STATUS_DIR = Path(__file__).parent / "data" / "job_status"
 _STALE_RETRAIN_MINUTES = 30
 
 
@@ -141,6 +142,22 @@ def _model_confidence() -> str:
     return "low"
 
 
+def _build_prediction(macros: dict, pre_glucose: int, pre_trend: str) -> dict:
+    """Shared curve/outcome assembly used by both the logged and preview paths (API-010)."""
+    curve = predict_glucose_curve(macros, pre_glucose, pre_trend)
+    peak_point = max(curve, key=lambda p: p["predicted_bg"])
+    model_confidence = _model_confidence()
+    outcome = classify_glucose_outcome(curve, pre_glucose)
+    outcome["confidence"] = model_confidence
+    return {
+        "curve": curve,
+        "predicted_peak_bg": float(peak_point["predicted_bg"]),
+        "predicted_time_to_peak_minutes": int(peak_point["minutes"]),
+        "model_confidence": model_confidence,
+        "outcome": outcome,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -213,19 +230,7 @@ def analyze_glucose(meal_id: str) -> dict:
 
     # --- Prediction ---
     macros = _extract_macros(meal)
-    curve = predict_glucose_curve(macros, pre_glucose, pre_trend)
-
-    peak_point = max(curve, key=lambda p: p["predicted_bg"])
-    model_confidence = _model_confidence()
-    outcome = classify_glucose_outcome(curve, pre_glucose)
-    outcome["confidence"] = model_confidence
-    prediction = {
-        "curve": curve,
-        "predicted_peak_bg": float(peak_point["predicted_bg"]),
-        "predicted_time_to_peak_minutes": int(peak_point["minutes"]),
-        "model_confidence": model_confidence,
-        "outcome": outcome,
-    }
+    prediction = _build_prediction(macros, pre_glucose, pre_trend)
 
     # --- Actuals (only when CGM window is complete) ---
     actuals = None
@@ -247,14 +252,88 @@ def analyze_glucose(meal_id: str) -> dict:
             "chart_path": overlay["chart_path"],
         }
 
+    dishes = [
+        {"name": d["dish_name"], "carbs_g": float(d["macros"].get("carbs_g", 0.0))}
+        for d in meal["dishes"]
+    ]
+
     return {
         "meal_id": meal_id,
         "meal_timestamp": meal["timestamp"],
-        "dishes": meal["dishes"],
+        "dishes": dishes,
         "total_carbs_g": float(meal["total_carbs_g"]),
         "pre_meal_glucose": pre_glucose,
         "pre_meal_trend": pre_trend,
         "prediction": prediction,
         "actuals": actuals,
         "retrain_triggered": retrain_triggered,
+    }
+
+
+def analyze_glucose_preview(meal_id: str) -> dict:
+    """Glucose prediction for a meal that has been analyzed but not yet logged (API-010).
+
+    Reads `data/job_status/{meal_id}.json` directly — never touches
+    `meal_logs.json`. Anchored to `job_status.created_at` (scan time), not a
+    log timestamp, since the meal isn't logged yet. Always returns
+    `actuals: None` (no CGM window is attached or persisted pre-log) and
+    `retrain_triggered: False` (retraining only draws from confirmed logged
+    data). Same return shape as `analyze_glucose()`.
+
+    Raises:
+        MealNotFoundError: no job_status record, or analysis not complete yet.
+        MissingCGMDataError: no CGM reading (real or manual, API-011) within
+            15 minutes of scan time.
+        RuntimeError: glucose model has not been trained yet.
+    """
+    status_path = _JOB_STATUS_DIR / f"{meal_id}.json"
+    if not status_path.exists():
+        raise MealNotFoundError(f"meal_id '{meal_id}' not found in job_status")
+
+    job = json.loads(status_path.read_text())
+    if job.get("status") != "complete" or not job.get("result"):
+        raise MealNotFoundError(f"meal_id '{meal_id}' analysis not complete")
+
+    if not _MODEL_PATH.exists():
+        raise RuntimeError(
+            "Glucose model has not been trained yet. "
+            "Collect at least 20 complete meal-CGM pairs and run train_model()."
+        )
+
+    meal_timestamp = job["created_at"]
+    result_dishes = job["result"].get("dishes", [])
+
+    # DishResult (job_status shape) carries no fiber_g field — total_fiber_g
+    # is 0.0 here same as the logged path effectively always is too, since
+    # /log-meal's macros dict has never included fiber_g either. Not a new
+    # gap introduced by the preview path; see plans/API-010-plan.md.
+    macros = {
+        "total_carbs_g":   float(job["result"].get("total_carbs_g", 0.0)),
+        "total_fiber_g":   0.0,
+        "total_fat_g":     sum(float(d.get("fat_g", 0.0)) for d in result_dishes),
+        "total_protein_g": sum(float(d.get("protein_g", 0.0)) for d in result_dishes),
+    }
+
+    cgm = get_pre_meal_glucose(meal_timestamp)
+    if not cgm:
+        raise MissingCGMDataError(f"No pre-meal glucose available for {meal_id}")
+    pre_glucose, pre_trend = int(cgm["glucose_mgdl"]), cgm["trend"]
+
+    prediction = _build_prediction(macros, pre_glucose, pre_trend)
+
+    dishes = [
+        {"name": d["name"], "carbs_g": float(d.get("carbs_g", 0.0))}
+        for d in result_dishes
+    ]
+
+    return {
+        "meal_id": meal_id,
+        "meal_timestamp": meal_timestamp,
+        "dishes": dishes,
+        "total_carbs_g": macros["total_carbs_g"],
+        "pre_meal_glucose": pre_glucose,
+        "pre_meal_trend": pre_trend,
+        "prediction": prediction,
+        "actuals": None,
+        "retrain_triggered": False,
     }

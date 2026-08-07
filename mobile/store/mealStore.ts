@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { immer } from 'zustand/middleware/immer';
 import type { DishResult, MealResult } from './types';
 import { submitMeal, pollMealStatus } from '../api/meals';
+import { useGlucoseStore } from './glucoseStore';
 
 type Status = 'idle' | 'uploading' | 'analyzing' | 'done' | 'error';
 
@@ -101,6 +102,7 @@ export const useMealStore = create<MealState & MealActions>()(
     ...initial,
     startScan: (imageUri: string) => {
       set((s) => { Object.assign(s, initial); s.status = 'uploading'; });
+      useGlucoseStore.getState().reset(); // MOB-012: each new scan starts with no anchor
       void runScan(imageUri, set, get);
     },
     setResult: (result) => set((s) => { Object.assign(s, result); }),
@@ -110,6 +112,9 @@ export const useMealStore = create<MealState & MealActions>()(
         if (dish) dish.name = name;
         if (s.dishes[0]?.crop_id === cropId) s.dishName = name;
       }),
-    reset: () => set(() => ({ ...initial })),
+    reset: () => {
+      set(() => ({ ...initial }));
+      useGlucoseStore.getState().reset();
+    },
   }))
 );

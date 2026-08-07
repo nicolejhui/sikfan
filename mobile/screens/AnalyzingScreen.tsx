@@ -1,13 +1,16 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { View, Text, StyleSheet, Animated, Easing, Platform } from 'react-native';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { View, Text, StyleSheet, Animated, Easing, Platform, TouchableOpacity } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useNavigation } from '@react-navigation/native';
 import type { StackNavigationProp } from '@react-navigation/stack';
+import type { BottomSheetModal } from '@gorhom/bottom-sheet';
 import Svg, { Defs, RadialGradient, LinearGradient, Stop, Rect } from 'react-native-svg';
 
 import { useMealStore } from '../store/mealStore';
+import { useGlucoseStore } from '../store/glucoseStore';
 import { defaultPalette, spacing, radius, fontSize, fontWeight } from '../constants/theme';
 import type { CameraStackParamList } from '../navigation';
+import GlucosePad from '../components/GlucosePad';
 
 type Nav = StackNavigationProp<CameraStackParamList, 'Analyzing'>;
 
@@ -27,10 +30,17 @@ const STEP_HEADLINES = [
 export default function AnalyzingScreen() {
   const navigation = useNavigation<Nav>();
   const status = useMealStore((s) => s.status);
+  const mealId = useMealStore((s) => s.mealId);
   const dishName = useMealStore((s) => s.dishName);
   const confidence = useMealStore((s) => s.confidence);
   const error = useMealStore((s) => s.error);
   const reset = useMealStore((s) => s.reset);
+
+  const preMealGlucose = useGlucoseStore((s) => s.preMealGlucose);
+  const submitManualGlucose = useGlucoseStore((s) => s.submitManualGlucose);
+  const glucosePadRef = useRef<BottomSheetModal>(null);
+  const [padOpen, setPadOpen] = useState(false);
+  const pendingNavRef = useRef(false);
 
   const [stepIndex, setStepIndex] = useState(0);
   const [chipVisible, setChipVisible] = useState(false);
@@ -79,15 +89,42 @@ export default function AnalyzingScreen() {
     }).start();
   }, [chipVisible]);
 
+  const navigateToResults = useCallback(() => {
+    const parent = navigation.getParent() as { navigate: (name: string, params?: object) => void } | undefined;
+    parent?.navigate('MainTabs', { screen: 'HomeTab', params: { screen: 'Results' } });
+  }, [navigation]);
+
   useEffect(() => {
     if (status === 'done') {
-      const parent = navigation.getParent() as { navigate: (name: string, params?: object) => void } | undefined;
-      parent?.navigate('MainTabs', { screen: 'HomeTab', params: { screen: 'Results' } });
+      // Navigation hold: if the pad is open when analysis completes, defer
+      // until it's dismissed rather than yanking the user to Results
+      // mid-entry (matches design's padOpenRef / wantDone logic).
+      if (padOpen) {
+        pendingNavRef.current = true;
+        return;
+      }
+      navigateToResults();
     } else if (status === 'error') {
       reset();
       navigation.replace('Camera', { error: error ?? 'Something went wrong. Please try again.' });
     }
-  }, [status]);
+  }, [status, padOpen, navigateToResults]);
+
+  const handlePadClose = useCallback(() => {
+    setPadOpen(false);
+    if (pendingNavRef.current) {
+      pendingNavRef.current = false;
+      navigateToResults();
+    }
+  }, [navigateToResults]);
+
+  const handleManualGlucoseSet = useCallback(
+    async (value: number) => {
+      if (!mealId) return;
+      await submitManualGlucose(mealId, value);
+    },
+    [mealId, submitManualGlucose]
+  );
 
   const beamTranslateY = beamAnim.interpolate({ inputRange: [0, 1], outputRange: [0, BEAM_TRAVEL] });
 
@@ -160,6 +197,35 @@ export default function AnalyzingScreen() {
 
       <Text style={styles.headline}>{STEP_HEADLINES[stepIndex]}</Text>
 
+      {mealId && (
+        <TouchableOpacity
+          style={styles.bgPrompt}
+          onPress={() => {
+            setPadOpen(true);
+            glucosePadRef.current?.present();
+          }}
+          activeOpacity={0.85}
+        >
+          <View style={styles.bgPromptIcon}>
+            <Ionicons name="water" size={16} color={defaultPalette.good.fg} />
+          </View>
+          <View style={styles.bgPromptText}>
+            {preMealGlucose != null ? (
+              <>
+                <Text style={styles.bgPromptValue}>{preMealGlucose} mg/dL</Text>
+                <Text style={styles.bgPromptLabel}>Blood sugar anchored</Text>
+              </>
+            ) : (
+              <>
+                <Text style={styles.bgPromptLabel}>Add your blood sugar</Text>
+                <Text style={styles.bgPromptSubtitle}>Enter it now while we analyze</Text>
+              </>
+            )}
+          </View>
+          {preMealGlucose == null && <Text style={styles.bgPromptPlaceholder}>– – –</Text>}
+        </TouchableOpacity>
+      )}
+
       <View style={styles.progressTrack}>
         <View
           style={[styles.progressFill, { width: `${((stepIndex + 1) / STEP_LABELS.length) * 100}%` }]}
@@ -176,6 +242,16 @@ export default function AnalyzingScreen() {
           </Text>
         ))}
       </View>
+
+      {mealId && (
+        <GlucosePad
+          sheetRef={glucosePadRef}
+          initial={preMealGlucose}
+          last={preMealGlucose ?? 0}
+          onSet={handleManualGlucoseSet}
+          onClose={handlePadClose}
+        />
+      )}
     </View>
   );
 }
@@ -281,6 +357,50 @@ const styles = StyleSheet.create({
     fontWeight: fontWeight.medium,
     textAlign: 'center',
     marginBottom: spacing.md,
+  },
+  bgPrompt: {
+    width: '100%',
+    maxWidth: 320,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderRadius: radius.lg,
+    padding: spacing.md,
+    marginBottom: spacing.lg,
+  },
+  bgPromptIcon: {
+    width: 32,
+    height: 32,
+    borderRadius: radius.full,
+    borderWidth: 1.5,
+    borderColor: defaultPalette.good.fg,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: spacing.sm,
+  },
+  bgPromptText: {
+    flex: 1,
+  },
+  bgPromptLabel: {
+    color: 'rgba(255,255,255,0.92)',
+    fontSize: fontSize.sm,
+    fontWeight: fontWeight.semibold,
+  },
+  bgPromptSubtitle: {
+    color: 'rgba(255,255,255,0.55)',
+    fontSize: fontSize.xs,
+    marginTop: 2,
+  },
+  bgPromptValue: {
+    color: '#fff',
+    fontSize: fontSize.md,
+    fontWeight: fontWeight.bold,
+  },
+  bgPromptPlaceholder: {
+    color: 'rgba(255,255,255,0.35)',
+    fontSize: fontSize.md,
+    fontWeight: fontWeight.medium,
+    letterSpacing: 2,
   },
   progressTrack: {
     width: '100%',

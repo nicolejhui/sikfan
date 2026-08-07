@@ -38,6 +38,15 @@ def _parse_iso(ts: str) -> datetime:
         raise ValueError(f"Invalid ISO 8601 timestamp '{ts}': {e}")
 
 
+def _to_utc(dt: datetime) -> datetime:
+    """Naive timestamps are treated as UTC (matches pipeline/meal_tracker.py's
+    convention and the naive-UTC format cgm_readings.json's historical
+    Dexcom-imported rows already use); aware timestamps are converted."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _validate_cgm(reading: dict) -> None:
     required = {"timestamp", "glucose_mgdl", "trend", "source"}
     missing = required - reading.keys()
@@ -93,23 +102,23 @@ def save_meal_log(meal: dict) -> None:
 
 def get_cgm_window(start_time: str, end_time: str) -> list[dict]:
     """Return all CGM readings between start_time and end_time (ISO 8601 strings)."""
-    start = _parse_iso(start_time)
-    end = _parse_iso(end_time)
+    start = _to_utc(_parse_iso(start_time))
+    end = _to_utc(_parse_iso(end_time))
     readings = _load(_CGM_FILE)
     return [
         r for r in readings
-        if start <= _parse_iso(r["timestamp"]) <= end
+        if start <= _to_utc(_parse_iso(r["timestamp"])) <= end
     ]
 
 
 def get_pre_meal_glucose(meal_timestamp: str, window_minutes: int = 15) -> dict | None:
     """Return the CGM reading closest to meal_timestamp within window_minutes."""
-    meal_dt = _parse_iso(meal_timestamp)
+    meal_dt = _to_utc(_parse_iso(meal_timestamp))
     readings = _load(_CGM_FILE)
 
     candidates = []
     for r in readings:
-        rdt = _parse_iso(r["timestamp"])
+        rdt = _to_utc(_parse_iso(r["timestamp"]))
         diff = abs((meal_dt - rdt).total_seconds() / 60)
         if diff <= window_minutes:
             candidates.append((diff, r))

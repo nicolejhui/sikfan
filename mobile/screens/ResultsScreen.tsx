@@ -10,8 +10,8 @@ import { useNavigation, useRoute } from '@react-navigation/native';
 import { defaultPalette, verdictColor, spacing, radius, fontSize, fontWeight } from '../constants/theme';
 import { useMealStore, useGlucoseStore, useHistoryStore } from '../store';
 import { formatPortion, verdictWord } from '../store/types';
-import { analyzeGlucose } from '../api/glucose';
 import ConfirmDishSheet from '../components/ConfirmDishSheet';
+import GlucosePad from '../components/GlucosePad';
 
 function sumMacros(dishes: { carbs_g: number; protein_g: number; fat_g: number; calories: number }[]) {
   return dishes.reduce(
@@ -78,7 +78,10 @@ export default function ResultsScreen() {
 
   const prediction = useGlucoseStore((s) => s.prediction);
   const storeVerdict = useGlucoseStore((s) => s.verdict);
-  const setPrediction = useGlucoseStore((s) => s.setPrediction);
+  const predictionStatus = useGlucoseStore((s) => s.predictionStatus);
+  const fetchPrediction = useGlucoseStore((s) => s.fetchPrediction);
+  const preMealGlucose = useGlucoseStore((s) => s.preMealGlucose);
+  const submitManualGlucose = useGlucoseStore((s) => s.submitManualGlucose);
   const readings = useGlucoseStore((s) => s.readings);
   const verdict = loggedMeal ? loggedMeal.verdict : storeVerdict;
 
@@ -113,19 +116,14 @@ export default function ResultsScreen() {
 
   useEffect(() => {
     if (!mealId) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await analyzeGlucose(mealId);
-        if (!cancelled) {
-          setPrediction(res.prediction, res.pre_meal_glucose, res.pre_meal_trend);
-        }
-      } catch {
-        // Chart stays empty; user can still see dish/macro info.
-      }
-    })();
-    return () => { cancelled = true; };
+    void fetchPrediction(mealId);
   }, [mealId]);
+
+  const glucosePadRef = useRef<BottomSheetModal>(null);
+  const handleManualGlucoseSet = async (value: number) => {
+    if (!mealId) return;
+    await submitManualGlucose(mealId, value);
+  };
 
   const colors = verdictColor(verdict);
 
@@ -200,68 +198,99 @@ export default function ResultsScreen() {
           </TouchableOpacity>
         </View>
 
-        <View style={[styles.verdictBanner, { backgroundColor: colors.tint }]}>
-          <Ionicons name={VERDICT_ICON[verdict ?? 'steady']} size={20} color={colors.deep} />
-          <Text style={[styles.verdictWord, { color: colors.deep }]}>{verdictWord(verdict)}</Text>
-          {prediction && (
-            <Text style={[styles.verdictDelta, { color: colors.fg }]}>
-              {prediction.outcome.delta_from_baseline >= 0 ? '+' : ''}
-              {Math.round(prediction.outcome.delta_from_baseline)}
-            </Text>
-          )}
-        </View>
+        {/* MOB-012: no glucose UI at all until an anchor exists (real CGM,
+            found automatically, or manual) — nothing dimmed/placeholder'd,
+            genuinely absent. Macro breakdown and dish header above are never
+            gated by this. */}
+        {predictionStatus === 'needs_manual_entry' && (
+          <TouchableOpacity style={styles.bloodSugarCta} onPress={() => glucosePadRef.current?.present()} activeOpacity={0.85}>
+            <View style={styles.bloodSugarCtaIcon}>
+              <Ionicons name="water" size={18} color="#fff" />
+            </View>
+            <View style={styles.bloodSugarCtaText}>
+              <Text style={styles.bloodSugarCtaTitle}>Add your blood sugar</Text>
+              <Text style={styles.bloodSugarCtaSubtitle}>Anchor this projection to your current reading</Text>
+            </View>
+            <Text style={styles.bloodSugarPlaceholder}>– – –</Text>
+          </TouchableOpacity>
+        )}
 
-        {prediction && (
-          <View style={styles.chartCard}>
-            <VictoryChart height={CHART_HEIGHT} padding={{ top: 12, bottom: 28, left: 40, right: 12 }}>
-              <VictoryAxis
-                dependentAxis
-                style={{ axis: { stroke: 'transparent' }, tickLabels: { fontSize: 10, fill: defaultPalette.inkFaint } }}
-              />
-              <VictoryAxis
-                tickValues={[0, 60, 120, 180]}
-                style={{ axis: { stroke: defaultPalette.hair }, tickLabels: { fontSize: 10, fill: defaultPalette.inkFaint } }}
-              />
-              <VictoryArea
-                data={bandData}
-                style={{ data: { fill: colors.fg, fillOpacity: 0.2, stroke: 'transparent' } }}
-              />
-              <VictoryLine
-                data={curveData}
-                style={{ data: { stroke: colors.fg, strokeWidth: 2 } }}
-              />
-              {readings.length > 0 && (
-                <VictoryLine
-                  data={actualData}
-                  style={{ data: { stroke: colors.deep, strokeWidth: 3 } }}
-                />
-              )}
-              {readings.length > 0 && (
-                <VictoryScatter
-                  data={actualData}
-                  size={3}
-                  style={{ data: { fill: colors.deep } }}
-                />
-              )}
-            </VictoryChart>
+        {predictionStatus === 'error' && (
+          <View style={styles.predictionErrorCard}>
+            <Text style={styles.predictionErrorText}>Couldn't load glucose prediction. Try again shortly.</Text>
           </View>
         )}
 
-        {prediction && (
-          <View style={styles.statStrip}>
-            <View style={styles.statItem}>
-              <Text style={styles.statValue}>{Math.round(prediction.predicted_peak_bg)}</Text>
-              <Text style={styles.statLabel}>Peak (mg/dL)</Text>
+        {predictionStatus === 'ready' && prediction && (
+          <>
+            {preMealGlucose != null && (
+              <TouchableOpacity style={styles.bloodSugarSet} onPress={() => glucosePadRef.current?.present()} activeOpacity={0.85}>
+                <View>
+                  <Text style={styles.bloodSugarValue}>{preMealGlucose} mg/dL</Text>
+                  <Text style={styles.bloodSugarSetLabel}>Anchored to your reading</Text>
+                </View>
+                <Ionicons name="pencil" size={16} color={defaultPalette.inkSoft} />
+              </TouchableOpacity>
+            )}
+
+            <View style={[styles.verdictBanner, { backgroundColor: colors.tint }]}>
+              <Ionicons name={VERDICT_ICON[verdict ?? 'steady']} size={20} color={colors.deep} />
+              <Text style={[styles.verdictWord, { color: colors.deep }]}>{verdictWord(verdict)}</Text>
+              <Text style={[styles.verdictDelta, { color: colors.fg }]}>
+                {prediction.outcome.delta_from_baseline >= 0 ? '+' : ''}
+                {Math.round(prediction.outcome.delta_from_baseline)}
+              </Text>
             </View>
-            <View style={styles.statItem}>
-              <Text style={styles.statValue}>{prediction.predicted_time_to_peak_minutes}</Text>
-              <Text style={styles.statLabel}>Peak at (min)</Text>
+
+            <View style={styles.chartCard}>
+              <VictoryChart height={CHART_HEIGHT} padding={{ top: 12, bottom: 28, left: 40, right: 12 }}>
+                <VictoryAxis
+                  dependentAxis
+                  style={{ axis: { stroke: 'transparent' }, tickLabels: { fontSize: 10, fill: defaultPalette.inkFaint } }}
+                />
+                <VictoryAxis
+                  tickValues={[0, 60, 120, 180]}
+                  style={{ axis: { stroke: defaultPalette.hair }, tickLabels: { fontSize: 10, fill: defaultPalette.inkFaint } }}
+                />
+                <VictoryArea
+                  data={bandData}
+                  style={{ data: { fill: colors.fg, fillOpacity: 0.2, stroke: 'transparent' } }}
+                />
+                <VictoryLine
+                  data={curveData}
+                  style={{ data: { stroke: colors.fg, strokeWidth: 2 } }}
+                />
+                {readings.length > 0 && (
+                  <VictoryLine
+                    data={actualData}
+                    style={{ data: { stroke: colors.deep, strokeWidth: 3 } }}
+                  />
+                )}
+                {readings.length > 0 && (
+                  <VictoryScatter
+                    data={actualData}
+                    size={3}
+                    style={{ data: { fill: colors.deep } }}
+                  />
+                )}
+              </VictoryChart>
             </View>
-            <View style={styles.statItem}>
-              <Text style={styles.statValue}>{settles != null ? Math.round(settles) : '—'}</Text>
-              <Text style={styles.statLabel}>Settles (mg/dL)</Text>
+
+            <View style={styles.statStrip}>
+              <View style={styles.statItem}>
+                <Text style={styles.statValue}>{Math.round(prediction.predicted_peak_bg)}</Text>
+                <Text style={styles.statLabel}>Peak (mg/dL)</Text>
+              </View>
+              <View style={styles.statItem}>
+                <Text style={styles.statValue}>{prediction.predicted_time_to_peak_minutes}</Text>
+                <Text style={styles.statLabel}>Peak at (min)</Text>
+              </View>
+              <View style={styles.statItem}>
+                <Text style={styles.statValue}>{settles != null ? Math.round(settles) : '—'}</Text>
+                <Text style={styles.statLabel}>Settles (mg/dL)</Text>
+              </View>
             </View>
-          </View>
+          </>
         )}
 
         {macros && (
@@ -304,6 +333,16 @@ export default function ResultsScreen() {
           confidence={confidence}
           onToast={showToast}
           onCorrected={handleCorrected}
+        />
+      )}
+
+      {mealId && (
+        <GlucosePad
+          sheetRef={glucosePadRef}
+          initial={preMealGlucose}
+          last={preMealGlucose ?? 0}
+          onSet={handleManualGlucoseSet}
+          onClose={() => {}}
         />
       )}
     </SafeAreaView>
@@ -395,6 +434,74 @@ const styles = StyleSheet.create({
   },
   editButtonDisabled: {
     opacity: 0.4,
+  },
+  bloodSugarCta: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: defaultPalette.brand,
+    borderRadius: radius.lg,
+    padding: spacing.md,
+    marginBottom: spacing.md,
+  },
+  bloodSugarCtaIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: radius.full,
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: spacing.sm,
+  },
+  bloodSugarCtaText: {
+    flex: 1,
+  },
+  bloodSugarCtaTitle: {
+    color: '#fff',
+    fontSize: fontSize.md,
+    fontWeight: fontWeight.semibold,
+  },
+  bloodSugarCtaSubtitle: {
+    color: 'rgba(255,255,255,0.8)',
+    fontSize: fontSize.xs,
+    marginTop: 2,
+  },
+  bloodSugarPlaceholder: {
+    color: 'rgba(255,255,255,0.6)',
+    fontSize: fontSize.md,
+    fontWeight: fontWeight.medium,
+    letterSpacing: 2,
+  },
+  bloodSugarSet: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: defaultPalette.surface,
+    borderRadius: radius.lg,
+    borderWidth: 1,
+    borderColor: defaultPalette.hair,
+    padding: spacing.md,
+    marginBottom: spacing.md,
+  },
+  bloodSugarValue: {
+    color: defaultPalette.ink,
+    fontSize: fontSize.xxl,
+    fontWeight: fontWeight.bold,
+  },
+  bloodSugarSetLabel: {
+    color: defaultPalette.inkSoft,
+    fontSize: fontSize.xs,
+    marginTop: 2,
+  },
+  predictionErrorCard: {
+    backgroundColor: defaultPalette.surfaceSoft,
+    borderRadius: radius.lg,
+    padding: spacing.md,
+    marginBottom: spacing.md,
+  },
+  predictionErrorText: {
+    color: defaultPalette.inkSoft,
+    fontSize: fontSize.sm,
+    textAlign: 'center',
   },
   verdictBanner: {
     flexDirection: 'row',

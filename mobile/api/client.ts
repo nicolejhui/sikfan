@@ -3,11 +3,15 @@ export const API_KEY = process.env.EXPO_PUBLIC_API_KEY;
 
 export class ApiError extends Error {
   status: number;
+  /** Machine-readable error code, e.g. "no_pre_meal_glucose" — undefined if
+   * the response didn't use this backend's {detail: {code, message}} shape. */
+  code?: string;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, code?: string) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -17,12 +21,23 @@ interface RequestOptions {
   headers?: Record<string, string>;
 }
 
-async function extractErrorMessage(response: Response): Promise<string> {
+interface ExtractedError {
+  message: string;
+  code?: string;
+}
+
+async function extractError(response: Response): Promise<ExtractedError> {
   try {
     const data = await response.json();
-    return data?.detail ?? data?.message ?? response.statusText;
+    // This backend's error bodies are {"detail": {"code": "...", "message": "..."}}
+    // — detail is an object, not a flat string. Unwrap it; fall back to a
+    // flat-string detail (or data.message) for resilience against other shapes.
+    if (data?.detail && typeof data.detail === 'object') {
+      return { message: data.detail.message ?? response.statusText, code: data.detail.code };
+    }
+    return { message: data?.detail ?? data?.message ?? response.statusText };
   } catch {
-    return response.statusText;
+    return { message: response.statusText };
   }
 }
 
@@ -37,7 +52,8 @@ export async function apiFetch(path: string, options: RequestOptions = {}): Prom
   });
 
   if (!response.ok) {
-    throw new ApiError(response.status, await extractErrorMessage(response));
+    const { message, code } = await extractError(response);
+    throw new ApiError(response.status, message, code);
   }
 
   return response;

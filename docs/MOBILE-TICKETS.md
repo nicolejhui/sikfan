@@ -313,21 +313,38 @@ Build the dedicated post-meal tracking screen that renders the live BG trace ove
 ### MOB-012 — Pre-meal manual blood glucose input
 
 **Goal**
-Let the user anchor the glucose projection to their actual current reading before they see results. No CGM in MVP mode — the user types in their reading on the Analyzing screen (while the scan runs) or on the Results screen (before committing). The entered value shifts the entire predicted curve; the Results screen prediction section is gated behind it.
+Let the user anchor the glucose prediction to their actual current reading when no CGM is connected — the expected case for most MVP users. The entered value is submitted to the backend (`API-011`) and a **real prediction is fetched for it** — there is no client-side curve math. Until an anchor exists (real CGM, found automatically per `API-010`, or manual, via this ticket), the Results screen shows no glucose-impact UI at all; macro breakdown and dish name are never gated by this and always show immediately regardless of anchor status.
+
+**Revision note (2026-08-06):** this ticket originally planned a purely
+client-side "shift the curve by `delta`" design assuming a baseline curve
+always exists to offset. That assumption doesn't hold — per three confirmed
+user stories, when there's no CGM reading, no glucose-impact UI should show
+at all (nothing to shift), and once a manual value is submitted it should
+produce a real, freshly-computed prediction, not an approximation. Rewritten
+below to submit-then-refetch. See `plans/API-011-plan.md`'s decision log for
+the full reasoning.
 
 **Acceptance Criteria**
 
+*api/client.ts — bugfix, prerequisite for this ticket*
+- [ ] `extractErrorMessage`/`ApiError` currently does `data?.detail ?? data?.message`, but this backend's error bodies are `{"detail": {"code": "...", "message": "..."}}` — `detail` is an object, not a string, so `ApiError` cannot reliably expose the error `code`. Fix `ApiError` to carry a `code: string | undefined` field parsed from `detail.code`, and `message` from `detail.message` (falling back to the old flat-string handling if `detail` isn't an object, for resilience against other endpoints' error shapes)
+
+*api/glucose.ts*
+- [ ] Add `submitManualGlucose(mealId: string, glucoseMgdl: number): Promise<void>` — `POST /manual-glucose` with `{meal_id: mealId, glucose_mgdl: glucoseMgdl}`
+
 *glucoseStore*
-- [ ] Add `setPreMealGlucose(value: number | null)` action to `glucoseStore`; it writes to the existing `preMealGlucose` state field (defined in MOB-002) and sets `preMealTrend` to `null` (manual entry has no trend arrow)
-- [ ] `mealStore.reset()` calls `glucoseStore.setPreMealGlucose(null)` so each new scan starts clean
+- [ ] `preMealGlucose`/`preMealTrend` (defined in MOB-002) are now populated **only from a successful `GlucoseResponse`** (real CGM via API-010, or the re-fetch after manual submission) — never set directly from raw user keypad input
+- [ ] Add `predictionStatus: 'idle' | 'loading' | 'ready' | 'needs_manual_entry' | 'error'` to `glucoseStore`, driven by fetching `GET /glucose/{meal_id}`: `loading` while in flight, `ready` on 200 (`setPrediction` called as today), `needs_manual_entry` specifically on a `no_pre_meal_glucose` `ApiError.code`, `error` on any other failure (503 model error, etc. — entering a BG will not fix these, so the UI must not offer manual entry for them)
+- [ ] Add `submitManualGlucose(mealId: string, glucoseMgdl: number): Promise<void>` action — calls `api/glucose.ts`'s `submitManualGlucose`, then re-fetches `GET /glucose/{meal_id}` and updates `prediction`/`preMealGlucose`/`preMealTrend`/`predictionStatus` from the real response, exactly the same code path a successful automatic (CGM-found) fetch already uses
+- [ ] `mealStore.reset()` resets `predictionStatus` to `idle` so each new scan starts clean
 
 *GlucosePad component (`components/GlucosePad.tsx`)*
-- [ ] Bottom-sheet numeric keypad; accepts `initial: number | null`, `last: number` (most recent stored reading, default 0 if none), `onSet(value: number): void`, `onClose(): void`
+- [ ] Bottom-sheet numeric keypad; accepts `initial: number | null`, `last: number` (most recent stored reading, default 0 if none), `onSet(value: number): void`, `onClose(): void` — `onSet` now triggers `glucoseStore.submitManualGlucose`, not a local state write
 - [ ] Large number display (50 sp font) with "mg/dL" label; placeholder "– – –" when empty
 - [ ] Real-time range label below the number: `In range` (70–180, good colour), `High` (> 180, warn colour), `Low` (< 70, low colour), `too low to log` (< 40), `out of range` (> 400)
 - [ ] "Last reading {last}" quick-fill pill button (clock icon); hidden when `last` is 0
 - [ ] 3-column keypad: digits 1–9 on rows 1–3, empty / 0 / backspace on row 4; max 3 digits entered
-- [ ] Submit button: label `Anchor projection` on first entry, `Update reading` when editing; disabled and greyed when value outside 40–400
+- [ ] Submit button: label `Anchor projection` on first entry, `Update reading` when editing; disabled and greyed when value outside 40–400; shows a brief loading state while `submitManualGlucose` is in flight
 - [ ] Tapping the backdrop calls `onClose`; swipe-down on the sheet handle also closes
 - [ ] Implemented with `@gorhom/bottom-sheet` (already a dependency from MOB-010)
 
@@ -335,23 +352,23 @@ Let the user anchor the glucose projection to their actual current reading befor
 - [ ] A prompt card is rendered at the bottom of the screen, above the progress section, while the scan runs
 - [ ] **Unset state**: dark glass card with drop icon (good-colour ring), "Add your blood sugar" title, "Enter it now while we analyze" subtitle, dashed `– – –` mg/dL placeholder on the right; tapping opens `GlucosePad`
 - [ ] **Set state**: card shows entered value (large font), "Blood sugar anchored" label, colour-coded range badge (in-range / high / low), edit icon button to re-open pad
+- [ ] Submitting here requires `mealStore.mealId` to already exist (set once `submitMeal` resolves, early in the scan) — `POST /manual-glucose` needs a `job_status` record to look up its `created_at` anchor; disable/hide the prompt card until `mealId` is non-null rather than allowing a submit with nothing to attach it to
 - [ ] Navigation hold: if the pad is open when the scan's 5.2 s timer fires, navigation to Results is deferred until the pad is dismissed or the value is confirmed (matches design's `padOpenRef` / `wantDone` logic)
 
 *Results screen (extends MOB-007)*
-- [ ] `BloodSugarCard` is rendered immediately below `DishHeader`, before the prediction content, in all three layouts (result / curve / minimal)
-- [ ] **Unset state**: brand-coloured CTA card, "Add your blood sugar" / "Anchor this projection to your current reading"; drop icon; dashed `– – –` mg/dL placeholder; tapping opens `GlucosePad`
-- [ ] **Set state**: surface card showing entered value (24 sp font), "Anchored to your reading" label, colour-coded range badge, edit button
-- [ ] **Prediction gate**: `VerdictBanner`, CGM chart, stat strip, macros card, and actions row are rendered at `opacity: 0.4` with `pointerEvents: none` and a subtle desaturation while `preMealGlucose === null`; they animate to full opacity/interaction once a value is entered (transition 350 ms)
-- [ ] **Curve shift**: when `preMealGlucose` is set, the projected peak, settle, and every point on the glucose curve are offset by `delta = preMealGlucose - baselineStartGlucose` so the chart reflects the user's actual baseline; `baselineStartGlucose` is a constant derived from the API's `pre_meal_glucose` field in `GlucoseResponse`
+- [ ] Macro breakdown (`macrosCard`) and dish header (`DishHeader`) render immediately once analysis completes, regardless of `predictionStatus` — never gated by glucose-anchor state
+- [ ] While `predictionStatus === 'loading'`: no glucose UI shown yet (avoid a flash of the manual-entry CTA before the automatic CGM check has even resolved)
+- [ ] `predictionStatus === 'needs_manual_entry'`: render `BloodSugarCard`'s CTA in place of `VerdictBanner`/chart/stat strip entirely — brand-coloured card, "Add your blood sugar" / "Anchor this projection to your current reading", drop icon, dashed `– – –` mg/dL placeholder; tapping opens `GlucosePad`. Nothing dimmed or partially shown — there is no curve to show yet
+- [ ] `predictionStatus === 'ready'`: `VerdictBanner`, CGM chart, stat strip render normally (existing MOB-007 behavior); a small surface card shows the anchor value (24 sp font), "Anchored to your reading" label, colour-coded range badge, edit button (re-opens `GlucosePad`, calling `submitManualGlucose` again on change — only relevant when the anchor was manual; if it came from real CGM, still editable as a manual override for this view)
+- [ ] `predictionStatus === 'error'`: generic failure state (e.g. "Couldn't load glucose prediction, try again") — do not offer manual entry, since a model/server error isn't fixed by a BG value
 
 **Implementation Notes**
 - `GlucosePad` is shared between `AnalyzingScreen` and `ResultsScreen` — export it from `components/GlucosePad.tsx`
-- `preMealGlucose` lives in `glucoseStore`; both screens read it via `useGlucoseStore(s => s.preMealGlucose)` — no prop-drilling, no duplicate local state
-- The curve shift on Results is purely presentational: derive the shifted meal object locally in the screen (`const shift = preMealGlucose - baselineStartGlucose; const shiftedMeal = {...meal, peak: meal.peak + shift, ...}`) — do not mutate the store or the API response
+- No client-side curve math anywhere — the prediction shown after manual entry is always the real `GET /glucose/{meal_id}` response fetched after `POST /manual-glucose` succeeds, identical in shape and trust level to the automatic-CGM case
 - `last` prop to `GlucosePad`: pass `glucoseStore.preMealGlucose ?? 0`; if non-zero this shows the quick-fill button pre-populated with the previous reading
-- The `MVP_MODE` flag does not affect this feature — manual BG entry is the primary (and only) input method in MVP mode
+- The `MVP_MODE` flag does not affect this feature — manual BG entry is the primary fallback input method in MVP mode (automatic CGM detection, per API-010, is tried first and used silently when available)
 
-**Dependencies:** MOB-002, MOB-006, MOB-007, MOB-010
+**Dependencies:** MOB-002, MOB-006, MOB-007, MOB-010, API-010, API-011
 
 ---
 

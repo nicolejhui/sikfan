@@ -4,13 +4,16 @@ jest.mock('../api/meals', () => ({
 }));
 
 const mockAnalyzeGlucose = jest.fn();
+const mockSubmitManualGlucose = jest.fn();
 jest.mock('../api/glucose', () => ({
   analyzeGlucose: (...args: unknown[]) => mockAnalyzeGlucose(...args),
+  submitManualGlucose: (...args: unknown[]) => mockSubmitManualGlucose(...args),
 }));
 
 import { useMealStore } from '../store/mealStore';
 import { useGlucoseStore } from '../store/glucoseStore';
 import { useHistoryStore } from '../store/historyStore';
+import { ApiError } from '../api/client';
 import type { GlucoseActuals, GlucosePrediction, LoggedMeal } from '../store/types';
 
 beforeEach(() => {
@@ -19,6 +22,7 @@ beforeEach(() => {
   useGlucoseStore.getState().reset();
   useHistoryStore.getState().clearHistory();
   mockAnalyzeGlucose.mockReset();
+  mockSubmitManualGlucose.mockReset();
 });
 
 // mealStore
@@ -64,6 +68,52 @@ test('reset clears glucoseStore', () => {
   useGlucoseStore.getState().setPrediction(mockPrediction, 110, 'flat');
   useGlucoseStore.getState().reset();
   expect(useGlucoseStore.getState().verdict).toBeNull();
+});
+
+// glucoseStore.fetchPrediction / submitManualGlucose (MOB-012)
+const mockGlucoseResponse = {
+  meal_id: 'meal_001',
+  meal_timestamp: '2026-08-06T12:00:00',
+  dishes: [],
+  total_carbs_g: 40,
+  pre_meal_glucose: 110,
+  pre_meal_trend: 'flat',
+  prediction: mockPrediction,
+  actuals: null,
+  retrain_triggered: false,
+  image_url: '/meal-image/meal_001',
+};
+
+test('fetchPrediction sets ready + prediction on success', async () => {
+  mockAnalyzeGlucose.mockResolvedValue(mockGlucoseResponse);
+  await useGlucoseStore.getState().fetchPrediction('meal_001');
+  const s = useGlucoseStore.getState();
+  expect(s.predictionStatus).toBe('ready');
+  expect(s.preMealGlucose).toBe(110);
+  expect(s.prediction?.predicted_peak_bg).toBe(145);
+});
+
+test('fetchPrediction sets needs_manual_entry on no_pre_meal_glucose', async () => {
+  mockAnalyzeGlucose.mockRejectedValue(new ApiError(422, 'no CGM', 'no_pre_meal_glucose'));
+  await useGlucoseStore.getState().fetchPrediction('meal_001');
+  expect(useGlucoseStore.getState().predictionStatus).toBe('needs_manual_entry');
+});
+
+test('fetchPrediction sets error on any other failure', async () => {
+  mockAnalyzeGlucose.mockRejectedValue(new ApiError(503, 'model down', 'glucose_model_error'));
+  await useGlucoseStore.getState().fetchPrediction('meal_001');
+  expect(useGlucoseStore.getState().predictionStatus).toBe('error');
+});
+
+test('submitManualGlucose posts the value then re-fetches a real prediction', async () => {
+  mockSubmitManualGlucose.mockResolvedValue(undefined);
+  mockAnalyzeGlucose.mockResolvedValue(mockGlucoseResponse);
+
+  await useGlucoseStore.getState().submitManualGlucose('meal_001', 118);
+
+  expect(mockSubmitManualGlucose).toHaveBeenCalledWith('meal_001', 118);
+  expect(mockAnalyzeGlucose).toHaveBeenCalledWith('meal_001');
+  expect(useGlucoseStore.getState().predictionStatus).toBe('ready');
 });
 
 // historyStore
@@ -153,6 +203,16 @@ describe('glucoseStore polling', () => {
     await jest.advanceTimersByTimeAsync(300_000);
     expect(mockAnalyzeGlucose).not.toHaveBeenCalled();
     expect(useGlucoseStore.getState().pollingActive).toBe(false);
+  });
+
+  test('reset also clears a live polling interval (no orphaned setInterval)', async () => {
+    mockAnalyzeGlucose.mockResolvedValue({ actuals: null });
+    useGlucoseStore.getState().startPolling('meal_001');
+    useGlucoseStore.getState().reset();
+
+    await jest.advanceTimersByTimeAsync(300_000);
+    expect(mockAnalyzeGlucose).not.toHaveBeenCalled();
+    expect(useGlucoseStore.getState().pollingHandle).toBeNull();
   });
 
   test('polling stops automatically after 36 intervals (180 minutes)', async () => {
