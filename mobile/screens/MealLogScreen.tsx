@@ -1,5 +1,5 @@
-import React from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity } from 'react-native';
+import React, { useState } from 'react';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Image, useWindowDimensions } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -10,6 +10,7 @@ import { defaultPalette, verdictColor, spacing, radius, fontSize, fontWeight } f
 import { useHistoryStore } from '../store';
 import { verdictWord, type LoggedMeal, type Verdict } from '../store/types';
 import type { LogStackParamList } from '../navigation';
+import { useMealThumbnail } from '../hooks/useMealThumbnail';
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -55,13 +56,31 @@ function groupByDay(meals: LoggedMeal[]): { label: string; meals: LoggedMeal[] }
   return groups;
 }
 
+const GRID_GAP = 11;
+
 function MealCard({ meal, isNew, onPress }: { meal: LoggedMeal; isNew: boolean; onPress: () => void }) {
   const dishName = meal.dishes[0]?.name ?? 'Unknown dish';
   const colors = verdictColor(meal.verdict);
+  const thumbnailUri = useMealThumbnail(meal);
+  const [thumbnailBroken, setThumbnailBroken] = useState(false);
+
+  // width: '47%' + aspectRatio: 1 doesn't resolve a height here since every
+  // child of `card` is absolutely positioned (no in-flow content for Yoga to
+  // size against) — compute an explicit square size instead.
+  const { width: screenWidth } = useWindowDimensions();
+  const cardSize = (screenWidth - spacing.md * 2 - GRID_GAP) / 2;
 
   return (
-    <TouchableOpacity style={styles.card} onPress={onPress} activeOpacity={0.85}>
-      <View style={styles.cardPhoto} />
+    <TouchableOpacity style={[styles.card, { width: cardSize, height: cardSize }]} onPress={onPress} activeOpacity={0.85}>
+      {thumbnailUri && !thumbnailBroken ? (
+        <Image
+          source={{ uri: thumbnailUri }}
+          style={styles.cardPhoto}
+          onError={() => setThumbnailBroken(true)}
+        />
+      ) : (
+        <View style={styles.cardPhoto} />
+      )}
 
       <View style={[styles.verdictChip, { backgroundColor: 'rgba(255,255,255,0.85)' }]}>
         <Ionicons name={VERDICT_ICON[meal.verdict ?? 'steady']} size={11} color={colors.deep} />
@@ -208,11 +227,9 @@ const styles = StyleSheet.create({
   grid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 11,
+    gap: GRID_GAP,
   },
   card: {
-    width: '47%',
-    aspectRatio: 1,
     borderRadius: radius.lg,
     overflow: 'hidden',
     backgroundColor: defaultPalette.surfaceSoft,

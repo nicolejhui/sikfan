@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Image } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -12,6 +12,8 @@ import { useMealStore, useGlucoseStore, useHistoryStore } from '../store';
 import { formatPortion, verdictWord } from '../store/types';
 import ConfirmDishSheet from '../components/ConfirmDishSheet';
 import GlucosePad from '../components/GlucosePad';
+import { MVP_MODE } from '../constants/config';
+import { useMealThumbnail } from '../hooks/useMealThumbnail';
 
 function sumMacros(dishes: { carbs_g: number; protein_g: number; fat_g: number; calories: number }[]) {
   return dishes.reduce(
@@ -59,6 +61,8 @@ export default function ResultsScreen() {
   const scanMacros = useMealStore((s) => s.macros);
   const scanDishes = useMealStore((s) => s.dishes);
   const scanMealTimestamp = useMealStore((s) => s.mealTimestamp);
+  const scanCapturedImageUri = useMealStore((s) => s.capturedImageUri);
+  const scanImageUrl = useMealStore((s) => s.imageUrl);
 
   // A meal opened from the Meal Log grid carries its own mealId in route
   // params; pull its data from historyStore instead of the in-progress scan.
@@ -75,6 +79,9 @@ export default function ResultsScreen() {
   const macros = loggedMeal ? sumMacros(loggedMeal.dishes) : scanMacros;
   const dishes = loggedMeal ? loggedMeal.dishes : scanDishes;
   const mealTimestamp = loggedMeal ? loggedMeal.meal_timestamp : scanMealTimestamp;
+  const thumbnailImageUrl = loggedMeal ? loggedMeal.image_url : scanCapturedImageUri ?? scanImageUrl ?? null;
+  const thumbnailUri = useMealThumbnail({ meal_id: mealId ?? '', image_url: thumbnailImageUrl });
+  const [thumbnailBroken, setThumbnailBroken] = useState(false);
 
   const prediction = useGlucoseStore((s) => s.prediction);
   const storeVerdict = useGlucoseStore((s) => s.verdict);
@@ -147,15 +154,33 @@ export default function ResultsScreen() {
       meal_id: mealId,
       dishes,
       total_carbs_g: macros?.carbs_g ?? 0,
-      image_url: null,
+      image_url: scanCapturedImageUri ?? scanImageUrl ?? null,
       meal_timestamp: mealTimestamp ?? new Date().toISOString(),
       verdict,
     });
     showToast('Logged to your day');
-    setTimeout(() => {
-      (navigation.getParent() as { navigate: (name: string, params?: object) => void } | undefined)
-        ?.navigate('MainTabs', { screen: 'LogTab', params: { screen: 'MealLog' } });
-    }, 1300);
+    // MOB-011: post-MVP, stay on Results so the "Track this meal" link is
+    // reachable instead of auto-navigating away. MVP_MODE keeps today's
+    // shipped auto-navigate behavior unchanged.
+    if (MVP_MODE) {
+      setTimeout(() => {
+        (navigation.getParent() as { navigate: (name: string, params?: object) => void } | undefined)
+          ?.navigate('MainTabs', { screen: 'LogTab', params: { screen: 'MealLog' } });
+      }, 1300);
+    }
+  };
+
+  // PostMealTracking is only registered on HomeStack (MOB-011) — this
+  // screen is shared with LogStack, so only offer the link when it's
+  // actually navigable from the current stack.
+  const canTrackMeal =
+    !MVP_MODE && !!mealId && alreadyLogged &&
+    !!navigation.getState()?.routeNames?.includes('PostMealTracking');
+
+  const handleTrackMeal = () => {
+    if (!mealId) return;
+    (navigation as unknown as { navigate: (name: string, params?: object) => void })
+      .navigate('PostMealTracking', { mealId });
   };
 
   return (
@@ -174,7 +199,15 @@ export default function ResultsScreen() {
 
       <ScrollView contentContainerStyle={styles.content}>
         <View style={styles.dishHeader}>
-          <View style={styles.thumbnail} />
+          {thumbnailUri && !thumbnailBroken ? (
+            <Image
+              source={{ uri: thumbnailUri }}
+              style={styles.thumbnail}
+              onError={() => setThumbnailBroken(true)}
+            />
+          ) : (
+            <View style={styles.thumbnail} />
+          )}
           <View style={styles.dishInfo}>
             <Text style={styles.dishName} numberOfLines={1}>{dishName ?? 'Unknown dish'}</Text>
             <View style={styles.confidenceRow}>
@@ -316,6 +349,13 @@ export default function ResultsScreen() {
             <Text style={styles.logButtonText}>{alreadyLogged ? 'Logged' : 'Log this meal'}</Text>
           </TouchableOpacity>
         </View>
+
+        {canTrackMeal && (
+          <TouchableOpacity style={styles.trackLink} onPress={handleTrackMeal} activeOpacity={0.7}>
+            <Text style={styles.trackLinkText}>Track this meal</Text>
+            <Ionicons name="chevron-forward" size={14} color={defaultPalette.brand} />
+          </TouchableOpacity>
+        )}
       </ScrollView>
 
       {toast && (
@@ -621,6 +661,18 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: fontSize.md,
     fontWeight: fontWeight.semibold,
+  },
+  trackLink: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: spacing.md,
+  },
+  trackLinkText: {
+    color: defaultPalette.brand,
+    fontSize: fontSize.sm,
+    fontWeight: fontWeight.medium,
+    marginRight: 2,
   },
   toast: {
     position: 'absolute',

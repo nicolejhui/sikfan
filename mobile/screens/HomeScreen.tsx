@@ -1,5 +1,5 @@
-import React from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity } from 'react-native';
+import React, { useState } from 'react';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Image } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import Svg, { Polyline } from 'react-native-svg';
@@ -10,6 +10,7 @@ import { defaultPalette, verdictColor, spacing, radius, fontSize, fontWeight } f
 import { useHistoryStore } from '../store';
 import { verdictWord, type LoggedMeal } from '../store/types';
 import type { HomeStackParamList } from '../navigation';
+import { useMealThumbnail } from '../hooks/useMealThumbnail';
 
 const USER_NAME = 'Mina';
 
@@ -53,10 +54,20 @@ function Sparkline({ color }: { color: string }) {
 function MealRow({ meal, onPress }: { meal: LoggedMeal; onPress: () => void }) {
   const dishName = meal.dishes[0]?.name ?? 'Unknown dish';
   const color = verdictColor(meal.verdict);
+  const thumbnailUri = useMealThumbnail(meal);
+  const [thumbnailBroken, setThumbnailBroken] = useState(false);
 
   return (
     <TouchableOpacity style={styles.mealRow} onPress={onPress} activeOpacity={0.7}>
-      <View style={styles.thumbnail} />
+      {thumbnailUri && !thumbnailBroken ? (
+        <Image
+          source={{ uri: thumbnailUri }}
+          style={styles.thumbnail}
+          onError={() => setThumbnailBroken(true)}
+        />
+      ) : (
+        <View style={styles.thumbnail} />
+      )}
       <View style={styles.mealInfo}>
         <Text style={styles.mealName} numberOfLines={1}>{dishName}</Text>
         <Text style={styles.mealTime}>{relativeTime(meal.meal_timestamp)}</Text>

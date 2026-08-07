@@ -19,6 +19,8 @@ interface MealState {
   portionBucket: string | null;
   macros: { carbs_g: number; protein_g: number; fat_g: number; calories: number } | null;
   error: string | null;
+  capturedImageUri: string | null;
+  imageUrl: string | null;
 }
 
 interface MealActions {
@@ -39,6 +41,8 @@ const initial: MealState = {
   portionBucket: null,
   macros: null,
   error: null,
+  capturedImageUri: null,
+  imageUrl: null,
 };
 
 type StoreApi = { getState: () => MealState & MealActions };
@@ -67,6 +71,7 @@ function applyResult(result: MealResult, set: (fn: (s: MealState) => void) => vo
     s.portion = primary?.portion_g ?? null;
     s.portionBucket = primary?.portion_bucket ?? null;
     s.macros = macros;
+    s.imageUrl = result.image_url;
   });
 }
 
@@ -101,7 +106,7 @@ export const useMealStore = create<MealState & MealActions>()(
   immer((set, get) => ({
     ...initial,
     startScan: (imageUri: string) => {
-      set((s) => { Object.assign(s, initial); s.status = 'uploading'; });
+      set((s) => { Object.assign(s, initial); s.status = 'uploading'; s.capturedImageUri = imageUri; });
       useGlucoseStore.getState().reset(); // MOB-012: each new scan starts with no anchor
       void runScan(imageUri, set, get);
     },

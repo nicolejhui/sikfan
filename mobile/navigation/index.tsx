@@ -13,6 +13,7 @@ import CameraScreen from '../screens/CameraScreen';
 import AnalyzingScreen from '../screens/AnalyzingScreen';
 import TrendsScreen from '../screens/TrendsScreen';
 import AboutScreen from '../screens/AboutScreen';
+import PostMealTrackingScreen from '../screens/PostMealTrackingScreen';
 
 // ---------------------------------------------------------------------------
 // Param lists
@@ -26,6 +27,7 @@ export type RootStackParamList = {
 export type HomeStackParamList = {
   Home: undefined;
   Results: { mealId?: string } | undefined;
+  PostMealTracking: { mealId: string };
 };
 
 export type LogStackParamList = {
@@ -65,6 +67,7 @@ function HomeStackNavigator() {
     <HomeStack.Navigator screenOptions={{ headerShown: false }}>
       <HomeStack.Screen name="Home" component={HomeScreen} />
       <HomeStack.Screen name="Results" component={ResultsScreen} />
+      <HomeStack.Screen name="PostMealTracking" component={PostMealTrackingScreen} />
     </HomeStack.Navigator>
   );
 }
