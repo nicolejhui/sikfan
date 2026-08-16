@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, useWindowDimensions } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useRoute } from '@react-navigation/native';
 import { VictoryChart, VictoryLine, VictoryArea, VictoryAxis, VictoryScatter } from 'victory-native';
@@ -28,6 +28,12 @@ export default function PostMealTrackingScreen() {
   const navigation = useNavigation();
   const route = useRoute();
   const { mealId } = route.params as { mealId: string };
+
+  // VictoryChart defaults to width 450 when unset, which overflows the
+  // chartCard on any phone narrower than ~482px — give it the card's actual
+  // content width instead.
+  const { width: screenWidth } = useWindowDimensions();
+  const chartWidth = screenWidth - spacing.md * 2;
 
   const loggedMeal = useHistoryStore((s) => s.meals.find((m) => m.meal_id === mealId));
   const dishName = loggedMeal?.dishes[0]?.name ?? 'Unknown dish';
@@ -77,7 +83,7 @@ export default function PostMealTrackingScreen() {
 
       <ScrollView contentContainerStyle={styles.content}>
         <View style={styles.chartCard}>
-          <VictoryChart height={CHART_HEIGHT} padding={{ top: 12, bottom: 28, left: 40, right: 12 }}>
+          <VictoryChart width={chartWidth} height={CHART_HEIGHT} padding={{ top: 12, bottom: 28, left: 40, right: 12 }}>
             <VictoryAxis
               dependentAxis
               style={{ axis: { stroke: 'transparent' }, tickLabels: { fontSize: 10, fill: defaultPalette.inkFaint } }}
@@ -177,6 +183,7 @@ const styles = StyleSheet.create({
     borderRadius: radius.lg,
     borderWidth: 1,
     borderColor: defaultPalette.hair,
+    overflow: 'hidden',
     marginBottom: spacing.md,
     paddingVertical: spacing.xs,
   },

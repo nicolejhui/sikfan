@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Image } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Image, useWindowDimensions } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -14,6 +14,8 @@ import ConfirmDishSheet from '../components/ConfirmDishSheet';
 import GlucosePad from '../components/GlucosePad';
 import { MVP_MODE } from '../constants/config';
 import { useMealThumbnail } from '../hooks/useMealThumbnail';
+import { logMeal } from '../api/meals';
+import { ApiError } from '../api/client';
 
 function sumMacros(dishes: { carbs_g: number; protein_g: number; fat_g: number; calories: number }[]) {
   return dishes.reduce(
@@ -52,6 +54,12 @@ export default function ResultsScreen() {
   const navigation = useNavigation();
   const route = useRoute();
   const routeMealId = (route.params as { mealId?: string } | undefined)?.mealId;
+
+  // VictoryChart defaults to width 450 when unset, which overflows the
+  // chartCard on any phone narrower than ~482px — give it the card's actual
+  // content width instead.
+  const { width: screenWidth } = useWindowDimensions();
+  const chartWidth = screenWidth - spacing.md * 2;
 
   const scanMealId = useMealStore((s) => s.mealId);
   const scanDishName = useMealStore((s) => s.dishName);
@@ -147,26 +155,41 @@ export default function ResultsScreen() {
 
   const macroMax = macros ? Math.max(macros.carbs_g, macros.protein_g, macros.fat_g, macros.calories / 4) : 0;
 
-  const handleLog = () => {
+  const [logging, setLogging] = useState(false);
+
+  const handleLog = async () => {
     if (!mealId || hasLoggedRef.current || alreadyLogged) return;
     hasLoggedRef.current = true;
-    addMeal({
-      meal_id: mealId,
-      dishes,
-      total_carbs_g: macros?.carbs_g ?? 0,
-      image_url: scanCapturedImageUri ?? scanImageUrl ?? null,
-      meal_timestamp: mealTimestamp ?? new Date().toISOString(),
-      verdict,
-    });
-    showToast('Logged to your day');
-    // MOB-011: post-MVP, stay on Results so the "Track this meal" link is
-    // reachable instead of auto-navigating away. MVP_MODE keeps today's
-    // shipped auto-navigate behavior unchanged.
-    if (MVP_MODE) {
-      setTimeout(() => {
-        (navigation.getParent() as { navigate: (name: string, params?: object) => void } | undefined)
-          ?.navigate('MainTabs', { screen: 'LogTab', params: { screen: 'MealLog' } });
-      }, 1300);
+    setLogging(true);
+    try {
+      const response = await logMeal(
+        mealId,
+        dishes.map((d) => d.name)
+      );
+      addMeal({
+        meal_id: mealId,
+        dishes,
+        total_carbs_g: macros?.carbs_g ?? 0,
+        image_url: scanCapturedImageUri ?? scanImageUrl ?? null,
+        meal_timestamp: response.meal_timestamp,
+        verdict,
+      });
+      showToast('Logged to your day');
+      // MOB-011: post-MVP, stay on Results so the "Track this meal" link is
+      // reachable instead of auto-navigating away. MVP_MODE keeps today's
+      // shipped auto-navigate behavior unchanged.
+      if (MVP_MODE) {
+        setTimeout(() => {
+          (navigation.getParent() as { navigate: (name: string, params?: object) => void } | undefined)
+            ?.navigate('MainTabs', { screen: 'LogTab', params: { screen: 'MealLog' } });
+        }, 1300);
+      }
+    } catch (err) {
+      hasLoggedRef.current = false;
+      const message = err instanceof ApiError ? err.message : 'Could not log meal — try again';
+      showToast(message);
+    } finally {
+      setLogging(false);
     }
   };
 
@@ -276,7 +299,7 @@ export default function ResultsScreen() {
             </View>
 
             <View style={styles.chartCard}>
-              <VictoryChart height={CHART_HEIGHT} padding={{ top: 12, bottom: 28, left: 40, right: 12 }}>
+              <VictoryChart width={chartWidth} height={CHART_HEIGHT} padding={{ top: 12, bottom: 28, left: 40, right: 12 }}>
                 <VictoryAxis
                   dependentAxis
                   style={{ axis: { stroke: 'transparent' }, tickLabels: { fontSize: 10, fill: defaultPalette.inkFaint } }}
@@ -341,12 +364,14 @@ export default function ResultsScreen() {
             <Ionicons name="flash-outline" size={20} color={defaultPalette.inkSoft} />
           </TouchableOpacity>
           <TouchableOpacity
-            style={[styles.logButton, alreadyLogged && styles.logButtonDisabled]}
+            style={[styles.logButton, (alreadyLogged || logging) && styles.logButtonDisabled]}
             onPress={handleLog}
             activeOpacity={0.85}
-            disabled={alreadyLogged}
+            disabled={alreadyLogged || logging}
           >
-            <Text style={styles.logButtonText}>{alreadyLogged ? 'Logged' : 'Log this meal'}</Text>
+            <Text style={styles.logButtonText}>
+              {alreadyLogged ? 'Logged' : logging ? 'Logging…' : 'Log this meal'}
+            </Text>
           </TouchableOpacity>
         </View>
 
@@ -567,6 +592,7 @@ const styles = StyleSheet.create({
     borderColor: defaultPalette.hair,
     marginBottom: spacing.md,
     paddingVertical: spacing.xs,
+    overflow: 'hidden',
   },
   statStrip: {
     flexDirection: 'row',

@@ -22,3 +22,17 @@ export interface LogMealResponse {
   logged: boolean;
   meal_timestamp: string;
 }
+
+// Matches ConfirmDishRequest in api.py: corrected_label is omitted (not sent
+// as null) for CONFIRM, which is the frozen convention per
+// data/MOBILE_DECISIONS.md Decision 4.
+export type ConfirmDishRequest =
+  | { meal_id: string; crop_id: string; action: 'CONFIRM' }
+  | { meal_id: string; crop_id: string; action: 'CORRECT' | 'ADD_NEW'; corrected_label: string };
+
+export interface ConfirmDishResponse {
+  crop_id: string;
+  action: 'CONFIRM' | 'CORRECT' | 'ADD_NEW';
+  updated_label: string;
+  chromadb_updated: boolean;
+}

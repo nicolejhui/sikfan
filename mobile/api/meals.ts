@@ -1,6 +1,6 @@
 import { File, Paths } from 'expo-file-system';
 import { apiFetchJson, ApiError, BASE_URL, API_KEY } from './client';
-import type { JobStatusResponse, LogMealResponse } from './types';
+import type { ConfirmDishRequest, ConfirmDishResponse, JobStatusResponse, LogMealResponse } from './types';
 
 export async function submitMeal(imageUri: string): Promise<{ meal_id: string; status: string }> {
   const formData = new FormData();
@@ -21,6 +21,14 @@ export async function logMeal(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ meal_id: mealId, confirmed_dishes: confirmedDishes }),
+  });
+}
+
+export async function confirmDish(body: ConfirmDishRequest): Promise<ConfirmDishResponse> {
+  return apiFetchJson('/confirm-dish', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
 }
 

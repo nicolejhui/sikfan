@@ -1,10 +1,13 @@
 import React, { useCallback, useState } from 'react';
-import { StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { BottomSheetBackdrop, BottomSheetModal, BottomSheetView } from '@gorhom/bottom-sheet';
 import type { BottomSheetBackdropProps } from '@gorhom/bottom-sheet';
 
 import { defaultPalette, spacing, radius, fontSize, fontWeight } from '../constants/theme';
+import { confirmDish } from '../api/meals';
+import { ApiError } from '../api/client';
+import type { ConfirmDishRequest } from '../api/types';
 
 interface ConfirmDishSheetProps {
   sheetRef: React.RefObject<BottomSheetModal | null>;
@@ -13,23 +16,9 @@ interface ConfirmDishSheetProps {
   dishName: string | null;
   confidence: number | null;
   onToast: (message: string) => void;
-  // Client-side-only reflection of a correction — no API call (MOB-010 is a
-  // stub; Epic 10's real POST /confirm-dish + ChromaDB write replaces this).
+  // Called with the server's normalized label once POST /confirm-dish
+  // succeeds, so the caller can reflect it in mealStore/historyStore.
   onCorrected: (correctedName: string) => void;
-}
-
-// Matches ConfirmDishRequest in api.py: corrected_label is `str | None = None`
-// and every tested CONFIRM curl example (docs/API-LAYER-TICKETS.md) omits the
-// key entirely rather than sending `corrected_label: null` — key omission is
-// the frozen convention for this field, not explicit null. See
-// data/MOBILE_DECISIONS.md Decision 4.
-type ConfirmCorrectPayload =
-  | { meal_id: string; crop_id: string; action: 'CONFIRM' }
-  | { meal_id: string; crop_id: string; action: 'CORRECT' | 'ADD_NEW'; corrected_label: string };
-
-function logStub(payload: ConfirmCorrectPayload) {
-  // Epic 10 greps this prefix to find the POST /confirm-dish integration point.
-  console.log('[MOB-010 stub] confirm/correct:', payload);
 }
 
 export default function ConfirmDishSheet({
@@ -43,29 +32,47 @@ export default function ConfirmDishSheet({
 }: ConfirmDishSheetProps) {
   const [mode, setMode] = useState<'initial' | 'correcting'>('initial');
   const [correctedText, setCorrectedText] = useState(dishName ?? '');
+  const [submitting, setSubmitting] = useState(false);
 
   const handleSheetChange = useCallback(
     (index: number) => {
       // index >= 0 means presenting/presented; -1 means dismissed. Reset the
       // "correct it" sub-form on every open so a prior edit doesn't linger.
       setMode('initial');
+      setSubmitting(false);
       if (index >= 0) setCorrectedText(dishName ?? '');
     },
     [dishName]
   );
 
+  const submit = useCallback(
+    async (payload: ConfirmDishRequest, successToast: string) => {
+      setSubmitting(true);
+      try {
+        const response = await confirmDish(payload);
+        if (payload.action !== 'CONFIRM') onCorrected(response.updated_label);
+        onToast(successToast);
+        sheetRef.current?.dismiss();
+      } catch (err) {
+        const message = err instanceof ApiError ? err.message : 'Could not save — try again';
+        onToast(message);
+      } finally {
+        setSubmitting(false);
+      }
+    },
+    [onToast, onCorrected, sheetRef]
+  );
+
   const handleLooksRight = useCallback(() => {
-    logStub({ meal_id: mealId, crop_id: cropId, action: 'CONFIRM' });
-    onToast('Confirmed');
-    sheetRef.current?.dismiss();
-  }, [mealId, cropId, onToast, sheetRef]);
+    void submit({ meal_id: mealId, crop_id: cropId, action: 'CONFIRM' }, 'Confirmed');
+  }, [mealId, cropId, submit]);
 
   const handleSaveCorrection = useCallback(() => {
-    logStub({ meal_id: mealId, crop_id: cropId, action: 'CORRECT', corrected_label: correctedText });
-    onCorrected(correctedText);
-    onToast('Saved');
-    sheetRef.current?.dismiss();
-  }, [mealId, cropId, correctedText, onToast, onCorrected, sheetRef]);
+    void submit(
+      { meal_id: mealId, crop_id: cropId, action: 'CORRECT', corrected_label: correctedText },
+      'Saved'
+    );
+  }, [mealId, cropId, correctedText, submit]);
 
   const renderBackdrop = useCallback(
     (props: BottomSheetBackdropProps) => (
@@ -95,11 +102,25 @@ export default function ConfirmDishSheet({
 
         {mode === 'initial' ? (
           <View style={styles.actionsRow}>
-            <TouchableOpacity style={styles.correctButton} onPress={() => setMode('correcting')} activeOpacity={0.85}>
+            <TouchableOpacity
+              style={styles.correctButton}
+              onPress={() => setMode('correcting')}
+              activeOpacity={0.85}
+              disabled={submitting}
+            >
               <Text style={styles.correctButtonText}>Correct it</Text>
             </TouchableOpacity>
-            <TouchableOpacity style={styles.confirmButton} onPress={handleLooksRight} activeOpacity={0.85}>
-              <Text style={styles.confirmButtonText}>Looks right ✓</Text>
+            <TouchableOpacity
+              style={styles.confirmButton}
+              onPress={handleLooksRight}
+              activeOpacity={0.85}
+              disabled={submitting}
+            >
+              {submitting ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={styles.confirmButtonText}>Looks right ✓</Text>
+              )}
             </TouchableOpacity>
           </View>
         ) : (
@@ -111,9 +132,19 @@ export default function ConfirmDishSheet({
               autoFocus
               placeholder="Dish name"
               placeholderTextColor={defaultPalette.inkFaint}
+              editable={!submitting}
             />
-            <TouchableOpacity style={styles.confirmButton} onPress={handleSaveCorrection} activeOpacity={0.85}>
-              <Text style={styles.confirmButtonText}>Save correction</Text>
+            <TouchableOpacity
+              style={styles.confirmButton}
+              onPress={handleSaveCorrection}
+              activeOpacity={0.85}
+              disabled={submitting || !correctedText.trim()}
+            >
+              {submitting ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={styles.confirmButtonText}>Save correction</Text>
+              )}
             </TouchableOpacity>
           </View>
         )}
