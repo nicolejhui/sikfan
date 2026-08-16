@@ -106,6 +106,12 @@ def _build_review_items(detected_items: list[dict]) -> list[dict]:
       mixed_bowl lone base only → reason: "partial_detection"
       mixed_bowl non-base UNCERTAIN → reason: "low_confidence"
       mixed_bowl non-base UNKNOWN   → reason: "unknown_dish"
+
+    Additionally, any item/component with needs_macro_entry=True gets a
+    "no_macro_data" entry appended alongside whatever confidence-based
+    entry (if any) it already produced above — a confident dish match can
+    still have no USDA data, and that's an independent failure mode that
+    should not be hidden behind (or replaced by) the confidence check.
     """
     review = []
 
@@ -124,6 +130,13 @@ def _build_review_items(detected_items: list[dict]) -> list[dict]:
                     "role": None,
                     "dish_name": item["dish_name"],
                     "reason": "low_confidence",
+                })
+            if item.get("needs_macro_entry"):
+                review.append({
+                    "crop_type": "single_dish",
+                    "role": None,
+                    "dish_name": item["dish_name"],
+                    "reason": "no_macro_data",
                 })
 
         elif item["crop_type"] == "mixed_bowl":
@@ -156,6 +169,14 @@ def _build_review_items(detected_items: list[dict]) -> list[dict]:
                             "dish_name": comp["dish_name"],
                             "reason": "low_confidence",
                         })
+
+                if comp.get("needs_macro_entry"):
+                    review.append({
+                        "crop_type": "mixed_bowl",
+                        "role": comp["role"],
+                        "dish_name": comp["dish_name"],
+                        "reason": "no_macro_data",
+                    })
 
     return review
 
@@ -246,6 +267,7 @@ def analyze_meal(
                 "status":      threshold["status"],
                 "macros":      portion["macros_scaled"],
                 "portion":     portion["portion_bucket"],
+                "needs_macro_entry": portion["needs_macro_entry"],
                 "_mask_pixels": crop_dict["mask_pixels"],  # scratch field for tiebreak
             })
 
@@ -272,6 +294,7 @@ def analyze_meal(
                 "confirmed":        clf["confirmed"],
                 "macros":           por["macros_scaled"],
                 "portion_fraction": por["portion_fraction"],
+                "needs_macro_entry": por["needs_macro_entry"],
             }
             for clf, por in zip(classify_comps, portion_comps)
         ]

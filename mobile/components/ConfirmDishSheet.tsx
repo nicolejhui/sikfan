@@ -16,9 +16,11 @@ interface ConfirmDishSheetProps {
   dishName: string | null;
   confidence: number | null;
   onToast: (message: string) => void;
-  // Called with the server's normalized label once POST /confirm-dish
-  // succeeds, so the caller can reflect it in mealStore/historyStore.
-  onCorrected: (correctedName: string) => void;
+  // Called once POST /confirm-dish succeeds for CORRECT/ADD_NEW, with the
+  // user-typed name (not the server's normalized DB key — see submit()
+  // below) and whether the correction changed the dish's macros server-side
+  // (FOOD-016a), so the caller knows whether to re-fetch glucose too.
+  onCorrected: (correctedName: string, macrosChanged: boolean) => void;
 }
 
 export default function ConfirmDishSheet({
@@ -49,8 +51,11 @@ export default function ConfirmDishSheet({
     async (payload: ConfirmDishRequest, successToast: string) => {
       setSubmitting(true);
       try {
+        // response.updated_label is normalize_dish_name()'s DB key
+        // ("kimchi_jjigae") — the ChromaDB/pipeline canonical form, not a
+        // display string. Reflect back what the user actually typed instead.
         const response = await confirmDish(payload);
-        if (payload.action !== 'CONFIRM') onCorrected(response.updated_label);
+        if (payload.action !== 'CONFIRM') onCorrected(payload.corrected_label, response.macros_changed);
         onToast(successToast);
         sheetRef.current?.dismiss();
       } catch (err) {

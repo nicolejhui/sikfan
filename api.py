@@ -31,6 +31,8 @@ from glucose_analysis import analyze_glucose_preview as _analyze_glucose_preview
 from pipeline.embedding_store import EmbeddingStore, _get_clip
 from pipeline.feedback import FeedbackAction, _append_correction_log, normalize_dish_name, record_feedback
 from pipeline.glucose_store import save_cgm_reading
+from pipeline.macro_lookup import lookup_macros
+from pipeline.portion import _scale_macros  # private but stable; reuse (matches nutrition.py's pattern)
 from pipeline.segmentation import _get_model, segment_meal
 
 _log = logging.getLogger(__name__)
@@ -184,6 +186,7 @@ class DishResult(BaseModel):
     calories: float
     portion_g: float | None = None
     portion_bucket: str | None = None  # "small" | "medium" | "large"; None if not estimated
+    needs_macro_entry: bool = False  # True if USDA had no match — carbs/macros above are 0, not verified-zero
 
 
 class MealResult(BaseModel):
@@ -297,6 +300,7 @@ class ConfirmDishResponse(BaseModel):
     action: Literal["CONFIRM", "CORRECT", "ADD_NEW"]
     updated_label: str
     chromadb_updated: bool
+    macros_changed: bool = False  # True if CORRECT/ADD_NEW's carbs_g differs from the pre-correction value
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +346,7 @@ def _build_dish_results(detected_items: list[dict]) -> list[dict]:
                 "calories": macros.get("calories", 0.0),
                 "portion_g": item.get("portion_g") or None,
                 "portion_bucket": item.get("portion") or None,  # pipeline stores bucket under "portion"
+                "needs_macro_entry": item.get("needs_macro_entry", False),
             })
         elif item["crop_type"] == "mixed_bowl":
             for j, comp in enumerate(item.get("components", [])):
@@ -357,6 +362,7 @@ def _build_dish_results(detected_items: list[dict]) -> list[dict]:
                     "calories": macros.get("calories", 0.0),
                     "portion_g": comp.get("portion_g") or None,
                     "portion_bucket": comp.get("portion_bucket") or None,
+                    "needs_macro_entry": comp.get("needs_macro_entry", False),
                 })
     return dishes
 
@@ -732,6 +738,45 @@ def _confirm_metadata_only(dish_name: str) -> bool:
 # API-006 route
 # ---------------------------------------------------------------------------
 
+def _recompute_dish_macros(corrected_label: str, portion_g: float | None) -> dict:
+    """Live USDA lookup for a corrected dish label, rescaled to portion_g.
+
+    Returns fields to merge into a DishResult dict: carbs_g, protein_g,
+    fat_g, calories, needs_macro_entry. Reuses lookup_macros() (not
+    portion.py's cache-only get_macros()) because a just-corrected label has
+    by definition never been looked up before.
+    """
+    macro_result = lookup_macros(corrected_label)
+    needs_macro_entry = macro_result.source == "no_results"
+    if needs_macro_entry:
+        return {
+            "carbs_g": 0.0, "protein_g": 0.0, "fat_g": 0.0, "calories": 0.0,
+            "needs_macro_entry": True,
+        }
+
+    macros = {
+        "calories": macro_result.calories,
+        "carbs_g": macro_result.carbs_g,
+        "fiber_g": macro_result.fiber_g,
+        "protein_g": macro_result.protein_g,
+        "fat_g": macro_result.fat_g,
+        "reference_weight_g": 100.0,  # USDA values are always per-100g
+    }
+    scaled = _scale_macros(macros, portion_g or 100.0)
+    if scaled is None:
+        return {
+            "carbs_g": 0.0, "protein_g": 0.0, "fat_g": 0.0, "calories": 0.0,
+            "needs_macro_entry": True,
+        }
+    return {
+        "carbs_g": scaled["carbs_g"],
+        "protein_g": scaled["protein_g"],
+        "fat_g": scaled["fat_g"],
+        "calories": scaled["calories"],
+        "needs_macro_entry": False,
+    }
+
+
 @app.post("/confirm-dish", response_model=ConfirmDishResponse, dependencies=[Depends(verify_api_key)])
 def confirm_dish(body: ConfirmDishRequest):
     """Send CONFIRM / CORRECT / ADD_NEW feedback for a detected crop.
@@ -770,6 +815,21 @@ def confirm_dish(body: ConfirmDishRequest):
     corrected_label = original_name if body.action == "CONFIRM" else body.corrected_label
     updated_label = normalize_dish_name(corrected_label)
     action = FeedbackAction(body.action)
+
+    # 3b. CORRECT/ADD_NEW: the dish identity actually changed, so its macros
+    # (looked up for the *old*, wrong label) are stale — recompute for the
+    # new label and persist back into job_status. CONFIRM leaves macros as
+    # they were computed during the scan (the name was already right).
+    macros_changed = False
+    if body.action in ("CORRECT", "ADD_NEW"):
+        old_carbs_g = dish_entry.get("carbs_g", 0.0)
+        dish_entry.update(_recompute_dish_macros(corrected_label, dish_entry.get("portion_g")))
+        dish_entry["name"] = updated_label
+        macros_changed = dish_entry["carbs_g"] != old_carbs_g
+
+        result = job.setdefault("result", {})
+        result["total_carbs_g"] = round(sum(d.get("carbs_g", 0.0) for d in dishes), 2)
+        _write_job_status(status_path, job)
 
     # 4. Resolve crop file.
     # "crop_1"   → parent_idx=1 → data/crops/{meal_id}/crop_1.jpg  (single_dish)
@@ -829,6 +889,7 @@ def confirm_dish(body: ConfirmDishRequest):
         action=body.action,
         updated_label=updated_label,
         chromadb_updated=chromadb_updated,
+        macros_changed=macros_changed,
     )
 
 

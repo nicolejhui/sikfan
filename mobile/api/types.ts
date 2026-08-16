@@ -35,4 +35,5 @@ export interface ConfirmDishResponse {
   action: 'CONFIRM' | 'CORRECT' | 'ADD_NEW';
   updated_label: string;
   chromadb_updated: boolean;
+  macros_changed: boolean;  // true if CORRECT/ADD_NEW's carbs_g differs from the pre-correction value
 }

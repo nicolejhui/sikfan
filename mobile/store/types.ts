@@ -10,6 +10,7 @@ export interface DishResult {
   calories: number;
   portion_g: number | null;
   portion_bucket: string | null;  // "small" | "medium" | "large"; null if not estimated
+  needs_macro_entry: boolean;  // true if USDA had no match — carbs/macros above are 0, not verified-zero
 }
 
 export interface MealResult {

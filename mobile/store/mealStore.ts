@@ -27,6 +27,7 @@ interface MealActions {
   startScan: (imageUri: string) => void;
   setResult: (result: Partial<MealState>) => void;
   updateDishName: (cropId: string, name: string) => void;
+  refreshFromResult: (result: MealResult) => void;
   reset: () => void;
 }
 
@@ -111,6 +112,10 @@ export const useMealStore = create<MealState & MealActions>()(
       void runScan(imageUri, set, get);
     },
     setResult: (result) => set((s) => { Object.assign(s, result); }),
+    // FOOD-016a: re-fetch after a dish correction changes macros — reuses
+    // the same apply path a fresh scan result goes through, so display
+    // (dishName/macros) and stored dishes stay consistent either way.
+    refreshFromResult: (result) => applyResult(result, set),
     updateDishName: (cropId, name) =>
       set((s) => {
         const dish = s.dishes.find((d) => d.crop_id === cropId);

@@ -42,7 +42,7 @@ _VALID_PORTIONS  = {"small", "medium", "large"}
 _VALID_ROLES     = {"base", "protein", "vegetable"}
 _VALID_REASONS   = {
     "unknown_dish", "low_confidence", "base_always_confirm",
-    "partial_detection", "no_food_detected",
+    "partial_detection", "no_food_detected", "no_macro_data",
 }
 
 
@@ -70,7 +70,9 @@ def test_detected_items_single_dish_schema():
     result = analyze_meal(_BREAKFAST)
     single_items = [i for i in result["detected_items"] if i["crop_type"] == "single_dish"]
     for item in single_items:
-        assert set(item.keys()) == {"crop_type", "dish_name", "confidence", "status", "macros", "portion"}, (
+        assert set(item.keys()) == {
+            "crop_type", "dish_name", "confidence", "status", "macros", "portion", "needs_macro_entry",
+        }, (
             f"Unexpected keys: {set(item.keys())}"
         )
         assert item["status"] in _VALID_STATUSES, f"Bad status: {item['status']}"
@@ -231,7 +233,7 @@ def test_confident_conflict_size_tiebreak(monkeypatch):
     monkeypatch.setattr(
         am_module, "estimate_portion",
         lambda comp_result, dish_name, config_path="config.yaml": {
-            "macros_scaled": None, "portion_bucket": "medium",
+            "macros_scaled": None, "portion_bucket": "medium", "needs_macro_entry": True,
         },
     )
 
@@ -268,7 +270,7 @@ def test_confident_conflict_score_wins_outside_band(monkeypatch):
     monkeypatch.setattr(
         am_module, "estimate_portion",
         lambda comp_result, dish_name, config_path="config.yaml": {
-            "macros_scaled": None, "portion_bucket": "medium",
+            "macros_scaled": None, "portion_bucket": "medium", "needs_macro_entry": True,
         },
     )
 

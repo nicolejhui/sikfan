@@ -14,7 +14,7 @@ import ConfirmDishSheet from '../components/ConfirmDishSheet';
 import GlucosePad from '../components/GlucosePad';
 import { MVP_MODE } from '../constants/config';
 import { useMealThumbnail } from '../hooks/useMealThumbnail';
-import { logMeal } from '../api/meals';
+import { logMeal, pollMealStatus } from '../api/meals';
 import { ApiError } from '../api/client';
 
 function sumMacros(dishes: { carbs_g: number; protein_g: number; fat_g: number; calories: number }[]) {
@@ -120,13 +120,39 @@ export default function ResultsScreen() {
   const hasLoggedRef = useRef(false);
   const alreadyLogged = useHistoryStore((s) => !!mealId && s.meals.some((m) => m.meal_id === mealId));
 
-  const handleCorrected = (correctedName: string) => {
+  const handleCorrected = (correctedName: string, macrosChanged: boolean) => {
     if (!cropId) return;
     if (loggedMeal) {
+      // FOOD-016a: correcting an already-logged meal's macros/prediction is
+      // out of scope (POST /log-meal snapshots macros into a separate file
+      // this doesn't touch) — cosmetic name update only, same as before.
       updateHistoryDishName(loggedMeal.meal_id, cropId, correctedName);
-    } else {
-      updateScanDishName(cropId, correctedName);
+      return;
     }
+
+    updateScanDishName(cropId, correctedName); // optimistic, replaced by the refetch below
+    if (!mealId) return;
+
+    void (async () => {
+      try {
+        const job = await pollMealStatus(mealId);
+        if (job.result) {
+          useMealStore.getState().refreshFromResult(job.result);
+          // refreshFromResult just overwrote dishName/dishes[].name with the
+          // server's normalized DB key (e.g. "bok_choy") — DishResult.name
+          // is always that slug, by design, everywhere else in the app. For
+          // display we want what the user actually typed, so reapply it on
+          // top; the macros/other fields from the fresh fetch stay intact.
+          useMealStore.getState().updateDishName(cropId, correctedName);
+        }
+      } catch {
+        // Keep the optimistic name; macros stay whatever they were —
+        // user can reopen the edit sheet to retry.
+      }
+      // Re-fetch on every correction (not gated on macrosChanged) — the
+      // user wants the glucose card to always reflect the latest correction.
+      void useGlucoseStore.getState().fetchPrediction(mealId);
+    })();
   };
 
   useEffect(() => {
@@ -154,6 +180,10 @@ export default function ResultsScreen() {
   const actualData = readings.map((r) => ({ x: r.minutes, y: r.glucose_mgdl }));
 
   const macroMax = macros ? Math.max(macros.carbs_g, macros.protein_g, macros.fat_g, macros.calories / 4) : 0;
+  // FOOD-016: USDA had no match for these dishes, so their contribution to
+  // `macros` above is 0 — not a verified zero-carb food. Surface that so the
+  // total doesn't read as more complete than it is.
+  const dishesMissingMacros = dishes.filter((d) => d.needs_macro_entry);
 
   const [logging, setLogging] = useState(false);
 
@@ -356,6 +386,15 @@ export default function ResultsScreen() {
             <MacroBar label="Protein" value={macros.protein_g} max={macroMax} color={defaultPalette.good.fg} />
             <MacroBar label="Fat" value={macros.fat_g} max={macroMax} color={defaultPalette.warn.fg} />
             <MacroBar label="Calories" value={macros.calories} max={macroMax * 4} color={defaultPalette.low.fg} />
+            {dishesMissingMacros.length > 0 && (
+              <View style={styles.macroWarning}>
+                <Ionicons name="alert-circle-outline" size={14} color={defaultPalette.warn.fg} />
+                <Text style={styles.macroWarningText}>
+                  No nutrition data found for {dishesMissingMacros.map((d) => d.name).join(', ')} —
+                  totals above don't include {dishesMissingMacros.length > 1 ? 'them' : 'it'}.
+                </Text>
+              </View>
+            )}
           </View>
         )}
 
@@ -623,6 +662,20 @@ const styles = StyleSheet.create({
     borderColor: defaultPalette.hair,
     padding: spacing.md,
     marginBottom: spacing.md,
+  },
+  macroWarning: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: spacing.xs,
+    marginTop: spacing.sm,
+    paddingTop: spacing.sm,
+    borderTopWidth: 1,
+    borderTopColor: defaultPalette.hair,
+  },
+  macroWarningText: {
+    flex: 1,
+    fontSize: fontSize.xs,
+    color: defaultPalette.inkSoft,
   },
   macrosTitle: {
     color: defaultPalette.ink,
