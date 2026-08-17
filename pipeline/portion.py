@@ -118,7 +118,7 @@ def _read_multiplier(dish_name: str) -> float:
 # Macro scaling
 # ---------------------------------------------------------------------------
 
-def _scale_macros(macros: dict, portion_g: float) -> Optional[dict]:
+def scale_macros(macros: dict, portion_g: float) -> Optional[dict]:
     """
     Scale per-reference_weight_g macros to portion_g.
 
@@ -181,7 +181,7 @@ def estimate_portion(
     needs_macro_entry = (
         macros is None or macros.get("source") == "no_results"
     )
-    macros_scaled = None if needs_macro_entry else _scale_macros(macros, portion_g)
+    macros_scaled = None if needs_macro_entry else scale_macros(macros, portion_g)
 
     return {
         "dish_name":        dish_name,
@@ -237,7 +237,7 @@ def estimate_portions_mixed(
 
         macros = get_macros(dish_name)
         needs_macro_entry = macros is None or macros.get("source") == "no_results"
-        macros_scaled = None if needs_macro_entry else _scale_macros(macros, portion_g)
+        macros_scaled = None if needs_macro_entry else scale_macros(macros, portion_g)
 
         component_dict = {
             "dish_name":         dish_name,
@@ -280,7 +280,7 @@ def estimate_portions_mixed(
 
         macros = get_macros(dish_name)
         needs_macro_entry = macros is None or macros.get("source") == "no_results"
-        macros_scaled = None if needs_macro_entry else _scale_macros(macros, portion_g_adjusted)
+        macros_scaled = None if needs_macro_entry else scale_macros(macros, portion_g_adjusted)
 
         results.append({
             "dish_name":         dish_name,

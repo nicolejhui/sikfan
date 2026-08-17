@@ -16,6 +16,7 @@ Feature indices (used in both build_training_data and predict_glucose_curve):
 """
 
 import json
+import logging
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -28,6 +29,8 @@ from sklearn.multioutput import MultiOutputRegressor
 from sklearn.preprocessing import StandardScaler
 
 from pipeline.glucose_store import get_meal_logs, get_pre_meal_glucose
+
+_log = logging.getLogger(__name__)
 
 _MODEL_DIR = Path(__file__).parent.parent / "data" / "models"
 _MODEL_PATH = _MODEL_DIR / "glucose_model.joblib"
@@ -122,7 +125,16 @@ def build_training_data() -> tuple[np.ndarray, np.ndarray]:
         y: shape (n_meals, 37) — BG curve at 5-min intervals for 180 min
     """
     meals = get_meal_logs()
-    complete = [m for m in meals if m.get("cgm_window", {}).get("status") == "complete"]
+    cgm_complete = [m for m in meals if m.get("cgm_window", {}).get("status") == "complete"]
+    # GLUC-012: exclude rows where a confirmed dish had no macro match — a
+    # missing key (legacy, pre-GLUC-012 row) is UNKNOWN, not False, and is
+    # deliberately still treated as trainable here rather than backfilled.
+    complete = [m for m in cgm_complete if not m.get("macros_incomplete", False)]
+    skipped = len(cgm_complete) - len(complete)
+    _log.info(
+        "build_training_data: %d trainable meals, %d skipped (macros_incomplete)",
+        len(complete), skipped,
+    )
 
     X_rows = []
     y_rows = []
@@ -398,6 +410,7 @@ def should_retrain() -> bool:
         # (pre-fix log_meal wrote this) rather than crashing on .get().
         if isinstance(m.get("cgm_window"), dict)
         and m["cgm_window"].get("status") == "complete"
+        and not m.get("macros_incomplete", False)  # GLUC-012: only count rows build_training_data() will actually use
         and m["timestamp"] > last_trained_ts  # compare by timestamp, not insertion order
     )
     return new_complete >= 10

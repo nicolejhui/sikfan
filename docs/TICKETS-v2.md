@@ -710,7 +710,19 @@ As a developer, I want new dishes to get correct USDA macro matches automaticall
 
 ---
 
-### FOOD-017 — Fix macro lookup `None` → `0.0` coercion masking no-match results
+### FOOD-017 — Fix macro lookup `None` → `0.0` coercion masking no-match results — CLOSED
+
+**Resolution note:** Superseded by the `needs_macro_entry` flag pattern
+(`DishResult.needs_macro_entry`, shipped alongside this ticket) rather than
+this ticket's originally-specified `carbs_g: float | None` null-on-the-wire
+approach. `carbs_g` stays `0.0` for an unresolved dish; `needs_macro_entry`
+is the signal a client checks instead. This was deliberate — nulling
+`carbs_g` would have been a breaking change to the frozen `DishResult`/
+`analyze_meal` schema, and a boolean flag alongside an unchanged numeric type
+is additive. GLUC-012 (`docs/GLUCOSE-TICKETS.md`) extends the same pattern
+into the training corpus: `POST /log-meal` now propagates
+`needs_macro_entry` into `meal_logs.json` as `macros_incomplete` +
+`unresolved_dishes`, and `train_model()` excludes flagged rows.
 
 **User Story**
 As a developer, I want a genuine "no macro data found" result to be visibly distinguishable from "this dish has zero carbs/protein/fat/calories," so the app doesn't silently show wrong nutrition info as if it were real.

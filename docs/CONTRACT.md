@@ -129,9 +129,17 @@ Call after `pollMealStatus` returns `status: "complete"`. Records the meal for t
 {
   "meal_id": "550e8400-...",
   "logged": true,
-  "meal_timestamp": "2026-06-20T14:32:00+00:00"
+  "meal_timestamp": "2026-06-20T14:32:00+00:00",
+  "macros_incomplete": false,
+  "unresolved_dishes": []
 }
 ```
+`macros_incomplete` (GLUC-012) is `true` when one or more `confirmed_dishes`
+had `needs_macro_entry: true` in the analysis result — i.e. USDA had no match
+and that dish's macros are `0.0`, not verified-zero. `unresolved_dishes` lists
+those dish names. The meal is still logged either way; flagged rows are
+excluded from `train_model()`'s training corpus so a missing macro match
+can't silently teach the glucose model that a high-carb meal caused no rise.
 
 **Errors**
 | Code | Body `code` | Meaning |

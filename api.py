@@ -22,7 +22,7 @@ from typing import Literal
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from PIL import Image
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from analyze_meal import analyze_meal as _analyze_meal
 from glucose_analysis import MealNotFoundError, MissingCGMDataError
@@ -32,7 +32,7 @@ from pipeline.embedding_store import EmbeddingStore, _get_clip
 from pipeline.feedback import FeedbackAction, _append_correction_log, normalize_dish_name, record_feedback
 from pipeline.glucose_store import save_cgm_reading
 from pipeline.macro_lookup import lookup_macros
-from pipeline.portion import _scale_macros  # private but stable; reuse (matches nutrition.py's pattern)
+from pipeline.portion import scale_macros
 from pipeline.segmentation import _get_model, segment_meal
 
 _log = logging.getLogger(__name__)
@@ -214,6 +214,8 @@ class LogMealResponse(BaseModel):
     meal_id: str
     logged: bool
     meal_timestamp: str
+    macros_incomplete: bool = False  # True if any confirmed dish had needs_macro_entry set
+    unresolved_dishes: list[str] = Field(default_factory=list)
 
 
 # --- GET /glucose/{meal_id} ---
@@ -546,15 +548,34 @@ def log_meal(body: LogMealRequest):
             "carbs_g": d.get("carbs_g", 0.0),
             "protein_g": d.get("protein_g", 0.0),
             "fat_g": d.get("fat_g", 0.0),
+            # TODO(GLUC-012): fiber_g is never copied from the job-status dish
+            # into this log entry — same class of silent-data-loss bug as
+            # macros_incomplete below, but out of scope here (separate ticket).
         }
         dishes.append({"dish_name": name, "portion_size": "medium", "macros": macros})
         total_carbs += macros["carbs_g"]
+
+    # GLUC-012: a dish with needs_macro_entry set contributed 0.0 to total_carbs
+    # above without USDA ever actually confirming zero carbs. Flag the row so
+    # train_model() can exclude it instead of silently learning from it.
+    # Iterate the crop-keyed dish list (not the name-collapsed result_dishes
+    # dict above) — mixed_bowl components can share a dish name across crops,
+    # and collapsing by name first would let one crop's flag hide another's.
+    result_dish_list = (job.get("result") or {}).get("dishes", [])
+    confirmed_set = set(body.confirmed_dishes)
+    unresolved_dishes = sorted({
+        d["name"] for d in result_dish_list
+        if d["name"] in confirmed_set and d.get("needs_macro_entry", False)
+    })
+    macros_incomplete = bool(unresolved_dishes)
 
     log_entry = {
         "meal_id": body.meal_id,
         "timestamp": meal_timestamp,
         "dishes": dishes,
         "total_carbs_g": round(total_carbs, 2),
+        "macros_incomplete": macros_incomplete,
+        "unresolved_dishes": unresolved_dishes,
         "pre_meal_glucose_mgdl": None,
         "pre_meal_trend": None,
         # Dict, not []: pipeline/meal_tracker.py's attach_cgm_window() and
@@ -581,7 +602,13 @@ def log_meal(body: LogMealRequest):
     job["logged"] = True
     _write_job_status(status_path, job)
 
-    return LogMealResponse(meal_id=body.meal_id, logged=True, meal_timestamp=meal_timestamp)
+    return LogMealResponse(
+        meal_id=body.meal_id,
+        logged=True,
+        meal_timestamp=meal_timestamp,
+        macros_incomplete=macros_incomplete,
+        unresolved_dishes=unresolved_dishes,
+    )
 
 # ---------------------------------------------------------------------------
 # API-011 route
@@ -762,7 +789,7 @@ def _recompute_dish_macros(corrected_label: str, portion_g: float | None) -> dic
         "fat_g": macro_result.fat_g,
         "reference_weight_g": 100.0,  # USDA values are always per-100g
     }
-    scaled = _scale_macros(macros, portion_g or 100.0)
+    scaled = scale_macros(macros, portion_g or 100.0)
     if scaled is None:
         return {
             "carbs_g": 0.0, "protein_g": 0.0, "fat_g": 0.0, "calories": 0.0,
