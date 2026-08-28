@@ -696,3 +696,145 @@ way to bootstrap:
 
 The model improves significantly with each new meal logged through the full
 pipeline going forward.
+
+# GLUC-012 — Prevent unresolved macros from silently entering the GPR training corpus
+
+> Confirm `GLUC-012` is free before filing — `GLUC-011` is insulin pre-bolus capture.
+> Note that `FOOD-017` is currently a **duplicated ID** (liquid detection in
+> `POST-MVP.md`/`LLM-TICKETS.md`, macro null-coercion in `docs/TICKETS-v2.md`).
+> Renumber one of those in the same pass.
+
+---
+
+## User Story
+
+As a developer, I want meals containing dishes with no USDA macro match to be
+excluded from GPR training rather than contributing an understated carb total,
+so the glucose model is never taught that a high-carb meal produced no rise.
+
+---
+
+## Why this exists / the problem
+
+`needs_macro_entry` already exists end-to-end for the **display** path:
+`_recompute_dish_macros()` in `api.py` returns `carbs_g: 0.0` plus
+`needs_macro_entry: True` on `source == "no_results"`, `DishResult` carries the
+flag, and `ResultsScreen.tsx` renders the "totals above don't include it"
+warning via `dishesMissingMacros`.
+
+The **training** path has no equivalent protection. `POST /log-meal` writes to
+`meal_logs.json`, which is the corpus `train_model()` and `_should_retrain()`
+iterate. A meal where one dish had no USDA match is written with that dish
+contributing `0.0` to `total_carbs_g`. The user sees a warning on screen; the
+model does not. It sees a real CGM curve paired with an understated carb figure
+and learns that those carbs don't raise blood glucose.
+
+This is worse than a display bug for two reasons:
+
+1. It is **silent and permanent** — a bad row looks identical to a good row
+   once written, and nothing downstream can distinguish them.
+2. At n≈20 training pairs, a single badly-labelled meal is ~5% of the corpus
+   and materially bends the fit.
+
+**Closing note for FOOD-017:** the flag pattern (`needs_macro_entry: bool`)
+superseded that ticket's specified null pattern (`carbs_g: float | None`),
+deliberately, to avoid breaking the frozen `CONTRACT.md` schema. Close
+FOOD-017 with that note so it isn't re-litigated.
+
+---
+
+## Decisions (locked — do not infer alternatives at implementation time)
+
+| # | Decision |
+|---|----------|
+| **D1** | Do **not** refuse the log. A meal with unresolved macros is still worth capturing for its CGM pairing and for later recovery. |
+| **D2** | `meal_logs.json` entries gain two fields: `macros_incomplete: bool` and `unresolved_dishes: list[str]`. |
+| **D3** | Training **excludes** rows where `macros_incomplete` is true. Do not downweight, do not impute. Per-observation noise weighting (GPR `alpha`) is a separate future ticket — do not build it here. |
+| **D4** | `LogMealResponse` gains `macros_incomplete: bool = False` and `unresolved_dishes: list[str] = []`. Additive with defaults, so it is non-breaking — same convention already used by `needs_macro_entry` and `macros_changed`. |
+| **D5** | Recovery is a **script**, not automatic. Once FOOD-013 supplies a user override for a previously unresolved dish, `scripts/backfill_meal_log_macros.py` recomputes affected rows and clears the flag so the meal re-enters training. |
+| **D6** | Legacy rows written before this ticket have **no flag**. Treat a missing `macros_incomplete` key as **unknown, not false**. The audit script must identify and report them; do not silently assume they are clean. |
+
+---
+
+## Acceptance Criteria
+
+- [ ] `POST /log-meal` inspects each dish's `needs_macro_entry` from `job_status` before writing the log entry
+- [ ] When any dish has `needs_macro_entry: true`, the `meal_logs.json` entry is written with `macros_incomplete: true` and `unresolved_dishes` listing those dish names
+- [ ] When all dishes resolve, the entry is written with `macros_incomplete: false` and `unresolved_dishes: []`
+- [ ] `LogMealResponse` returns both fields so the client can surface a "this meal won't improve your predictions until you add nutrition data" affordance (mobile follow-up ticket, not this one)
+- [ ] `train_model()` skips rows where `macros_incomplete` is true
+- [ ] `_should_retrain()` counts only trainable rows, so excluded meals do not trigger a retrain that adds no new signal
+- [ ] Training logs the count of skipped rows on each run — a silent skip is the same class of bug this ticket fixes
+- [ ] `scripts/audit_meal_log_macros.py` reports, for the existing corpus: total rows, rows flagged incomplete, rows with **no** flag (legacy), and for legacy rows a best-effort determination by cross-referencing each dish name against `data/macro_cache/{slug}.json` for `source: "no_results"`
+- [ ] `scripts/backfill_meal_log_macros.py` recomputes macros for flagged rows whose dishes now resolve (via `get_macros()`, which prefers user overrides), updates `total_carbs_g`, and clears the flag
+- [ ] Regression test: log a meal containing a dish name guaranteed to miss USDA, assert `macros_incomplete: true` end-to-end and assert that row is absent from `train_model()`'s training set
+
+---
+
+## Out of scope (do not bundle)
+
+- GPR `alpha` / per-observation noise weighting
+- Ingredient-level decomposition or LLM macro estimation
+- USDA `dataType` cascade or query expansion
+- Mobile UI for the new `LogMealResponse` fields — file as a separate `MOB-*`
+- **Adjacent, same failure mode, separate ticket:** `/log-meal`'s macros dict has never included `fiber_g`, so `total_fiber_g` is `0` for every meal ever logged. Identical "zero means missing" bug. File it; do not fix it here.
+
+---
+
+## Files to modify / create
+
+- `api.py` — `LogMealResponse` model, `POST /log-meal` handler, `_append_meal_log()`
+- `pipeline/glucose_model.py` — `train_model()`, `_should_retrain()`
+- `scripts/audit_meal_log_macros.py` — new
+- `scripts/backfill_meal_log_macros.py` — new
+- `CONTRACT.md` — document the two new `LogMealResponse` fields
+- `docs/TICKETS-v2.md` — close FOOD-017 with the superseded-by-flag-pattern note
+
+---
+
+## Verification
+
+```bash
+# 1. Audit the existing corpus — run this FIRST, before any code changes,
+#    and keep the output. It is your baseline for how bad the problem already is.
+python scripts/audit_meal_log_macros.py
+
+# 2. Current miss rate in the macro cache, for context
+echo "no_results: $(grep -l '"no_results"' data/macro_cache/*.json 2>/dev/null | wc -l) / $(ls data/macro_cache/*.json 2>/dev/null | wc -l)"
+
+# 3. Log a meal with a guaranteed-miss dish, confirm the flag round-trips
+curl -s -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d "{\"meal_id\":\"$MEAL_ID\",\"confirmed_dishes\":[\"zzz_nonexistent_dish\"]}" \
+  https://glycolens-api.fly.dev/log-meal | python -m json.tool
+
+# 4. Confirm the row is written flagged and is excluded from training
+python -c "
+import json
+from pipeline.glucose_model import train_model
+logs = json.load(open('data/glucose/meal_logs.json'))
+flagged = [m for m in logs if m.get('macros_incomplete')]
+legacy  = [m for m in logs if 'macros_incomplete' not in m]
+print(f'total={len(logs)} flagged={len(flagged)} legacy_unflagged={len(legacy)}')
+assert flagged, 'Expected at least one flagged row'
+"
+
+# 5. Regression — training set size drops by exactly the flagged count
+python -c "
+from pipeline.glucose_model import train_model
+train_model()  # should print the skipped-row count
+"
+```
+
+---
+
+## Dependencies
+
+FOOD-012 (macro lookup), FOOD-013 (user override — supplies the recovery path
+for D5), GLUC-003 (training pipeline being protected)
+
+---
+
+## Claude Code Prompt
+
+```
+```
