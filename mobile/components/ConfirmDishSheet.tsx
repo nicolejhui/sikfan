@@ -8,6 +8,7 @@ import { defaultPalette, spacing, radius, fontSize, fontWeight } from '../consta
 import { confirmDish } from '../api/meals';
 import { ApiError } from '../api/client';
 import type { ConfirmDishRequest } from '../api/types';
+import { formatDishName } from '../store/types';
 
 interface ConfirmDishSheetProps {
   sheetRef: React.RefObject<BottomSheetModal | null>;
@@ -97,7 +98,7 @@ export default function ConfirmDishSheet({
       handleIndicatorStyle={styles.handleIndicator}
     >
       <BottomSheetView style={styles.content}>
-        <Text style={styles.dishName} numberOfLines={1}>{dishName ?? 'Unknown dish'}</Text>
+        <Text style={styles.dishName} numberOfLines={1}>{formatDishName(dishName) || 'Unknown dish'}</Text>
         {confidence != null && (
           <View style={styles.confidenceBadge}>
             <Ionicons name="sparkles" size={11} color={defaultPalette.brand} />

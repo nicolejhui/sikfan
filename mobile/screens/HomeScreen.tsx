@@ -8,7 +8,7 @@ import type { StackNavigationProp } from '@react-navigation/stack';
 
 import { defaultPalette, verdictColor, spacing, radius, fontSize, fontWeight } from '../constants/theme';
 import { useHistoryStore } from '../store';
-import { verdictWord, type LoggedMeal } from '../store/types';
+import { formatDishName, verdictWord, type LoggedMeal } from '../store/types';
 import type { HomeStackParamList } from '../navigation';
 import { useMealThumbnail } from '../hooks/useMealThumbnail';
 
@@ -69,7 +69,7 @@ function MealRow({ meal, onPress }: { meal: LoggedMeal; onPress: () => void }) {
         <View style={styles.thumbnail} />
       )}
       <View style={styles.mealInfo}>
-        <Text style={styles.mealName} numberOfLines={1}>{dishName}</Text>
+        <Text style={styles.mealName} numberOfLines={1}>{formatDishName(dishName)}</Text>
         <Text style={styles.mealTime}>{relativeTime(meal.meal_timestamp)}</Text>
       </View>
       <View style={[styles.verdictChip, { backgroundColor: color.tint }]}>

@@ -120,6 +120,29 @@ export function verdictWord(verdict: Verdict | null | undefined): string {
   }
 }
 
+/**
+ * Render a dish name for display.
+ *
+ * `DishResult.name` is always the server's normalized slug — `normalize_dish_name()`
+ * lowercases and underscores it (`"Dried Tofu Sticks"` -> `dried_tofu_sticks`)
+ * because that string is the ChromaDB key and the macro-cache filename. That's
+ * correct as an identifier and wrong to show a user, so format at render time
+ * only; never write this back into state or send it to the API.
+ *
+ * Left alone if it has no underscores — LLM-supplied component names
+ * (`"rice, white, cooked"`) are already human-readable, and title-casing them
+ * would mangle the intentional lowercase.
+ */
+export function formatDishName(name: string | null | undefined): string {
+  if (!name) return '';
+  if (!name.includes('_')) return name;
+  return name
+    .split('_')
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ');
+}
+
 export function formatPortion(bucket: string | null, grams: number | null): string {
   if (!grams) return '';
   const approx = `~${Math.round(grams)} g`;

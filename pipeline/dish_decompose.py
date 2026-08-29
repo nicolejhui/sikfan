@@ -432,14 +432,22 @@ def resolve_composite_macros(dish_name: str, config_path: str = "config.yaml") -
     Decompose `dish_name` and fold its components into a single per-100g
     macro profile, shaped exactly like a pipeline.nutrition cache entry.
 
-    Returns None when the dish didn't actually decompose (a single component
-    whose name matches the input) — the signal to the caller to fall back to
-    the existing lookup_macros() path unchanged. No behavior change for
-    simple dishes.
+    Returns None when the dish didn't actually decompose (exactly one
+    component) — the signal to the caller to fall back to the existing
+    lookup_macros() path, unchanged, using the ORIGINAL dish_name (not
+    whatever the LLM renamed it to). No behavior change for simple dishes.
+
+    Deliberately checks component COUNT only, not name equality against the
+    input. A real model reliably renames even a genuinely simple dish into
+    USDA-style phrasing ("white rice" -> "rice, white, cooked") — confirmed
+    via a live call on 2026-08-28. An exact-string check against the
+    original name would treat every simple dish as composite, defeating the
+    "no behavior change for simple dishes" guarantee this function exists to
+    provide, for essentially every real dish name.
     """
     components = decompose_dish(dish_name, config_path=config_path)
 
-    if len(components) == 1 and _slug(components[0]["name"]) == _slug(dish_name):
+    if len(components) == 1:
         return None
 
     totals = {field: Decimal("0") for field in _MACRO_FIELDS}
@@ -448,6 +456,17 @@ def resolve_composite_macros(dish_name: str, config_path: str = "config.yaml") -
     carbs_resolved = Decimal("0")
     resolved_components = []
 
+    # NOTE (2026-08-28 finding): before this ticket, a correction made
+    # exactly one lookup_macros() call; this loop can now fire several for
+    # one correction. Live testing found USDA's search endpoint
+    # intermittently 400s on a well-formed query (confirmed NOT a rate
+    # limit — X-RateLimit-Remaining showed >99% headroom on the failing
+    # response), which lookup_macros() then caches as a genuine no_results —
+    # silently understating a resolvable component's macros. A client-side
+    # inter-call delay was tried here first and did NOT reliably prevent it
+    # (still failed at 3s spacing on retry) — the actual fix is the
+    # retry-with-backoff now in pipeline.macro_lookup._query_usda(), which
+    # benefits every caller, not just this loop.
     for component in components:
         proportion = Decimal(str(component["proportion"]))
         per_100g, macro_source = _component_per_100g(component)
@@ -475,6 +494,22 @@ def resolve_composite_macros(dish_name: str, config_path: str = "config.yaml") -
     # would wrongly exclude a genuinely zero-carb meal from glucose training).
     carb_coverage = float(carbs_resolved / carbs_total) if carbs_total > 0 else 1.0
 
+    # An "unresolved" component (no USDA match AND no fallback_macros)
+    # contributes 0.0 to BOTH carbs_resolved and carbs_total, so it is
+    # invisible to the ratio above — a dish with a wholly unknown component
+    # would report carb_coverage 1.0 while genuinely understating its carbs.
+    # Observed live 2026-08-28: a curry-rice dish whose vegetable component
+    # didn't resolve still reported 1.0. Its true carbs are unknown, not
+    # zero, so discount coverage by the share of the dish we know nothing
+    # about. Deliberately NOT an imputation — we don't invent a carb value
+    # for it (see D4); we just stop claiming full coverage.
+    known_mass = sum(
+        Decimal(str(c["proportion"]))
+        for c in resolved_components
+        if c["macro_source"] != "unresolved"
+    )
+    carb_coverage *= float(known_mass)
+
     result = {
         "dish_name": _slug(dish_name),
         "source": "composite",
@@ -487,3 +522,119 @@ def resolve_composite_macros(dish_name: str, config_path: str = "config.yaml") -
         result[field] = float(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# LLM-backed USDA match selection (replaces hardcoded heuristics)
+# ---------------------------------------------------------------------------
+
+_SELECT_SYSTEM = """You match a food name against candidate entries from the \
+USDA FoodData Central database.
+
+Given a dish name and a numbered list of candidate USDA food descriptions, \
+pick the index of the candidate that refers to the SAME FOOD.
+
+Rules:
+- A shared cooking method is NOT a match. "Peanuts, boiled" is not a match for \
+"boiled chicken" — the food itself (peanuts vs chicken) is different.
+- A more specific or differently-prepared version of the same food IS a match. \
+"Rice, white, cooked, glutinous" is an acceptable match for "white rice".
+- If NO candidate is the same food, return null. Returning null is correct and \
+expected; a wrong match is far worse than no match, because these numbers are \
+used for diabetic carb counting.
+
+Respond with ONLY valid JSON: {"best_index": <integer or null>}
+"""
+
+_SELECT_SCHEMA = {
+    "type": "object",
+    "properties": {"best_index": {"anyOf": [{"type": "integer"}, {"type": "null"}]}},
+    "required": ["best_index"],
+    "additionalProperties": False,
+}
+
+
+def select_best_usda_candidate(
+    dish_name: str,
+    candidate_names: list[str],
+    config_path: str = "config.yaml",
+) -> Optional[int]:
+    """
+    Return the index of the candidate that is the same food as `dish_name`,
+    or None if none of them are.
+
+    Replaces two pieces of guesswork at once:
+      1. lookup_macros() blindly taking candidates[0]. Observed 2026-08-29:
+         USDA's top hit for "boiled_chicken" was "Peanuts, boiled" (21g
+         carbs/100g vs chicken's ~0).
+      2. A hardcoded cooking-verb stopword list used to reject such matches —
+         English-only, and missing poached/blanched/stir-fried/smoked, i.e.
+         exactly the _PINYIN_FALLBACK brittleness this project already flags.
+
+    Fails CLOSED (returns None) on any error. An unvalidated match would be
+    recorded silently into a diabetic carb count; a blank is visible and the
+    user can still correct the dish by hand.
+    """
+    if not candidate_names:
+        return None
+
+    numbered = "\n".join(f"{i}. {name}" for i, name in enumerate(candidate_names))
+    try:
+        import anthropic
+
+        client = anthropic.Anthropic()
+        response = client.messages.create(
+            model=_load_decompose_model(config_path),
+            max_tokens=256,
+            output_config={
+                "effort": "low",
+                "format": {"type": "json_schema", "schema": _SELECT_SCHEMA},
+            },
+            system=[{
+                "type": "text",
+                "text": _SELECT_SYSTEM,
+                "cache_control": {"type": "ephemeral"},
+            }],
+            messages=[{
+                "role": "user",
+                "content": f"Dish name: {dish_name}\n\nCandidates:\n{numbered}",
+            }],
+        )
+        text = next(b.text for b in response.content if b.type == "text")
+        index = json.loads(text).get("best_index")
+    except Exception as exc:
+        _log.warning(
+            "select_best_usda_candidate failed for %r (%s: %s) — rejecting match "
+            "rather than recording an unvalidated one",
+            dish_name, type(exc).__name__, exc,
+        )
+        return None
+
+    if index is None:
+        return None
+    if not isinstance(index, int) or not (0 <= index < len(candidate_names)):
+        _log.warning("select_best_usda_candidate returned out-of-range index %r", index)
+        return None
+    return index
+
+
+def suggest_usda_query(dish_name: str, config_path: str = "config.yaml") -> Optional[str]:
+    """
+    A USDA-searchable rewrite of `dish_name`, or None if it's already fine.
+
+    Reuses the decomposition we already pay for: decompose_dish() returns
+    USDA-style component names ("white rice" -> "rice, white, cooked"), and
+    for a single-component dish that name IS the better search term — which
+    the old code discarded, then hand-maintained a _PINYIN_FALLBACK dict to
+    approximate. Costs no extra API call on a decomposition cache hit.
+    """
+    try:
+        components = decompose_dish(dish_name, config_path=config_path)
+    except Exception:
+        return None
+    if len(components) != 1:
+        return None
+    suggested = components[0]["name"].strip()
+    if not suggested or _slug(suggested) == _slug(dish_name):
+        return None
+    return suggested

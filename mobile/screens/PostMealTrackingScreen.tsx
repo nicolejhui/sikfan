@@ -6,6 +6,7 @@ import { VictoryChart, VictoryLine, VictoryArea, VictoryAxis, VictoryScatter } f
 
 import { defaultPalette, verdictColor, spacing, radius, fontSize, fontWeight } from '../constants/theme';
 import { useGlucoseStore, useHistoryStore } from '../store';
+import { formatDishName } from '../store/types';
 
 const CHART_HEIGHT = 186;
 const MIN_READINGS_FOR_SUMMARY = 3;
@@ -73,7 +74,7 @@ export default function PostMealTrackingScreen() {
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
       <View style={styles.header}>
-        <Text style={styles.dishName} numberOfLines={1}>{dishName}</Text>
+        <Text style={styles.dishName} numberOfLines={1}>{formatDishName(dishName)}</Text>
         {mealTimestamp && (
           <Text style={styles.subhead}>
             Logged {formatLogTime(mealTimestamp)} · {formatElapsed(mealTimestamp)}

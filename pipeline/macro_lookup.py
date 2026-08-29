@@ -7,7 +7,7 @@ Results are cached locally so the same dish never makes a redundant API call.
 Flow:
   1. Check cache at data/macro_cache/{slug}.json
   2. If miss: query USDA with English name
-  3. If 0 results: try pinyin fallback for common Chinese dishes
+  3. If 0 results: ask the LLM for a USDA-searchable rewrite of the name
   4. If still 0: return no_results (signals FOOD-013 manual entry)
   5. Cache and return top-3 candidates + selected (index 0 by default)
 
@@ -48,36 +48,6 @@ _NUTRIENT_IDS = {
     "protein_g": 1003,  # Protein
     "fat_g":    1004,   # Total lipid (fat)
 }
-
-# Simple pinyin → English fallback for common Chinese dishes with poor USDA coverage.
-# Extend as needed; not intended to be exhaustive.
-_PINYIN_FALLBACK: dict[str, str] = {
-    # Chinese dish pinyin → searchable English
-    "hong shao rou":          "red braised pork belly",
-    "hong shao":              "red braised pork",
-    "mapo tofu":              "mapo tofu spicy",
-    "kung pao chicken":       "kung pao chicken",
-    "char siu":               "chinese bbq pork",
-    "congee":                 "rice porridge congee",
-    "chow mein":              "chow mein noodles",
-    "lo mein":                "lo mein noodles",
-    "braised beef noodle":    "beef noodle soup taiwanese",
-    "dried tofu sticks":      "dried tofu sticks chinese",
-    "dan dan noodles":        "dan dan noodles spicy",
-    "wontons":                "wonton soup",
-    "tang yuan":              "glutinous rice balls sesame",
-    "spring rolls":           "spring rolls fried",
-    "dumplings":              "dumplings steamed",
-    # Short or ambiguous queries that hit USDA 400s — expand to be more specific
-    "brown rice":             "rice brown cooked",
-    "white rice":             "rice white cooked",
-    "purple rice":            "rice purple cooked",
-    "bok choy":               "bok choy cooked",
-    "kimchi":                 "kimchi fermented",
-    "tofu":                   "tofu cooked",
-    "egg":                    "egg cooked scrambled",
-}
-
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -181,12 +151,35 @@ class _QueryError(Exception):
     """Raised on 400 Bad Request — USDA rejects this query string; caller should try fallback."""
 
 
+# FOOD-019 finding (2026-08-28, live testing): USDA's search endpoint
+# intermittently returns a raw-nginx 400 (Content-Type: text/html, the
+# generic "400 Bad Request" page) for a query that is well-formed and
+# succeeds seconds before/after — confirmed NOT a rate limit
+# (X-RateLimit-Remaining showed >99% headroom on the same failing response).
+# This looks like transient flakiness at USDA's API gateway, upstream of
+# FDC's own application logic. A single retry after 1.5s was NOT reliable
+# enough on live testing (still failed on a subsequent run); escalating to
+# 3 total attempts with growing backoff. A client-side pacing delay between
+# unrelated calls was tried first and did not help either — this is retried
+# per-request, not spaced between requests.
+_TRANSIENT_400_RETRY_DELAYS_SECONDS = (1.5, 3.0)  # one entry per retry (not counting the first attempt)
+
+
 def _query_usda(query: str, api_key: str) -> list[dict]:
     """
     Hit the USDA FNDDS search endpoint and return up to 3 parsed candidates.
     Returns [] when the API returns 0 foods for the query.
     Raises _QueryError on 400 (bad query, not bad key) so caller can try fallback.
     Raises _APIError on other HTTP / network errors so callers can skip caching.
+
+    Retries on a 400 with escalating backoff — see
+    _TRANSIENT_400_RETRY_DELAYS_SECONDS above. A genuinely malformed query
+    still ends up as _QueryError after all attempts; this only rescues the
+    case where an identical, valid query would have succeeded moments later.
+    Even with this, live testing on 2026-08-28 could not confirm 100%
+    reliability — treat a no_results-after-retries result on a
+    plausible-sounding food as "probably transient", not necessarily a true
+    USDA miss; scripts/clear_decompositions.py --dish is the recourse.
     """
     params = {
         "query":    query,
@@ -194,20 +187,25 @@ def _query_usda(query: str, api_key: str) -> list[dict]:
         "pageSize": 5,
         "api_key":  api_key,
     }
-    try:
-        resp = requests.get(_USDA_SEARCH_URL, params=params, timeout=10)
-        if resp.status_code == 400:
-            raise _QueryError(f"USDA rejected query '{query}' (400)")
-        resp.raise_for_status()
-    except _QueryError:
-        raise
-    except requests.HTTPError as exc:
-        raise _APIError(f"USDA API HTTP error: {exc}") from exc
-    except requests.RequestException as exc:
-        raise _APIError(f"USDA API network error: {exc}") from exc
+    last_400: Optional[_QueryError] = None
+    for attempt in range(1 + len(_TRANSIENT_400_RETRY_DELAYS_SECONDS)):
+        if attempt > 0:
+            time.sleep(_TRANSIENT_400_RETRY_DELAYS_SECONDS[attempt - 1])
+        try:
+            resp = requests.get(_USDA_SEARCH_URL, params=params, timeout=10)
+            if resp.status_code == 400:
+                last_400 = _QueryError(f"USDA rejected query '{query}' (400)")
+                continue
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            raise _APIError(f"USDA API HTTP error: {exc}") from exc
+        except requests.RequestException as exc:
+            raise _APIError(f"USDA API network error: {exc}") from exc
 
-    foods = resp.json().get("foods", [])
-    return [_parse_candidate(f) for f in foods[:3]]
+        foods = resp.json().get("foods", [])
+        return [_parse_candidate(f) for f in foods[:3]]
+
+    raise last_400
 
 
 def _build_result(dish_name: str, candidates: list[dict], source: str) -> MacroResult:
@@ -250,13 +248,26 @@ def _now_iso() -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
-def lookup_macros(dish_name: str, api_key: Optional[str] = None) -> MacroResult:
+def _default_suggest_query(dish_name: str) -> Optional[str]:
+    """Lazy import breaks the dish_decompose <-> macro_lookup import cycle."""
+    try:
+        from pipeline.dish_decompose import suggest_usda_query
+        return suggest_usda_query(dish_name)
+    except Exception:
+        return None
+
+
+def lookup_macros(
+    dish_name: str,
+    api_key: Optional[str] = None,
+    suggest_query: Optional[callable] = None,
+) -> MacroResult:
     """
     Return macros (per 100g) for a confirmed dish name.
 
     1. Returns cached result immediately if available.
     2. Queries USDA FNDDS with the dish name.
-    3. Falls back to a pinyin → English translation for Chinese dishes.
+    3. Falls back to an LLM-suggested USDA-searchable rewrite of the name.
     4. Returns a no_results MacroResult if no match found (triggers FOOD-013).
 
     Args:
@@ -274,28 +285,57 @@ def lookup_macros(dish_name: str, api_key: Optional[str] = None) -> MacroResult:
 
     key = _get_api_key(api_key)
 
-    # 2. Primary query (English); on 400 fall through to fallback immediately
+    # 2. Primary query (English); on 400 fall through to fallback immediately.
+    # query_rejected tracks whether every attempt ended in a 400 (an ERROR)
+    # rather than a clean 200-with-zero-foods (a genuine "USDA doesn't have
+    # this"). Only the latter is safe to cache — see the caching note below.
     candidates: list[dict] = []
+    query_rejected = False
     try:
         candidates = _query_usda(query_name, key)
     except _QueryError:
-        pass  # fall through to fallback below
+        query_rejected = True  # fall through to fallback below
     except _APIError as exc:
         print(f"[macro_lookup] {exc} — result not cached; provide a valid USDA API key")
         return _build_result(dish_name, [], source="no_results")
 
-    # 3. Fallback: try pinyin/expanded query when 0 results OR query was rejected (400)
+    # 3. Fallback: rewrite the query when 0 results OR the query was rejected (400).
+    #
+    # This used to be _PINYIN_FALLBACK — a hand-maintained dict mapping ~25
+    # dish names to searchable English ("congee" -> "rice porridge congee").
+    # It only ever covered what someone remembered to type, which CLAUDE.md
+    # already flagged as brittle. suggest_usda_query() asks the LLM instead,
+    # and costs no extra API call in the common path: it reuses the
+    # decomposition already computed (and cached) for this dish name.
+    #
+    # Injected rather than imported, because pipeline.dish_decompose imports
+    # THIS module — a direct import would be circular.
     if not candidates:
-        fallback_query = _PINYIN_FALLBACK.get(query_name.lower())
+        fallback_query = (suggest_query or _default_suggest_query)(dish_name)
         if fallback_query:
             print(f"[macro_lookup] Trying fallback query for '{query_name}': '{fallback_query}'")
             try:
                 candidates = _query_usda(fallback_query, key)
-            except (_QueryError, _APIError) as exc:
+                query_rejected = False  # fallback got a real answer from USDA
+            except _QueryError as exc:
+                print(f"[macro_lookup] Fallback also failed: {exc}")
+                query_rejected = True
+            except _APIError as exc:
                 print(f"[macro_lookup] Fallback also failed: {exc}")
 
     result = _build_result(dish_name, candidates, source="usda_api")
-    # Cache hits and genuine no_results alike (dish truly absent from USDA)
+
+    # Cache a genuine no_results (USDA answered, and has nothing) so we don't
+    # re-query a dish it truly lacks. Do NOT cache when every attempt was
+    # rejected with a 400 — that's the transient gateway flakiness documented
+    # above, and persisting it would permanently pin a perfectly resolvable
+    # food to zero macros with no retry. Found 2026-08-29: "boiled_chicken"
+    # 400'd during a scan and was cached as no_results, which get_macros()
+    # then served forever. A skipped write just means the next lookup retries.
+    if result.source == "no_results" and query_rejected:
+        print(f"[macro_lookup] '{query_name}' only ever got 400s — not caching, will retry next time")
+        return result
+
     _save_cache(result)
     return result
 

@@ -209,12 +209,146 @@ def test_no_results_fallback_and_coverage_divergence(tmp: Path) -> None:
     check("the no_results component used its fallback_macros", len(estimated) == 1)
 
 
+def test_unresolved_component_reduces_carb_coverage(tmp: Path) -> None:
+    """Regression (observed live 2026-08-28): a component with NO USDA match
+    and NO fallback_macros ("unresolved") contributes 0.0 to both
+    carbs_resolved and carbs_total, making it invisible to the ratio — a real
+    curry-rice dish with an unresolved vegetable component still reported
+    carb_coverage 1.0 despite genuinely understating its carbs."""
+    _patch_dirs(tmp)
+    _patch_llm([
+        {"name": "white rice", "role": "base", "proportion": 0.8,
+         "usda_likely": True, "fallback_macros": None},
+        {"name": "unknowable veg", "role": "vegetable", "proportion": 0.2,
+         "usda_likely": True, "fallback_macros": None},  # usda_likely but will miss -> unresolved
+    ])
+    _patch_lookup_macros({
+        "white rice": _FakeMacroResult(source="usda_api", calories=130, carbs_g=28, fiber_g=0.4, protein_g=2.7, fat_g=0.3),
+        "unknowable veg": _FakeMacroResult(source="no_results"),
+    })
+
+    result = dd.resolve_composite_macros("rice with unknowable veg")
+    unresolved = [c for c in result["components"] if c["macro_source"] == "unresolved"]
+    check("component with no USDA match and no fallback is 'unresolved'", len(unresolved) == 1)
+    check(
+        "an unresolved component drops carb_coverage below 1.0 (not invisible to the ratio)",
+        result["carb_coverage"] < 1.0,
+    )
+    check(
+        "carb_coverage is discounted by the unresolved mass share (0.8)",
+        abs(result["carb_coverage"] - 0.8) < 1e-6,
+    )
+
+
 def test_simple_dish_passthrough_returns_none(tmp: Path) -> None:
     _patch_dirs(tmp)
     _patch_llm([{"name": "mapo tofu", "role": None, "proportion": 1.0,
                  "usda_likely": True, "fallback_macros": None}])
     result = dd.resolve_composite_macros("mapo tofu")
     check("a simple dish name resolves to None (use lookup_macros() path unchanged)", result is None)
+
+
+def test_simple_dish_renamed_by_llm_still_returns_none(tmp: Path) -> None:
+    """Regression: a live call on 2026-08-28 showed the real model renames
+    even a simple dish into USDA-style phrasing ("white rice" -> "rice,
+    white, cooked") — a single component whose name does NOT match the
+    input string. The passthrough check must key on component COUNT alone,
+    not name equality, or every real simple dish gets wrongly treated as
+    composite."""
+    _patch_dirs(tmp)
+    _patch_llm([{"name": "rice, white, cooked", "role": "base", "proportion": 1.0,
+                 "usda_likely": True, "fallback_macros": None}])
+    result = dd.resolve_composite_macros("white rice")
+    check(
+        "a single component with a DIFFERENT (LLM-renamed) name still resolves to None",
+        result is None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests: macro_lookup transient-400 caching (FOOD-019 fallout)
+# ---------------------------------------------------------------------------
+
+def test_transient_400_not_cached(tmp: Path) -> None:
+    """Regression (2026-08-29): USDA intermittently 400s on a valid query.
+    lookup_macros() used to cache that as a genuine no_results, permanently
+    pinning a resolvable food to zero macros — which became far more damaging
+    once _fill_missing_macros() started resolving every dish at scan time
+    (one transient blip = a silently, permanently wrong dish)."""
+    import pipeline.macro_lookup as ml
+    orig_cache_dir, orig_query = ml.CACHE_DIR, ml._query_usda
+    cache_dir = tmp / "ml_transient"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        ml.CACHE_DIR = cache_dir
+        def _always_400(query, api_key):
+            raise ml._QueryError("simulated transient 400")
+        ml._query_usda = _always_400
+        result = ml.lookup_macros("some transient dish")
+        check("all-400s still returns no_results", result.source == "no_results")
+        check(
+            "all-400s writes NO cache file (retries next time, not pinned to zero)",
+            not list(cache_dir.glob("*.json")),
+        )
+
+        # A clean 200-with-zero-foods is a real answer and must still cache.
+        ml._query_usda = lambda query, api_key: []
+        ml.lookup_macros("zzz definitely not a food")
+        check(
+            "a genuine zero-result miss IS still cached",
+            bool(list(cache_dir.glob("zzz_definitely_not_a_food.json"))),
+        )
+    finally:
+        ml.CACHE_DIR, ml._query_usda = orig_cache_dir, orig_query
+
+
+# ---------------------------------------------------------------------------
+# Tests: LLM-backed USDA match selection
+# ---------------------------------------------------------------------------
+
+def test_select_best_usda_candidate() -> None:
+    """Regression (2026-08-29): USDA returned "Peanuts, boiled" as the top hit
+    for "boiled_chicken" (21g carbs/100g vs chicken's ~0), and lookup_macros()
+    takes candidates[0] unconditionally. Harmless when lookups only ran on a
+    user-visible correction; _fill_missing_macros() resolves silently, so an
+    unrelated match would inject phantom carbs into a diabetic carb count.
+
+    Judgment is the LLM's (a hardcoded cooking-verb stopword list was tried
+    first and rejected — English-only, missed poached/blanched/stir-fried,
+    i.e. the same brittleness _PINYIN_FALLBACK was criticized for). These
+    tests pin the CONTRACT around that call, not the model's answers:
+    fail-closed on error, and reject an out-of-range index."""
+    orig = dd._load_decompose_model
+    try:
+        # Any failure inside the call must reject the match, never accept an
+        # unvalidated one — a blank is visible and correctable, wrong carbs
+        # are neither.
+        dd._load_decompose_model = lambda config_path="config.yaml": (_ for _ in ()).throw(RuntimeError("boom"))
+        check(
+            "LLM failure fails CLOSED (returns None, no unvalidated match)",
+            dd.select_best_usda_candidate("boiled_chicken", ["Peanuts, boiled"]) is None,
+        )
+    finally:
+        dd._load_decompose_model = orig
+
+    check(
+        "no candidates -> None (nothing to validate)",
+        dd.select_best_usda_candidate("anything", []) is None,
+    )
+
+
+def test_no_hardcoded_food_tables_in_lookup() -> None:
+    """_PINYIN_FALLBACK (a hand-maintained ~25-entry dish-name dict) is gone,
+    replaced by suggest_usda_query(). Guards against it being reintroduced."""
+    import pipeline.macro_lookup as ml
+    check(
+        "macro_lookup no longer defines _PINYIN_FALLBACK",
+        not hasattr(ml, "_PINYIN_FALLBACK"),
+    )
+    check(
+        "lookup_macros accepts an injected query suggester",
+        "suggest_query" in ml.lookup_macros.__code__.co_varnames,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -327,9 +461,14 @@ def main() -> None:
         test_stale_cache_is_a_miss(tmp)
         test_resolve_composite_macros_weighted_sum(tmp)
         test_no_results_fallback_and_coverage_divergence(tmp)
+        test_unresolved_component_reduces_carb_coverage(tmp)
         test_simple_dish_passthrough_returns_none(tmp)
+        test_simple_dish_renamed_by_llm_still_returns_none(tmp)
+        test_transient_400_not_cached(tmp)
         test_log_meal_persists_carb_coverage(tmp)
 
+    test_select_best_usda_candidate()
+    test_no_hardcoded_food_tables_in_lookup()
     test_aggregate_carb_coverage()
     test_is_trainable_carb_coverage_gate()
 

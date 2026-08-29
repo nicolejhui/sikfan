@@ -9,7 +9,7 @@ import { useNavigation, useRoute } from '@react-navigation/native';
 
 import { defaultPalette, verdictColor, spacing, radius, fontSize, fontWeight } from '../constants/theme';
 import { useMealStore, useGlucoseStore, useHistoryStore } from '../store';
-import { formatPortion, verdictWord } from '../store/types';
+import { formatDishName, formatPortion, verdictWord } from '../store/types';
 import type { DishComponent } from '../store/types';
 import ConfirmDishSheet from '../components/ConfirmDishSheet';
 import GlucosePad from '../components/GlucosePad';
@@ -295,7 +295,7 @@ export default function ResultsScreen() {
             <View style={styles.thumbnail} />
           )}
           <View style={styles.dishInfo}>
-            <Text style={styles.dishName} numberOfLines={1}>{dishName ?? 'Unknown dish'}</Text>
+            <Text style={styles.dishName} numberOfLines={1}>{formatDishName(dishName) || 'Unknown dish'}</Text>
             <View style={styles.confidenceRow}>
               {confidence != null && (
                 <View style={styles.confidenceBadge}>
@@ -448,14 +448,14 @@ export default function ResultsScreen() {
             {showBreakdown && compositeDishes.map((dish) => (
               <View key={dish.crop_id} style={styles.breakdownGroup}>
                 {compositeDishes.length > 1 && (
-                  <Text style={styles.breakdownDishName} numberOfLines={1}>{dish.name}</Text>
+                  <Text style={styles.breakdownDishName} numberOfLines={1}>{formatDishName(dish.name)}</Text>
                 )}
                 {(dish.components ?? []).map((component, idx) => {
                   const grams = componentGrams(component, dish.portion_g);
                   const carbs = componentCarbs(component, dish.portion_g);
                   return (
                     <View key={`${dish.crop_id}-${idx}`} style={styles.componentRow}>
-                      <Text style={styles.componentName} numberOfLines={1}>{component.name}</Text>
+                      <Text style={styles.componentName} numberOfLines={1}>{formatDishName(component.name)}</Text>
                       {grams != null && <Text style={styles.componentGrams}>{Math.round(grams)}g</Text>}
                       <Text style={styles.componentCarbs}>
                         {carbs != null ? `${Math.round(carbs)}g carbs` : '—'}

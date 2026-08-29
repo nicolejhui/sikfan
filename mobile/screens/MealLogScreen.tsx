@@ -8,7 +8,7 @@ import type { StackNavigationProp } from '@react-navigation/stack';
 
 import { defaultPalette, verdictColor, spacing, radius, fontSize, fontWeight } from '../constants/theme';
 import { useHistoryStore } from '../store';
-import { verdictWord, type LoggedMeal, type Verdict } from '../store/types';
+import { formatDishName, verdictWord, type LoggedMeal, type Verdict } from '../store/types';
 import type { LogStackParamList } from '../navigation';
 import { useMealThumbnail } from '../hooks/useMealThumbnail';
 
@@ -98,7 +98,7 @@ function MealCard({ meal, isNew, onPress }: { meal: LoggedMeal; isNew: boolean; 
         style={styles.cardScrim}
         pointerEvents="none"
       >
-        <Text style={styles.cardDishName} numberOfLines={1}>{dishName}</Text>
+        <Text style={styles.cardDishName} numberOfLines={1}>{formatDishName(dishName)}</Text>
         <Text style={styles.cardTime}>{timeLabel(meal.meal_timestamp)}</Text>
       </LinearGradient>
     </TouchableOpacity>

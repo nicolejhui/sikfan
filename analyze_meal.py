@@ -267,6 +267,13 @@ def analyze_meal(
                 "status":      threshold["status"],
                 "macros":      portion["macros_scaled"],
                 "portion":     portion["portion_bucket"],
+                # estimate_portion() already used portion_g to scale `macros`
+                # above, but any downstream RE-scaling (POST /confirm-dish's
+                # _recompute_dish_macros) needs the gram figure itself. Without
+                # it that path falls back to `portion_g or 100.0` and silently
+                # emits per-100g macros for a full plate — found 2026-08-28 via
+                # FOOD-019, where a corrected curry-rice dish reported 10g carbs.
+                "portion_g":   portion["portion_g"],
                 "needs_macro_entry": portion["needs_macro_entry"],
                 "_mask_pixels": crop_dict["mask_pixels"],  # scratch field for tiebreak
             })
@@ -294,6 +301,11 @@ def analyze_meal(
                 "confirmed":        clf["confirmed"],
                 "macros":           por["macros_scaled"],
                 "portion_fraction": por["portion_fraction"],
+                # Same reason as the single_dish path above — without these,
+                # _build_dish_results() emits portion_g: null and a correction
+                # re-scales to 100g instead of the real portion.
+                "portion_g":        por["portion_g"],
+                "portion_bucket":   por["portion_bucket"],
                 "needs_macro_entry": por["needs_macro_entry"],
             }
             for clf, por in zip(classify_comps, portion_comps)

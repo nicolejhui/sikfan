@@ -70,8 +70,15 @@ def test_detected_items_single_dish_schema():
     result = analyze_meal(_BREAKFAST)
     single_items = [i for i in result["detected_items"] if i["crop_type"] == "single_dish"]
     for item in single_items:
+        # "portion_g" added 2026-08-28: additive only, no existing field
+        # changed name or type, so the frozen-schema rule in CLAUDE.md is
+        # satisfied. estimate_portion() always computed it and used it to
+        # scale `macros`, but it was never emitted here — leaving any
+        # downstream re-scaling (POST /confirm-dish) to fall back to 100g
+        # and silently report per-100g macros for a full plate.
         assert set(item.keys()) == {
-            "crop_type", "dish_name", "confidence", "status", "macros", "portion", "needs_macro_entry",
+            "crop_type", "dish_name", "confidence", "status", "macros", "portion",
+            "portion_g", "needs_macro_entry",
         }, (
             f"Unexpected keys: {set(item.keys())}"
         )
@@ -233,7 +240,8 @@ def test_confident_conflict_size_tiebreak(monkeypatch):
     monkeypatch.setattr(
         am_module, "estimate_portion",
         lambda comp_result, dish_name, config_path="config.yaml": {
-            "macros_scaled": None, "portion_bucket": "medium", "needs_macro_entry": True,
+            "macros_scaled": None, "portion_bucket": "medium", "portion_g": 180.0,
+            "needs_macro_entry": True,
         },
     )
 
@@ -270,7 +278,8 @@ def test_confident_conflict_score_wins_outside_band(monkeypatch):
     monkeypatch.setattr(
         am_module, "estimate_portion",
         lambda comp_result, dish_name, config_path="config.yaml": {
-            "macros_scaled": None, "portion_bucket": "medium", "needs_macro_entry": True,
+            "macros_scaled": None, "portion_bucket": "medium", "portion_g": 180.0,
+            "needs_macro_entry": True,
         },
     )
 

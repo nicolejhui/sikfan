@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import time
 import uuid
@@ -35,11 +36,11 @@ from analyze_meal import analyze_meal as _analyze_meal
 from glucose_analysis import MealNotFoundError, MissingCGMDataError
 from glucose_analysis import analyze_glucose as _analyze_glucose
 from glucose_analysis import analyze_glucose_preview as _analyze_glucose_preview
-from pipeline.dish_decompose import resolve_composite_macros
+from pipeline.dish_decompose import resolve_composite_macros, select_best_usda_candidate
 from pipeline.embedding_store import EmbeddingStore, _get_clip
 from pipeline.feedback import FeedbackAction, _append_correction_log, normalize_dish_name, record_feedback
 from pipeline.glucose_store import save_cgm_reading
-from pipeline.macro_lookup import lookup_macros
+from pipeline.macro_lookup import lookup_macros, select_candidate
 from pipeline.nutrition import CACHE_DIR as _MACRO_CACHE_DIR
 from pipeline.nutrition import _atomic_write as _write_macro_cache_entry
 from pipeline.portion import scale_macros
@@ -397,6 +398,124 @@ def _write_job_status(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
+def _load_macro_cache_entry(dish_name: str) -> dict | None:
+    """Read the macro_cache entry lookup_macros() just wrote, to inspect the
+    matched usda_name. Returns None if absent or unreadable."""
+    path = _MACRO_CACHE_DIR / f"{normalize_dish_name(dish_name)}.json"
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _validate_usda_match(dish_name: str, portion_g: float | None) -> dict | None:
+    """
+    Confirm the USDA entry lookup_macros() picked is actually the same food,
+    re-selecting a better candidate when it isn't.
+
+    lookup_macros() takes candidates[0] unconditionally. Observed 2026-08-29:
+    USDA's top hit for "boiled_chicken" was "Peanuts, boiled" (21g carbs/100g
+    against chicken's ~0). Harmless when lookups only ran on a user-visible
+    correction; _fill_missing_macros() resolves silently, so a bad match would
+    land phantom carbs in a diabetic carb count with nothing on screen.
+
+    Judgment is delegated to the LLM rather than a hardcoded cooking-verb list
+    (which would be English-only and miss poached/blanched/stir-fried — the
+    same brittleness _PINYIN_FALLBACK is criticized for). It inspects the top-3
+    candidates lookup_macros() already stores, so it can also pick candidate 1
+    or 2 when 0 is wrong, via the pre-existing select_candidate().
+
+    Returns the (possibly re-scaled) macro dict, or None if no candidate matches.
+    """
+    cached = _load_macro_cache_entry(dish_name)
+    if cached is None:
+        return None
+    # A user override or a composite entry was not chosen by USDA's ranking,
+    # so there is nothing to second-guess.
+    if cached.get("source") != "usda_api":
+        return _recompute_dish_macros(dish_name, portion_g)
+
+    candidates = cached.get("candidates") or []
+    candidate_names = [c.get("usda_name", "") for c in candidates]
+    if not candidate_names:
+        return None
+
+    best = select_best_usda_candidate(dish_name, candidate_names)
+    if best is None:
+        _log.warning(
+            "no USDA candidate matches %r (offered %s) — leaving needs_macro_entry "
+            "set rather than recording an unrelated food's macros",
+            dish_name, candidate_names,
+        )
+        return None
+
+    if candidate_names[best] != cached.get("usda_name"):
+        _log.info(
+            "re-selected USDA match for %r: %r -> %r",
+            dish_name, cached.get("usda_name"), candidate_names[best],
+        )
+        try:
+            select_candidate(dish_name, best)
+        except (ValueError, IndexError) as exc:
+            _log.warning("select_candidate failed for %r: %s", dish_name, exc)
+            return None
+
+    return _recompute_dish_macros(dish_name, portion_g)
+
+
+def _fill_missing_macros(dish_results: list[dict], total_carbs_g: float) -> float:
+    """Resolve macros for scanned dishes that had no cached nutrition data.
+
+    pipeline.portion's get_macros() is deliberately cache-only — it reads
+    data/overrides/ then data/macro_cache/ and returns None on a miss, so no
+    network call ever enters the pixel pipeline (plans/FOOD-019-plan.md D3).
+    The consequence, hit in real use 2026-08-29: a freshly-scanned dish with
+    no cache entry reports needs_macro_entry with 0.0 macros — even for
+    something as ordinary as "rice", which USDA obviously has. Before this,
+    the ONLY path that actually queried USDA was POST /confirm-dish, so a
+    dish only ever got macros if the user had previously corrected it.
+
+    This runs in the async analysis job (already network-bound and polled by
+    AnalyzingScreen), which is where D3 always intended resolution to happen —
+    keeping analyze_meal.py and pipeline/portion.py themselves untouched.
+
+    Mutates dish_results in place and returns the recomputed total carbs.
+    Never raises: a lookup failure leaves that dish exactly as it was
+    (needs_macro_entry, zeroed macros), i.e. the pre-fix behavior.
+    """
+    changed = False
+    for dish in dish_results:
+        if not dish.get("needs_macro_entry"):
+            continue
+        try:
+            # Same resolution the correction path uses, so a dish resolved at
+            # scan time and one resolved via a correction can never disagree.
+            resolved = _recompute_dish_macros(dish["name"], dish.get("portion_g"))
+        except Exception as exc:
+            _log.warning("macro fill failed for %r: %s", dish.get("name"), exc)
+            continue
+        if resolved.get("needs_macro_entry"):
+            continue  # genuinely no USDA match — leave the flag set
+
+        # Guard the direct-USDA case against an unrelated top hit (see
+        # _match_is_plausible). A composite result is exempt: its components
+        # were resolved individually against LLM-supplied USDA-style names,
+        # and its own dish_name intentionally doesn't appear in any single
+        # component's usda_name.
+        if not resolved.get("components"):
+            validated = _validate_usda_match(dish["name"], dish.get("portion_g"))
+            if validated is None:
+                continue  # no candidate is the same food — leave the flag set
+            resolved = validated
+
+        dish.update(resolved)
+        changed = True
+
+    if not changed:
+        return total_carbs_g
+    return round(sum(d.get("carbs_g", 0.0) for d in dish_results), 2)
+
+
 def _run_analysis(meal_id: str, image_path: Path, status_path: Path) -> None:
     """Sync worker: runs analyze_meal(), updates job status, deletes upload."""
     # Save per-crop images for POST /confirm-dish before analyze_meal() runs.
@@ -419,10 +538,11 @@ def _run_analysis(meal_id: str, image_path: Path, status_path: Path) -> None:
     try:
         result = _analyze_meal(str(image_path), store=_store)
         dish_results = _build_dish_results(result["detected_items"])
+        total_carbs = _fill_missing_macros(dish_results, result["total_macros"].get("carbs_g", 0.0))
         meal_result = {
             "meal_id": meal_id,
             "dishes": dish_results,
-            "total_carbs_g": result["total_macros"].get("carbs_g", 0.0),
+            "total_carbs_g": total_carbs,
             "image_url": f"/meal-image/{meal_id}",
         }
         status_data["status"] = "complete"

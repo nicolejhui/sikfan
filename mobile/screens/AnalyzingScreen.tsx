@@ -8,6 +8,7 @@ import Svg, { Defs, RadialGradient, LinearGradient, Stop, Rect } from 'react-nat
 
 import { useMealStore } from '../store/mealStore';
 import { useGlucoseStore } from '../store/glucoseStore';
+import { formatDishName } from '../store/types';
 import { defaultPalette, spacing, radius, fontSize, fontWeight } from '../constants/theme';
 import type { CameraStackParamList } from '../navigation';
 import GlucosePad from '../components/GlucosePad';
@@ -186,7 +187,7 @@ export default function AnalyzingScreen() {
               <Ionicons name="checkmark" size={13} color="#fff" />
             </View>
             <Text style={styles.chipLabel} numberOfLines={1}>
-              {dishName}
+              {formatDishName(dishName)}
             </Text>
             {confidence != null && (
               <Text style={styles.chipConfidence}>{Math.round(confidence * 100)}%</Text>
