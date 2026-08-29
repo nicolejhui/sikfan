@@ -70,6 +70,10 @@ Epic 9 — Mobile App (React Native MVP). MOB-001–MOB-004 done, see docs/MOBIL
 ## Mobile Ticket Verification (required)
 Run the `/mobile_ticket_check` skill after implementing any MOB-* ticket, before marking it complete — do not rely on `tsc` alone. It runs `expo-doctor`, `tsc --noEmit`, and a clean-cache Metro restart with bundling verification. MOB-005 shipped two dependency-drift breakages (`viewManagersMetadata of null`, then a `babel-preset-expo` hoisting failure) that `tsc` never caught and cost a full debugging session — see `.claude/skills/mobile_ticket_check/SKILL.md` for details.
 
+## Mobile Native Build (confirmed 2026-08-28)
+`mobile/ios/` is a **committed, hand-managed native folder** — `project.pbxproj`, `Podfile`, `AppDelegate.swift`, `Info.plist`, etc. are tracked in git (only build artifacts like `Pods/`/`build/`/`DerivedData` are gitignored, via `mobile/ios/.gitignore`). This project is on the **bare workflow, not Prebuild/CNG**.
+Consequence: `app.json`'s native-config fields (`orientation`, `icon`, `userInterfaceStyle`, `ios`, `android`, `plugins`) are **inert** for anything already reflected in the committed `ios/` folder — editing `app.json`'s `icon` will not change the app icon. Any native change (icon, splash screen, permissions, plugin config) must be made **directly in `mobile/ios/`** (and the Android equivalent, once it exists), not through `app.json`.
+
 ## Mobile Design System — Source of Truth
 - Upstream: Claude Design project "SikFan" (project id `23216dca-776e-4021-ae6d-814c5407e7e2`), file `theme.jsx`. This is the canonical definition of every color token, palette (sunrise/matcha/mist), and verdict color group.
 - In-repo mirror: `mobile/constants/theme.ts` — ported field-for-field from `theme.jsx` (same palette names, hex values, and `{fg, deep, tint, ring}` verdict-group shape). Keep it in sync if `theme.jsx` changes.

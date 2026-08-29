@@ -18,11 +18,14 @@ Feature indices (used in both build_training_data and predict_glucose_curve):
 import json
 import logging
 import os
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
 import joblib
 import numpy as np
+import yaml
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel
 from sklearn.multioutput import MultiOutputRegressor
@@ -35,6 +38,63 @@ _log = logging.getLogger(__name__)
 _MODEL_DIR = Path(__file__).parent.parent / "data" / "models"
 _MODEL_PATH = _MODEL_DIR / "glucose_model.joblib"
 _META_PATH = _MODEL_DIR / "training_metadata.json"
+
+_DEFAULT_MIN_CARB_COVERAGE = 0.70
+
+
+def _load_min_carb_coverage(config_path: str = "config.yaml") -> float:
+    """Read glucose_training.min_carb_coverage from config.yaml (FOOD-019 D6)."""
+    try:
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f) or {}
+        return float(cfg.get("glucose_training", {}).get("min_carb_coverage", _DEFAULT_MIN_CARB_COVERAGE))
+    except FileNotFoundError:
+        return _DEFAULT_MIN_CARB_COVERAGE
+
+
+def _exclusion_reason(meal: dict, min_carb_coverage: float) -> Optional[str]:
+    """
+    Return None if `meal` is trainable, else a short reason string.
+
+    Single source of truth for glucose-training row exclusion — used by both
+    is_trainable() (the gate) and build_training_data()'s diagnostic logging,
+    so the two can never drift apart (GLUC-012 acceptance criteria: a silent
+    skip is the same class of bug the ticket fixes).
+
+    A missing key is UNKNOWN, not failing, for both macros_incomplete
+    (GLUC-012 D6 — legacy rows predate the flag) and carb_coverage
+    (FOOD-019 D6 — legacy rows predate decomposition). Only an explicit
+    True / below-threshold value excludes a row.
+    """
+    cgm_window = meal.get("cgm_window")
+    # cgm_window is normally a dict ({"status": ..., "readings": [...]});
+    # guard against legacy/malformed entries where it's still a bare []
+    # (pre-fix log_meal wrote this) rather than crashing on .get().
+    if not isinstance(cgm_window, dict) or cgm_window.get("status") != "complete":
+        return "cgm_incomplete"
+    if meal.get("macros_incomplete", False):
+        return "macros_incomplete"
+    carb_coverage = meal.get("carb_coverage")
+    if carb_coverage is not None and carb_coverage < min_carb_coverage:
+        return "carb_coverage_below_threshold"
+    return None
+
+
+def is_trainable(meal: dict, min_carb_coverage: Optional[float] = None) -> bool:
+    """
+    True if `meal` should be used for glucose model training.
+
+    Conditions (all must hold):
+      1. cgm_window is a complete dict (not a legacy bare list, not pending).
+      2. macros_incomplete is not True (GLUC-012).
+      3. carb_coverage, if present, is >= min_carb_coverage (FOOD-019 D6).
+
+    Extracted so build_training_data() and should_retrain() can never
+    evaluate different rows as trainable (GLUC-012 acceptance criteria).
+    """
+    if min_carb_coverage is None:
+        min_carb_coverage = _load_min_carb_coverage()
+    return _exclusion_reason(meal, min_carb_coverage) is None
 
 _TREND_MAP = {
     "falling_rapidly": -2,
@@ -125,15 +185,15 @@ def build_training_data() -> tuple[np.ndarray, np.ndarray]:
         y: shape (n_meals, 37) — BG curve at 5-min intervals for 180 min
     """
     meals = get_meal_logs()
-    cgm_complete = [m for m in meals if m.get("cgm_window", {}).get("status") == "complete"]
-    # GLUC-012: exclude rows where a confirmed dish had no macro match — a
-    # missing key (legacy, pre-GLUC-012 row) is UNKNOWN, not False, and is
-    # deliberately still treated as trainable here rather than backfilled.
-    complete = [m for m in cgm_complete if not m.get("macros_incomplete", False)]
-    skipped = len(cgm_complete) - len(complete)
+    min_carb_coverage = _load_min_carb_coverage()
+    complete = [m for m in meals if is_trainable(m, min_carb_coverage)]
+
+    skip_reasons = Counter(
+        r for r in (_exclusion_reason(m, min_carb_coverage) for m in meals) if r
+    )
     _log.info(
-        "build_training_data: %d trainable meals, %d skipped (macros_incomplete)",
-        len(complete), skipped,
+        "build_training_data: %d trainable meals, %d skipped %s",
+        len(complete), sum(skip_reasons.values()), dict(skip_reasons),
     )
 
     X_rows = []
@@ -403,14 +463,13 @@ def should_retrain() -> bool:
         return False
 
     meals = get_meal_logs()
+    min_carb_coverage = _load_min_carb_coverage()
     new_complete = sum(
         1 for m in meals
-        # cgm_window is normally a dict ({"status": ..., "readings": [...]});
-        # guard against legacy/malformed entries where it's still a bare []
-        # (pre-fix log_meal wrote this) rather than crashing on .get().
-        if isinstance(m.get("cgm_window"), dict)
-        and m["cgm_window"].get("status") == "complete"
-        and not m.get("macros_incomplete", False)  # GLUC-012: only count rows build_training_data() will actually use
+        # is_trainable() is the same predicate build_training_data() uses, so
+        # this can never count a row the trainer would then skip (GLUC-012
+        # acceptance criteria).
+        if is_trainable(m, min_carb_coverage)
         and m["timestamp"] > last_trained_ts  # compare by timestamp, not insertion order
     )
     return new_complete >= 10

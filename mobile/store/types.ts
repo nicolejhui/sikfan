@@ -1,4 +1,21 @@
-// analyze_meal response (FOOD-015 schema)
+// FOOD-019: one resolved or estimated ingredient of a decomposed composite
+// dish (e.g. "japanese curry chicken katsu with white rice" -> katsu, curry
+// sauce, rice). Only present when the dish went through decomposition.
+export interface DishComponent {
+  name: string;
+  role: string | null;  // "base" | "protein" | "vegetable" | "sauce" | "other" | null
+  proportion: number;   // share of the dish's total cooked weight, 0-1
+  per_100g: {
+    calories: number;
+    carbs_g: number;
+    fiber_g: number;
+    protein_g: number;
+    fat_g: number;
+  };
+  macro_source: 'usda_api' | 'estimated' | 'unresolved';
+}
+
+// analyze_meal response (FOOD-015 schema; FOOD-019 additive fields below)
 export interface DishResult {
   crop_id: string;
   name: string;
@@ -11,6 +28,14 @@ export interface DishResult {
   portion_g: number | null;
   portion_bucket: string | null;  // "small" | "medium" | "large"; null if not estimated
   needs_macro_entry: boolean;  // true if USDA had no match — carbs/macros above are 0, not verified-zero
+  // FOOD-019: populated only when this dish resolved via composite
+  // decomposition (after a CORRECT/ADD_NEW correction — see
+  // plans/FOOD-019-plan.md API-012 "Known scope boundary"). A dish that
+  // never decomposed keeps the defaults below, matching the API's own
+  // DishResult.macro_coverage / carb_coverage defaults exactly.
+  components?: DishComponent[] | null;
+  macro_coverage?: number;  // 1.0 = not a composite, or fully USDA-resolved
+  carb_coverage?: number;   // 1.0 = not a composite, or fully USDA-resolved
 }
 
 export interface MealResult {

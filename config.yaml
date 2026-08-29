@@ -71,6 +71,25 @@ glucose_classification:
   spike_threshold_mgdl: 40    # predicted peak delta above pre-meal BG → spike
   drop_threshold_mgdl: 20     # predicted peak delta below pre-meal BG → drop
 
+glucose_training:
+  # FOOD-019 D6: exclude a meal from GPR training if its carb_coverage (share
+  # of total_carbs_g backed by USDA, not LLM estimation) falls below this.
+  # A missing carb_coverage key (pre-FOOD-019 row) is UNKNOWN, not failing,
+  # and stays trainable — see pipeline/glucose_model.py:is_trainable().
+  # Chosen at n=21 training rows, where one row is ~5% of the corpus; not
+  # measurable against fit quality yet. Safe to re-tune — both coverage
+  # fields are persisted on the row, so a change here re-admits/excludes
+  # rows retroactively with no backfill needed.
+  min_carb_coverage: 0.70
+
+llm:
+  # FOOD-019: dish decomposition for composite meal names (e.g. "chicken
+  # katsu with white rice"). Config-driven per plans/FOOD-019-plan.md D8 so
+  # quality can be escalated without a code change — see also D9: swapping
+  # this value self-invalidates the decomposition cache (schema_version/model
+  # stamp), so a change here does NOT require a manual cache clear.
+  decompose_model: claude-sonnet-5
+
 thresholds:
   confident: 0.82        # score >= this -> CONFIDENT
   uncertain: 0.65        # score >= this AND < confident -> UNCERTAIN

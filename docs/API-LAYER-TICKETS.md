@@ -1495,6 +1495,77 @@ preview path this feeds into), `pipeline/glucose_store.save_cgm_reading`
 
 ---
 
+## API-012 — Composite dish decomposition in the correction path — IMPLEMENTED
+
+### Goal
+Wire FOOD-019's `pipeline.dish_decompose.resolve_composite_macros()` into
+`_recompute_dish_macros()` so a corrected label like "japanese curry chicken
+katsu with white rice" — which has no single USDA match — gets real macros
+via component decomposition, instead of the hard `0.0` / `needs_macro_entry:
+True` `_recompute_dish_macros()` previously returned for any `no_results`.
+Full design + decision log: `plans/FOOD-019-plan.md`.
+
+### Status note (2026-08-28)
+Implemented and verified via `scripts/verify_food019.py` (mocked LLM
+boundary — no Anthropic credits required to run it) plus a regression run of
+`scripts/verify_gluc_012.py` (no drift). A live smoke test against a real
+Sonnet call is still open, pending confirmation of the exact
+`output_config`/`format` structured-output sub-schema against a billed
+account (flagged in `pipeline/dish_decompose.py`'s `_call_llm_decompose`
+docstring) — any request-shape issue there fails open to pre-FOOD-019
+behavior rather than erroring, so this is a quality follow-up, not a
+blocker.
+
+### What changed
+- `_recompute_dish_macros(corrected_label, portion_g)` (`api.py`) now tries
+  `resolve_composite_macros(corrected_label)` first. `None` (dish didn't
+  actually decompose) falls through to the pre-existing `lookup_macros()`
+  path, byte-for-byte unchanged.
+- When it resolves, the composite per-100g profile is persisted to
+  `data/macro_cache/{slug}.json` (`source: "composite"`) via the same
+  `pipeline.nutrition._atomic_write` helper `pipeline.nutrition` itself uses
+  — so a future scan of the same corrected label hits the cache through the
+  existing `get_macros()` → `pipeline.portion.estimate_portion()` path with
+  **zero changes** to `pipeline/portion.py` or `analyze_meal.py`.
+- `DishResult` gains three additive fields — `components: list[dict] | None
+  = None`, `macro_coverage: float = 1.0`, `carb_coverage: float = 1.0` — so
+  no existing consumer of the frozen `analyze_meal`/`DishResult` schema
+  breaks; a dish that never went through composite decomposition (the vast
+  majority, including a freshly-scanned dish that transparently hits an
+  already-cached composite entry — see the note below) keeps the defaults.
+- `LogMealResponse` and the `meal_logs.json` row gain `carb_coverage`
+  (meal-level, carb-weighted across confirmed dishes, via the new
+  `_aggregate_carb_coverage()` helper) — this is the field
+  `pipeline.glucose_model.is_trainable()`'s FOOD-019 D6 threshold reads.
+  Persisted starting now regardless of whether the training gate currently
+  excludes anything, since coverage can't be reconstructed retroactively.
+
+### Known scope boundary (deliberate, not an oversight)
+`pipeline/portion.py`'s `scale_macros()` only ever returns the 5 numeric
+macro fields — it does not pass `macro_coverage`/`carb_coverage`/`components`
+through. So a dish resolved purely by the **initial scan** hitting an
+already-cached composite entry (via `get_macros()`) will show correct
+`carbs_g`/etc. but **not** the coverage/component breakdown — that metadata
+only surfaces via `_recompute_dish_macros()`'s own return value, i.e. after a
+CORRECT/ADD_NEW correction. `plans/FOOD-019-plan.md` puts
+`pipeline/portion.py` and `analyze_meal.py` in "Unchanged on purpose"
+deliberately; plumbing coverage all the way through the scan pipeline is a
+possible follow-up if MOB-014 (mobile breakdown UI) needs it for the
+first-scan case, not bundled into this ticket.
+
+### Files modified
+- `api.py` — `_recompute_dish_macros()`, `DishResult`, `LogMealResponse`,
+  `log_meal()`, new `_aggregate_carb_coverage()` helper
+- `pipeline/dish_decompose.py` (new, FOOD-019) — `resolve_composite_macros()`
+  is the only entry point this ticket calls into
+
+### Dependencies
+FOOD-019 (`pipeline/dish_decompose.py`), API-006 (`POST /confirm-dish`, the
+route `_recompute_dish_macros()` serves), API-004 (`POST /log-meal`, the
+`carb_coverage` persistence point)
+
+---
+
 ## Ticket Summary — updated row to add
 
 Replace the existing Ticket Summary table footer with:

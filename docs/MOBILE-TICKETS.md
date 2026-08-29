@@ -393,3 +393,36 @@ Replace the placeholder boxes used for meal thumbnails on Home, Results, and Mea
 - Cache fetched URIs in a plain in-memory `Map<mealId, uri>` (module-level, not in Zustand) — thumbnails are a rendering concern, not app state that needs to survive reloads
 
 **Dependencies:** MOB-002, MOB-003, MOB-004, MOB-005, MOB-007, MOB-008
+
+---
+
+## Known Issues (deferred, not blocking)
+
+Surfaced 2026-08-28 by `npx expo-doctor` while verifying MOB-014 (composite
+dish breakdown UI, FOOD-019). Two of the four findings that day (`eas-cli`
+stray install, 6 packages a patch behind SDK 56) were fixed in the same pass
+— see `mobile/package.json` — and re-verified clean via `expo-doctor` (20/22,
+up from 18/22), `tsc --noEmit` (no new errors), and a clean-cache Metro
+bundle (2681 modules, no errors). The two below were deliberately deferred:
+
+- **Hermes V1 memory regression.** `expo@56.0.21`'s Hermes build
+  (`250829098.0.10`) is affected by a known memory regression; the fix is
+  upgrading to **Expo SDK 57** (`expo@^57.0.9`+, React Native 0.86.2+) — a
+  major version jump, not a patch. Deferred because a major SDK upgrade is
+  exactly the class of change that broke native module registration
+  silently during MOB-005 (see `.claude/skills/mobile_ticket_check/SKILL.md`
+  incident notes) and deserves its own dedicated pass with full
+  re-verification, not a bundled fix alongside unrelated ticket work.
+- ~~**Prebuild / app.json sync.**~~ **RESOLVED 2026-08-28.** `mobile/ios/` is
+  tracked in git (`project.pbxproj`, `Podfile`, `AppDelegate.swift`, etc. —
+  only build artifacts are gitignored) — this project is confirmed on the
+  **bare workflow, not Prebuild/CNG**. `app.json`'s native fields
+  (`orientation`, `icon`, `userInterfaceStyle`, `ios`, `android`, `plugins`)
+  are inert for anything already reflected in `ios/`; native changes go
+  directly into `mobile/ios/` from now on. Recorded as a standing rule in
+  `CLAUDE.md`'s "Mobile Native Build" section — no code change needed, no
+  ticket required, this was purely a documentation gap.
+
+**Hermes/SDK 57 next step:** re-run `npx expo-doctor` to see current status;
+it's a candidate for its own ticket if it starts causing real friction (a
+memory-related crash, for instance) before then.

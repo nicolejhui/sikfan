@@ -10,6 +10,7 @@ import { useNavigation, useRoute } from '@react-navigation/native';
 import { defaultPalette, verdictColor, spacing, radius, fontSize, fontWeight } from '../constants/theme';
 import { useMealStore, useGlucoseStore, useHistoryStore } from '../store';
 import { formatPortion, verdictWord } from '../store/types';
+import type { DishComponent } from '../store/types';
 import ConfirmDishSheet from '../components/ConfirmDishSheet';
 import GlucosePad from '../components/GlucosePad';
 import { MVP_MODE } from '../constants/config';
@@ -36,6 +37,23 @@ const VERDICT_ICON: Record<string, React.ComponentProps<typeof Ionicons>['name']
   steady: 'pulse',
   drop: 'arrow-down',
 };
+
+// FOOD-019: grams/carbs for one decomposed component, derived from the
+// parent dish's own portion_g (the pixel-based estimate) — the decomposer
+// itself never supplies absolute grams, only proportion. Null when the
+// parent dish has no portion_g (component grams then can't be derived; the
+// carbs-per-component figure still can, scaled off proportion alone, so it
+// is computed independently rather than gated on grams being available).
+function componentGrams(component: DishComponent, dishPortionG: number | null): number | null {
+  if (dishPortionG == null) return null;
+  return component.proportion * dishPortionG;
+}
+
+function componentCarbs(component: DishComponent, dishPortionG: number | null): number | null {
+  const grams = componentGrams(component, dishPortionG);
+  if (grams == null) return null;
+  return (component.per_100g.carbs_g * grams) / 100;
+}
 
 function MacroBar({ label, value, max, color }: { label: string; value: number; max: number; color: string }) {
   const pct = max > 0 ? Math.min(100, (value / max) * 100) : 0;
@@ -184,6 +202,21 @@ export default function ResultsScreen() {
   // `macros` above is 0 — not a verified zero-carb food. Surface that so the
   // total doesn't read as more complete than it is.
   const dishesMissingMacros = dishes.filter((d) => d.needs_macro_entry);
+
+  // FOOD-019: three dish states, not two (plans/FOOD-019-plan.md MOB-014).
+  // "missing" is dishesMissingMacros above — totals exclude it, existing
+  // warning below, unchanged. "estimated" is new: totals DO include it, so
+  // reusing the missing-macros copy for it would be false — a dish here
+  // resolved via composite decomposition with at least one component backed
+  // by LLM estimation rather than USDA, not zero information. A dish never
+  // decomposed (macro_coverage undefined, i.e. the API default 1.0) is
+  // "complete" and renders nothing extra, silently.
+  const compositeDishes = dishes.filter((d) => d.components && d.components.length > 0);
+  const totalComponents = compositeDishes.reduce((n, d) => n + (d.components?.length ?? 0), 0);
+  const estimatedDishes = dishes.filter(
+    (d) => !d.needs_macro_entry && (d.macro_coverage ?? 1) > 0 && (d.macro_coverage ?? 1) < 1
+  );
+  const [showBreakdown, setShowBreakdown] = useState(false);
 
   const [logging, setLogging] = useState(false);
 
@@ -386,6 +419,59 @@ export default function ResultsScreen() {
             <MacroBar label="Protein" value={macros.protein_g} max={macroMax} color={defaultPalette.good.fg} />
             <MacroBar label="Fat" value={macros.fat_g} max={macroMax} color={defaultPalette.warn.fg} />
             <MacroBar label="Calories" value={macros.calories} max={macroMax * 4} color={defaultPalette.low.fg} />
+
+            {estimatedDishes.length > 0 && (
+              <View style={styles.estimatedNotice}>
+                <Ionicons name="flask-outline" size={13} color={defaultPalette.inkSoft} />
+                <Text style={styles.estimatedNoticeText}>
+                  Some of {estimatedDishes.map((d) => d.name).join(', ')} is based on estimates —
+                  totals above include it.
+                </Text>
+              </View>
+            )}
+
+            {compositeDishes.length > 0 && (
+              <TouchableOpacity
+                style={styles.breakdownToggle}
+                onPress={() => setShowBreakdown((v) => !v)}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.breakdownToggleText}>Breakdown · {totalComponents} items</Text>
+                <Ionicons
+                  name={showBreakdown ? 'chevron-up' : 'chevron-down'}
+                  size={14}
+                  color={defaultPalette.inkSoft}
+                />
+              </TouchableOpacity>
+            )}
+
+            {showBreakdown && compositeDishes.map((dish) => (
+              <View key={dish.crop_id} style={styles.breakdownGroup}>
+                {compositeDishes.length > 1 && (
+                  <Text style={styles.breakdownDishName} numberOfLines={1}>{dish.name}</Text>
+                )}
+                {(dish.components ?? []).map((component, idx) => {
+                  const grams = componentGrams(component, dish.portion_g);
+                  const carbs = componentCarbs(component, dish.portion_g);
+                  return (
+                    <View key={`${dish.crop_id}-${idx}`} style={styles.componentRow}>
+                      <Text style={styles.componentName} numberOfLines={1}>{component.name}</Text>
+                      {grams != null && <Text style={styles.componentGrams}>{Math.round(grams)}g</Text>}
+                      <Text style={styles.componentCarbs}>
+                        {carbs != null ? `${Math.round(carbs)}g carbs` : '—'}
+                      </Text>
+                      {component.macro_source !== 'usda_api' && (
+                        <View style={styles.estimatedBadge}>
+                          <Ionicons name="flask-outline" size={9} color={defaultPalette.inkSoft} />
+                          <Text style={styles.estimatedBadgeText}>estimated</Text>
+                        </View>
+                      )}
+                    </View>
+                  );
+                })}
+              </View>
+            ))}
+
             {dishesMissingMacros.length > 0 && (
               <View style={styles.macroWarning}>
                 <Ionicons name="alert-circle-outline" size={14} color={defaultPalette.warn.fg} />
@@ -676,6 +762,78 @@ const styles = StyleSheet.create({
     flex: 1,
     fontSize: fontSize.xs,
     color: defaultPalette.inkSoft,
+  },
+  estimatedNotice: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: spacing.xs,
+    marginTop: spacing.sm,
+    paddingTop: spacing.sm,
+    borderTopWidth: 1,
+    borderTopColor: defaultPalette.hair,
+  },
+  estimatedNoticeText: {
+    flex: 1,
+    fontSize: fontSize.xs,
+    color: defaultPalette.inkSoft,
+  },
+  breakdownToggle: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: spacing.sm,
+    paddingTop: spacing.sm,
+    borderTopWidth: 1,
+    borderTopColor: defaultPalette.hair,
+  },
+  breakdownToggleText: {
+    fontSize: fontSize.xs,
+    fontWeight: fontWeight.medium,
+    color: defaultPalette.inkSoft,
+  },
+  breakdownGroup: {
+    marginTop: spacing.sm,
+  },
+  breakdownDishName: {
+    fontSize: fontSize.xs,
+    fontWeight: fontWeight.medium,
+    color: defaultPalette.inkFaint,
+    marginBottom: spacing.xs / 2,
+  },
+  componentRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: spacing.xs,
+  },
+  componentName: {
+    flex: 1,
+    fontSize: fontSize.xs,
+    color: defaultPalette.ink,
+    marginRight: spacing.xs,
+  },
+  componentGrams: {
+    fontSize: fontSize.xs,
+    color: defaultPalette.inkFaint,
+    marginRight: spacing.sm,
+  },
+  componentCarbs: {
+    fontSize: fontSize.xs,
+    color: defaultPalette.inkSoft,
+    fontWeight: fontWeight.medium,
+  },
+  estimatedBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: defaultPalette.surfaceSoft,
+    borderRadius: radius.full,
+    paddingHorizontal: spacing.xs,
+    paddingVertical: 1,
+    marginLeft: spacing.xs,
+  },
+  estimatedBadgeText: {
+    fontSize: 9,
+    color: defaultPalette.inkSoft,
+    marginLeft: 2,
   },
   macrosTitle: {
     color: defaultPalette.ink,

@@ -834,6 +834,49 @@ for D5), GLUC-003 (training pipeline being protected)
 
 ---
 
+## Amendment (FOOD-019, 2026-08-28) — carb_coverage exclusion, additive to D3
+
+**D3 is marked locked** ("Do not downweight, do not impute. Per-observation
+noise weighting (GPR `alpha`) is a separate future ticket — do not build it
+here."). This amendment adds a second, independent exclusion clause — it does
+not downweight or impute, so it does not violate D3's letter, but it does
+change what counts as trainable, which D3 explicitly froze. Recorded here so
+the change has a paper trail rather than being re-litigated later with no
+context.
+
+**What changed.** FOOD-019 (`plans/FOOD-019-plan.md`) introduced composite
+dish decomposition: a dish name like "japanese curry chicken katsu with white
+rice" is split into components, each resolved via USDA or LLM-estimated when
+USDA has no match. This means `needs_macro_entry` (and therefore
+`macros_incomplete`) can now be `False` for a dish whose carbs were *partly*
+estimated rather than fully USDA-backed — a distinction this ticket's own
+binary flag cannot express. `pipeline.glucose_model.is_trainable()` gains a
+second clause: exclude a row whose `carb_coverage` (carb-weighted share of
+`total_carbs_g` backed by USDA, persisted by `POST /log-meal`) falls below
+`glucose_training.min_carb_coverage` in `config.yaml` (initially **0.70**). A
+row without the key — every row logged before this amendment — is UNKNOWN,
+not failing, and stays trainable, exactly like a missing `macros_incomplete`
+key under this ticket's own D6.
+
+**Corpus measurement backing the 0.70 choice** (2026-08-28,
+`data/glucose/meal_logs.json`): 21 CGM-complete rows, 83 dish entries, 0 rows
+flagged `macros_incomplete`, all 21 rows legacy (predate this ticket's own
+flag). At n=21 one meal is ~5% of the corpus, so 0.70 vs. 0.80 is not
+measurable against fit quality yet — the value is a placeholder, re-tunable
+via config with no backfill needed, since both `carb_coverage` and
+`macro_coverage` are persisted on the row regardless of whether the gate
+currently excludes anything.
+
+**Implementation:** `pipeline.glucose_model.is_trainable(meal)` and its
+diagnostic sibling `_exclusion_reason(meal)` are the single predicate both
+`build_training_data()` and `should_retrain()` call — extracted specifically
+so the two can't drift apart, per this ticket's own acceptance criteria
+("Training logs the count of skipped rows on each run — a silent skip is the
+same class of bug this ticket fixes"). Full design: `plans/FOOD-019-plan.md`
+D6 and D7.
+
+---
+
 ## Claude Code Prompt
 
 ```

@@ -19,19 +19,29 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
+from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from PIL import Image
 from pydantic import BaseModel, Field
 
+# Load .env before any os.getenv/os.environ read below — API_KEY, USDA_API_KEY,
+# and ANTHROPIC_API_KEY all live there. load_dotenv() never overrides a variable
+# already exported in the shell (e.g. via ~/.zshrc), so existing setups are
+# unaffected; it only fills in what the shell doesn't already provide.
+load_dotenv()
+
 from analyze_meal import analyze_meal as _analyze_meal
 from glucose_analysis import MealNotFoundError, MissingCGMDataError
 from glucose_analysis import analyze_glucose as _analyze_glucose
 from glucose_analysis import analyze_glucose_preview as _analyze_glucose_preview
+from pipeline.dish_decompose import resolve_composite_macros
 from pipeline.embedding_store import EmbeddingStore, _get_clip
 from pipeline.feedback import FeedbackAction, _append_correction_log, normalize_dish_name, record_feedback
 from pipeline.glucose_store import save_cgm_reading
 from pipeline.macro_lookup import lookup_macros
+from pipeline.nutrition import CACHE_DIR as _MACRO_CACHE_DIR
+from pipeline.nutrition import _atomic_write as _write_macro_cache_entry
 from pipeline.portion import scale_macros
 from pipeline.segmentation import _get_model, segment_meal
 
@@ -187,6 +197,16 @@ class DishResult(BaseModel):
     portion_g: float | None = None
     portion_bucket: str | None = None  # "small" | "medium" | "large"; None if not estimated
     needs_macro_entry: bool = False  # True if USDA had no match — carbs/macros above are 0, not verified-zero
+    # FOOD-019: populated only when this dish went through the CORRECT/ADD_NEW
+    # correction path and resolved via composite decomposition. A dish whose
+    # macros came from the original scan (including one that transparently
+    # hit an already-cached composite entry via get_macros()) keeps the
+    # defaults below — the coverage/component breakdown is not (yet) plumbed
+    # through pipeline.portion's scale_macros(), which strips it to the 5
+    # numeric macro fields. See plans/FOOD-019-plan.md "Unchanged on purpose".
+    components: list[dict] | None = None
+    macro_coverage: float = 1.0  # 1.0 = not a composite, or fully USDA-resolved
+    carb_coverage: float = 1.0   # 1.0 = not a composite, or fully USDA-resolved
 
 
 class MealResult(BaseModel):
@@ -216,6 +236,7 @@ class LogMealResponse(BaseModel):
     meal_timestamp: str
     macros_incomplete: bool = False  # True if any confirmed dish had needs_macro_entry set
     unresolved_dishes: list[str] = Field(default_factory=list)
+    carb_coverage: float = 1.0  # FOOD-019 D6: carb-weighted share of total_carbs_g backed by USDA
 
 
 # --- GET /glucose/{meal_id} ---
@@ -569,6 +590,15 @@ def log_meal(body: LogMealRequest):
     })
     macros_incomplete = bool(unresolved_dishes)
 
+    # FOOD-019 D6: meal-level carb_coverage, carb-weighted across confirmed
+    # dishes (a dish that never went through composite decomposition
+    # defaults to 1.0 — see DishResult.carb_coverage). Persisted even though
+    # the glucose_training.min_carb_coverage gate may exclude nothing today —
+    # coverage cannot be reconstructed after the fact, and recording it now
+    # is what makes the threshold re-tunable later with no backfill.
+    confirmed_dish_list = [d for d in result_dish_list if d["name"] in confirmed_set]
+    carb_coverage = _aggregate_carb_coverage(confirmed_dish_list)
+
     log_entry = {
         "meal_id": body.meal_id,
         "timestamp": meal_timestamp,
@@ -576,6 +606,7 @@ def log_meal(body: LogMealRequest):
         "total_carbs_g": round(total_carbs, 2),
         "macros_incomplete": macros_incomplete,
         "unresolved_dishes": unresolved_dishes,
+        "carb_coverage": carb_coverage,
         "pre_meal_glucose_mgdl": None,
         "pre_meal_trend": None,
         # Dict, not []: pipeline/meal_tracker.py's attach_cgm_window() and
@@ -608,6 +639,7 @@ def log_meal(body: LogMealRequest):
         meal_timestamp=meal_timestamp,
         macros_incomplete=macros_incomplete,
         unresolved_dishes=unresolved_dishes,
+        carb_coverage=carb_coverage,
     )
 
 # ---------------------------------------------------------------------------
@@ -765,20 +797,79 @@ def _confirm_metadata_only(dish_name: str) -> bool:
 # API-006 route
 # ---------------------------------------------------------------------------
 
+def _aggregate_carb_coverage(dishes: list[dict]) -> float:
+    """
+    Carb-weighted carb_coverage across a meal's confirmed dishes (FOOD-019
+    D6). A dish that never went through composite decomposition contributes
+    its default 1.0 (DishResult.carb_coverage), so a meal with no composite
+    dishes at all reports 1.0 here, matching pre-FOOD-019 behavior exactly.
+
+    Zero total carbs -> 1.0 (no carb uncertainty to speak of), mirroring
+    resolve_composite_macros()'s own convention for the same edge case.
+    """
+    total_carbs = sum(d.get("carbs_g", 0.0) for d in dishes)
+    if total_carbs <= 0:
+        return 1.0
+    weighted = sum(d.get("carbs_g", 0.0) * d.get("carb_coverage", 1.0) for d in dishes)
+    return round(weighted / total_carbs, 4)
+
+
 def _recompute_dish_macros(corrected_label: str, portion_g: float | None) -> dict:
-    """Live USDA lookup for a corrected dish label, rescaled to portion_g.
+    """Live macro resolution for a corrected dish label, rescaled to portion_g.
 
     Returns fields to merge into a DishResult dict: carbs_g, protein_g,
-    fat_g, calories, needs_macro_entry. Reuses lookup_macros() (not
-    portion.py's cache-only get_macros()) because a just-corrected label has
-    by definition never been looked up before.
+    fat_g, calories, needs_macro_entry, components, macro_coverage,
+    carb_coverage. Every return path sets all seven keys explicitly — a
+    second correction on the same crop can move a dish from composite back
+    to simple (or vice versa), and dish_entry.update() only overwrites keys
+    present in the new dict, so a missing key here would leave stale
+    composite metadata from a *previous* correction lingering on the entry.
+
+    FOOD-019: tries composite decomposition first (for names like "japanese
+    curry chicken katsu with white rice" that have no single USDA match).
+    resolve_composite_macros() returns None for a dish that doesn't actually
+    decompose (a single component matching the input) — the signal to fall
+    through to the pre-FOOD-019 lookup_macros() path, unchanged below.
     """
+    composite = resolve_composite_macros(corrected_label)
+    if composite is not None:
+        # Persist so a future lookup of this exact label — a fresh scan via
+        # pipeline.portion's get_macros(), or another correction — hits the
+        # cache with no further API call. Same file pipeline.nutrition and
+        # pipeline.portion already read; no new read path needed there.
+        cache_path = _MACRO_CACHE_DIR / f"{normalize_dish_name(corrected_label)}.json"
+        _write_macro_cache_entry(cache_path, composite)
+
+        scaled = scale_macros(composite, portion_g or 100.0)
+        if scaled is None:
+            return {
+                "carbs_g": 0.0, "protein_g": 0.0, "fat_g": 0.0, "calories": 0.0,
+                "needs_macro_entry": True,
+                "components": composite["components"],
+                "macro_coverage": composite["macro_coverage"],
+                "carb_coverage": composite["carb_coverage"],
+            }
+        return {
+            "carbs_g": scaled["carbs_g"],
+            "protein_g": scaled["protein_g"],
+            "fat_g": scaled["fat_g"],
+            "calories": scaled["calories"],
+            # Only a dish where NO component resolved via USDA is treated as
+            # unresolved — a partially-estimated composite still has a real
+            # (if partly estimated) carb total, unlike a genuine no_results.
+            "needs_macro_entry": composite["macro_coverage"] == 0.0,
+            "components": composite["components"],
+            "macro_coverage": composite["macro_coverage"],
+            "carb_coverage": composite["carb_coverage"],
+        }
+
     macro_result = lookup_macros(corrected_label)
     needs_macro_entry = macro_result.source == "no_results"
     if needs_macro_entry:
         return {
             "carbs_g": 0.0, "protein_g": 0.0, "fat_g": 0.0, "calories": 0.0,
             "needs_macro_entry": True,
+            "components": None, "macro_coverage": 1.0, "carb_coverage": 1.0,
         }
 
     macros = {
@@ -794,6 +885,7 @@ def _recompute_dish_macros(corrected_label: str, portion_g: float | None) -> dic
         return {
             "carbs_g": 0.0, "protein_g": 0.0, "fat_g": 0.0, "calories": 0.0,
             "needs_macro_entry": True,
+            "components": None, "macro_coverage": 1.0, "carb_coverage": 1.0,
         }
     return {
         "carbs_g": scaled["carbs_g"],
@@ -801,6 +893,7 @@ def _recompute_dish_macros(corrected_label: str, portion_g: float | None) -> dic
         "fat_g": scaled["fat_g"],
         "calories": scaled["calories"],
         "needs_macro_entry": False,
+        "components": None, "macro_coverage": 1.0, "carb_coverage": 1.0,
     }
 
 

@@ -1,0 +1,489 @@
+"""
+FOOD-019: Composite dish decomposition for macro lookup.
+
+Real meal names are composite — "Japanese curry chicken katsu with white rice" —
+and USDA FNDDS has no single entry for them, so pipeline.macro_lookup.lookup_macros()
+returns source="no_results" and the app shows no macro info at all. See
+plans/FOOD-019-plan.md for the full design and decision log.
+
+This module parses a composite dish name into its component foods via a single
+Anthropic call (cached to disk — a novel dish name is decomposed once), looks up
+(or LLM-estimates) each component's macros independently, and folds the result
+into an ordinary per-100g macro profile shaped exactly like a
+pipeline.nutrition cache entry — so pipeline.portion and pipeline.nutrition need
+zero changes to consume it. The decomposer supplies relative composition only;
+grams still come from pipeline.portion's pixel-based portion estimate.
+
+No rule-based parsing anywhere: no connective splitter ("with"/"over"/"and"),
+no name->grams table. See plans/FOOD-019-plan.md, "No rule-based parsing
+anywhere in this design".
+
+Decomposition cache entries carry provenance (schema_version, model) and
+self-invalidate on a prompt edit or a config model swap — see D9 in the plan.
+A failed decomposition call (no key, network, malformed output) fails open to
+a single-component passthrough that is NEVER cached, so one bad call can't
+permanently pin a dish to "does not decompose".
+
+Public API:
+    decompose_dish(dish_name)           -> list[dict]
+    resolve_composite_macros(dish_name) -> dict | None
+    clear_decomposition(dish_name)      -> None
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Optional
+
+import yaml
+
+from pipeline.macro_lookup import lookup_macros
+from pipeline.nutrition import CACHE_DIR, _atomic_write, _load_json, _slug
+
+_log = logging.getLogger(__name__)
+
+DECOMPOSITION_CACHE_DIR = CACHE_DIR / "decompositions"
+
+# Bump whenever _DECOMPOSE_SYSTEM or the component schema changes below — this
+# self-invalidates every cached decomposition (plans/FOOD-019-plan.md D9).
+_SCHEMA_VERSION = 1
+
+_DEFAULT_MODEL = "claude-sonnet-5"
+
+_MACRO_FIELDS = ("calories", "carbs_g", "fiber_g", "protein_g", "fat_g")
+
+_PROPORTION_MIN = 0.05
+_PROPORTION_MAX = 0.85
+
+_VALID_ROLES = {"base", "protein", "vegetable", "sauce", "other"}
+
+_DECOMPOSE_SYSTEM = """You are a nutrition-labeling assistant. Given a meal or dish \
+name, break it into its distinct component foods for macro-nutrient lookup.
+
+For each component, provide:
+- name: a USDA-searchable English name (e.g. "rice, white, cooked", not "rice")
+- role: one of base | protein | vegetable | sauce | other
+- proportion: this component's share of the total cooked weight (0-1). All \
+proportions across components must sum to 1.0.
+- usda_likely: true if you expect USDA FoodData Central to have a close match for \
+this component, false if it's a composite sauce/preparation unlikely to have a \
+direct USDA match.
+- fallback_macros: your best estimate of this component's macros per 100g \
+(calories, carbs_g, fiber_g, protein_g, fat_g) — REQUIRED (non-null) when \
+usda_likely is false, null when usda_likely is true.
+
+A simple, single-food dish name (e.g. "white rice") should return exactly one \
+component with proportion 1.0 and name equal to the (cleaned) input.
+
+Respond with ONLY valid JSON in this exact schema — no prose, no markdown fences:
+{
+  "components": [
+    {
+      "name": "string",
+      "role": "base",
+      "proportion": 0.5,
+      "usda_likely": true,
+      "fallback_macros": null
+    }
+  ]
+}
+"""
+
+_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "components": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "role": {"type": "string", "enum": sorted(_VALID_ROLES)},
+                    "proportion": {"type": "number"},
+                    "usda_likely": {"type": "boolean"},
+                    "fallback_macros": {
+                        "anyOf": [
+                            {"type": "null"},
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "calories": {"type": "number"},
+                                    "carbs_g": {"type": "number"},
+                                    "fiber_g": {"type": "number"},
+                                    "protein_g": {"type": "number"},
+                                    "fat_g": {"type": "number"},
+                                },
+                                "required": list(_MACRO_FIELDS),
+                                "additionalProperties": False,
+                            },
+                        ]
+                    },
+                },
+                "required": ["name", "role", "proportion", "usda_likely", "fallback_macros"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["components"],
+    "additionalProperties": False,
+}
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def _load_decompose_model(config_path: str = "config.yaml") -> str:
+    try:
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f) or {}
+        return cfg.get("llm", {}).get("decompose_model", _DEFAULT_MODEL)
+    except FileNotFoundError:
+        return _DEFAULT_MODEL
+
+
+# ---------------------------------------------------------------------------
+# Cache
+# ---------------------------------------------------------------------------
+
+def _decomposition_path(dish_name: str):
+    return DECOMPOSITION_CACHE_DIR / f"{_slug(dish_name)}.json"
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _load_decomposition(dish_name: str, model: str) -> Optional[dict]:
+    """
+    Return the cached decomposition entry, or None on a miss OR a stale entry.
+
+    An entry is stale — and treated exactly like a cache miss — when its
+    schema_version or model doesn't match current config. This is what makes
+    a prompt edit or a config model swap (D8) self-invalidating: no manual
+    cache-clear step, no migration script (D9).
+    """
+    entry = _load_json(_decomposition_path(dish_name))
+    if entry is None:
+        return None
+    if entry.get("schema_version") != _SCHEMA_VERSION:
+        return None
+    if entry.get("model") != model:
+        return None
+    return entry
+
+
+def _save_decomposition(dish_name: str, components: list[dict], model: str) -> None:
+    entry = {
+        "dish_name": _slug(dish_name),
+        "components": components,
+        "schema_version": _SCHEMA_VERSION,
+        "model": model,
+        "cached_at": _now_iso(),
+    }
+    _atomic_write(_decomposition_path(dish_name), entry)
+
+
+def clear_decomposition(dish_name: str) -> None:
+    """
+    Delete the decomposition cache entry for a dish, plus the derived
+    macro_cache entry if it was built from a decomposition (source ==
+    "composite"). Never touches data/overrides/ — user overrides outrank
+    both layers in pipeline.nutrition.get_macros() and must survive.
+    """
+    decomp_path = _decomposition_path(dish_name)
+    if decomp_path.exists():
+        decomp_path.unlink()
+        _log.info("dish_decompose: cleared decomposition cache for %r", dish_name)
+
+    macro_path = CACHE_DIR / f"{_slug(dish_name)}.json"
+    cached = _load_json(macro_path)
+    if cached is not None and cached.get("source") == "composite":
+        macro_path.unlink()
+        _log.info("dish_decompose: cleared derived composite macro cache for %r", dish_name)
+
+
+# ---------------------------------------------------------------------------
+# Decomposition (LLM call + post-processing)
+# ---------------------------------------------------------------------------
+
+def _passthrough(dish_name: str) -> list[dict]:
+    """The fail-open result: one component, unchanged from input. Never cached."""
+    return [{
+        "name": dish_name.strip(),
+        "role": None,
+        "proportion": 1.0,
+        "usda_likely": True,
+        "fallback_macros": None,
+    }]
+
+
+def _normalize_components(raw_components: list[dict]) -> list[dict]:
+    """
+    Arithmetic sanity on the model's returned proportions — not knowledge
+    about food. Never trust the model's own arithmetic to already sum to 1.0.
+    """
+    components = []
+    for c in raw_components:
+        name = str(c["name"]).strip().lower()
+        role = c.get("role")
+        if role not in _VALID_ROLES:
+            role = None
+        proportion = float(c["proportion"])
+        usda_likely = bool(c.get("usda_likely", True))
+        fallback_macros = c.get("fallback_macros")
+        components.append({
+            "name": name,
+            "role": role,
+            "proportion": proportion,
+            "usda_likely": usda_likely,
+            "fallback_macros": fallback_macros,
+        })
+
+    # Normalize to sum to 1.0.
+    total = sum(c["proportion"] for c in components)
+    if total <= 0:
+        # Degenerate model output — spread evenly rather than divide by zero.
+        even = 1.0 / len(components)
+        for c in components:
+            c["proportion"] = even
+    else:
+        for c in components:
+            c["proportion"] = c["proportion"] / total
+
+    _clamp_and_redistribute(components)
+    return components
+
+
+def _clamp_and_redistribute(components: list[dict]) -> None:
+    """
+    Enforce [0.05, 0.85] on every proportion while keeping the sum at 1.0, in
+    place. A single clamp-then-renormalize pass is not sufficient: clamping
+    the largest value down and renormalizing the rest can push a second value
+    back over the ceiling (e.g. [0.9, 0.1] -> clamp -> [0.85, 0.1] -> naive
+    renormalize by 1/0.95 -> [0.894, 0.105], re-violating the 0.85 ceiling).
+
+    Water-filling instead: each pass fixes only the single worst violator at
+    its bound, then redistributes the remaining budget proportionally among
+    the components not yet fixed. Repeating re-derives whether any other
+    component now violates after redistribution, converging in at most
+    len(components) passes.
+    """
+    n = len(components)
+    fixed = [False] * n
+
+    for _ in range(n):
+        violations = []
+        for i, c in enumerate(components):
+            if fixed[i]:
+                continue
+            if c["proportion"] > _PROPORTION_MAX:
+                violations.append((i, c["proportion"] - _PROPORTION_MAX, _PROPORTION_MAX))
+            elif c["proportion"] < _PROPORTION_MIN:
+                violations.append((i, _PROPORTION_MIN - c["proportion"], _PROPORTION_MIN))
+        if not violations:
+            break
+
+        # Fix only the worst violator this pass — fixing all simultaneously
+        # can be infeasible (e.g. two components each wanting the opposite
+        # extreme with nothing left over for the rest to absorb).
+        worst_i, _, bound = max(violations, key=lambda v: v[1])
+        fixed[worst_i] = True
+        components[worst_i]["proportion"] = bound
+
+        remaining_budget = 1.0 - sum(c["proportion"] for i, c in enumerate(components) if fixed[i])
+        unfixed = [i for i in range(n) if not fixed[i]]
+        if not unfixed:
+            break
+        unfixed_total = sum(components[i]["proportion"] for i in unfixed)
+        if unfixed_total <= 0:
+            even = remaining_budget / len(unfixed)
+            for i in unfixed:
+                components[i]["proportion"] = even
+        else:
+            for i in unfixed:
+                components[i]["proportion"] = components[i]["proportion"] / unfixed_total * remaining_budget
+
+    # Floating-point cleanup: nudge the largest component so the sum is
+    # exactly 1.0 rather than 0.9999999999-something.
+    total = sum(c["proportion"] for c in components)
+    if abs(total - 1.0) > 1e-9:
+        largest = max(range(n), key=lambda i: components[i]["proportion"])
+        components[largest]["proportion"] += 1.0 - total
+
+
+def _call_llm_decompose(dish_name: str, model: str) -> list[dict]:
+    """
+    One Anthropic call. Raises on any failure (no key, network, malformed
+    output, schema violation) — the caller (decompose_dish) treats any
+    exception here as fail-open and does not cache the result.
+
+    NOTE: the exact output_config/format sub-schema shape for structured
+    outputs has not been confirmed against a live billed account as of
+    2026-08-28 (see plans/FOOD-019-plan.md "Dependencies to resolve before
+    starting") — a request-shape rejection here is indistinguishable, from
+    the caller's point of view, from any other failure, and safely fails
+    open either way. Re-run scripts/verify_food019.py --live once credits
+    are available to confirm the shape, and adjust here if the API rejects
+    an unexpected sub-key.
+    """
+    import anthropic
+
+    client = anthropic.Anthropic()
+    response = client.messages.create(
+        model=model,
+        max_tokens=1024,
+        output_config={
+            "effort": "low",
+            "format": {"type": "json_schema", "schema": _RESPONSE_SCHEMA},
+        },
+        system=[{
+            "type": "text",
+            "text": _DECOMPOSE_SYSTEM,
+            "cache_control": {"type": "ephemeral"},
+        }],
+        messages=[{"role": "user", "content": dish_name}],
+    )
+
+    text = next(block.text for block in response.content if block.type == "text")
+    parsed = json.loads(text)
+    raw_components = parsed["components"]
+    if not raw_components:
+        raise ValueError("decomposition returned zero components")
+
+    for c in raw_components:
+        if not c.get("usda_likely", True) and not c.get("fallback_macros"):
+            raise ValueError(
+                f"component {c.get('name')!r} has usda_likely=false but no fallback_macros"
+            )
+
+    return raw_components
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def decompose_dish(dish_name: str, config_path: str = "config.yaml") -> list[dict]:
+    """
+    Return the component breakdown for a dish name.
+
+    Cache hit (matching schema_version and model) -> zero API calls.
+    A simple, single-food dish name safely decomposes to itself (one
+    component, proportion 1.0) and is cached like any other result.
+    Any failure fails open to the same one-component shape, but is NEVER
+    cached, so a transient failure can't permanently pin a dish to
+    "does not decompose" (plans/FOOD-019-plan.md D9).
+    """
+    model = _load_decompose_model(config_path)
+
+    cached = _load_decomposition(dish_name, model)
+    if cached is not None:
+        return cached["components"]
+
+    try:
+        raw_components = _call_llm_decompose(dish_name, model)
+    except Exception as exc:
+        _log.warning(
+            "dish_decompose: decomposition failed for %r (%s: %s) — using "
+            "single-component passthrough, NOT cached",
+            dish_name, type(exc).__name__, exc,
+        )
+        return _passthrough(dish_name)
+
+    components = _normalize_components(raw_components)
+    _save_decomposition(dish_name, components, model)
+    return components
+
+
+def _component_per_100g(component: dict) -> tuple[dict, str]:
+    """
+    Resolve one component's per-100g macros.
+
+    Returns (per_100g_dict, macro_source) where macro_source is one of:
+      "usda_api"   — a real USDA match (lookup_macros() succeeded)
+      "estimated"  — no USDA match; used the LLM's fallback_macros
+      "unresolved" — no USDA match AND no fallback_macros provided; the
+                     component contributes 0.0 to every macro field, same
+                     "0.0 stays 0.0, a flag is the signal" convention FOOD-017
+                     established for needs_macro_entry. Neither macro_coverage
+                     nor carb_coverage counts this component as resolved.
+    """
+    macro_result = lookup_macros(component["name"])
+    usda_resolved = macro_result.source != "no_results" and macro_result.carbs_g is not None
+    if usda_resolved:
+        per_100g = {field: (getattr(macro_result, field) or 0.0) for field in _MACRO_FIELDS}
+        return per_100g, "usda_api"
+
+    fallback = component.get("fallback_macros")
+    if fallback:
+        per_100g = {field: float(fallback.get(field, 0.0)) for field in _MACRO_FIELDS}
+        return per_100g, "estimated"
+
+    return {field: 0.0 for field in _MACRO_FIELDS}, "unresolved"
+
+
+def resolve_composite_macros(dish_name: str, config_path: str = "config.yaml") -> Optional[dict]:
+    """
+    Decompose `dish_name` and fold its components into a single per-100g
+    macro profile, shaped exactly like a pipeline.nutrition cache entry.
+
+    Returns None when the dish didn't actually decompose (a single component
+    whose name matches the input) — the signal to the caller to fall back to
+    the existing lookup_macros() path unchanged. No behavior change for
+    simple dishes.
+    """
+    components = decompose_dish(dish_name, config_path=config_path)
+
+    if len(components) == 1 and _slug(components[0]["name"]) == _slug(dish_name):
+        return None
+
+    totals = {field: Decimal("0") for field in _MACRO_FIELDS}
+    mass_resolved = Decimal("0")
+    carbs_total = Decimal("0")
+    carbs_resolved = Decimal("0")
+    resolved_components = []
+
+    for component in components:
+        proportion = Decimal(str(component["proportion"]))
+        per_100g, macro_source = _component_per_100g(component)
+
+        component_carbs = Decimal(str(per_100g["carbs_g"])) * proportion
+        carbs_total += component_carbs
+        if macro_source == "usda_api":
+            mass_resolved += proportion
+            carbs_resolved += component_carbs
+
+        for field in _MACRO_FIELDS:
+            totals[field] += Decimal(str(per_100g[field])) * proportion
+
+        resolved_components.append({
+            "name": component["name"],
+            "role": component.get("role"),
+            "proportion": float(proportion),
+            "per_100g": per_100g,
+            "macro_source": macro_source,
+        })
+
+    macro_coverage = float(mass_resolved)
+    # No carbs anywhere in the dish -> no carb uncertainty to speak of; treat
+    # as fully covered rather than dividing by zero or reporting 0 (which
+    # would wrongly exclude a genuinely zero-carb meal from glucose training).
+    carb_coverage = float(carbs_resolved / carbs_total) if carbs_total > 0 else 1.0
+
+    result = {
+        "dish_name": _slug(dish_name),
+        "source": "composite",
+        "reference_weight_g": 100.0,
+        "macro_coverage": round(macro_coverage, 4),
+        "carb_coverage": round(carb_coverage, 4),
+        "components": resolved_components,
+    }
+    for field, value in totals.items():
+        result[field] = float(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+    return result

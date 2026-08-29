@@ -779,6 +779,90 @@ The pipeline currently does zero-shot CLIP: embeddings come straight from the fr
 
 ---
 
+### FOOD-019 — Composite dish decomposition for macro lookup — IMPLEMENTED
+
+**Status note (2026-08-28):** Backend implemented — `pipeline/dish_decompose.py`,
+wired into `api.py`'s `_recompute_dish_macros()` (API-012), `pipeline/glucose_model.py`'s
+`is_trainable()` gate, `config.yaml`. Verified via `scripts/verify_food019.py`
+(mocked LLM boundary, no credits required) and `scripts/verify_gluc_012.py`
+(no regression). The mobile-side breakdown UI (MOB-014) and a live smoke
+test against a real Sonnet call (`scripts/verify_food019.py` currently mocks
+the Anthropic client entirely — see the `_call_llm_decompose` docstring) are
+still open. Full design and decision log: `plans/FOOD-019-plan.md`.
+
+**User Story**
+As a user, I want a composite meal name like "Japanese curry chicken katsu
+with white rice" to show real macro info, so a dish that's obviously a
+combination of foods doesn't silently fall back to "no macro info" just
+because USDA has no single entry matching the whole phrase.
+
+**Why this exists / the problem**
+`lookup_macros()` (`pipeline/macro_lookup.py`) queries USDA FNDDS with the
+full dish name as one string. FNDDS has entries for individual prepared
+foods, not arbitrary user-typed combinations, so a composite name returns
+`source: "no_results"` and `_recompute_dish_macros()` (`api.py`) returns hard
+`0.0` macros with `needs_macro_entry: True` — this was, in practice, the main
+coverage ceiling once real meals started getting logged through the app.
+
+**Acceptance Criteria**
+- `pipeline.dish_decompose.decompose_dish(dish_name)` parses a dish name into
+  component foods via one Anthropic call, caches the result, and returns a
+  one-component passthrough for a simple dish name (no behavior change) —
+  see Implementation Notes for why this is LLM-only, not rule-based
+- The decomposition cache self-invalidates on a prompt edit or a
+  `config.yaml` model swap (`schema_version`/`model` stamped on every entry)
+  — no manual cache-clear step required for normal drift
+- A failed decomposition call (no key, network, malformed output) fails open
+  to the passthrough shape and is **never cached** — one bad call cannot
+  permanently pin a dish to "does not decompose"
+- `resolve_composite_macros(dish_name)` folds resolved/estimated components
+  into a single per-100g profile shaped exactly like a
+  `pipeline.nutrition` cache entry (`source: "composite"`), so
+  `pipeline.portion`/`pipeline.nutrition` need zero code changes to consume it
+- Two coverage numbers are computed and persisted: `macro_coverage`
+  (mass-weighted) drives UI transparency; `carb_coverage` (carb-weighted, the
+  metric that actually matters for glucose training) drives the
+  `glucose_training.min_carb_coverage` gate in `pipeline.glucose_model`
+- `needs_macro_entry` on a composite dish is `True` only when *no* component
+  resolved via USDA at all — a partially-estimated composite still reports a
+  real (if partly estimated) carb total, never a hard zero
+- `scripts/clear_decompositions.py` provides manual recourse (`--dish`,
+  `--stale`, `--all`) for a bad split that needs re-deriving outside the
+  automatic self-invalidation path
+
+**Implementation Notes**
+- **No rule-based parsing anywhere** — no connective splitter ("with" /
+  "over" / "and"), no name→grams table. A splitter needs two hardcoded
+  tables, not one (a connective list *and* a per-food gram table, since USDA
+  is per-100g), which is the same brittleness this file's own `FOOD-012
+  Notes` section already flags in `_PINYIN_FALLBACK`. `_PINYIN_FALLBACK`
+  itself is left alone, not extended or removed — that's FOOD-016's job.
+- The decomposer supplies relative composition (proportions) only, never
+  absolute grams — portion size stays owned by `pipeline.portion`'s
+  pixel-based estimate, which is real signal an LLM without the photo
+  cannot supply better than a guess
+- Default model is `claude-sonnet-5`, read from `config.yaml`'s
+  `llm.decompose_model` rather than hardcoded, so quality can be escalated
+  by editing config, not code
+- Full decision log (10 entries — engine choice, proportions-not-grams,
+  cache design, coverage-metric split, the training-gate threshold and its
+  corpus measurement, model choice, cache self-invalidation, additive schema):
+  `plans/FOOD-019-plan.md`
+- This is the ticket `docs/TICKETS-v2.md`'s own FOOD-012 Notes section
+  anticipated ("pairs naturally with FOOD-016 LLM fallback") and that
+  FOOD-016 (`docs/TICKETS-v2.md`) explicitly scoped out as a separate ticket
+  rather than conflating with USDA-pinning — this is that separate ticket
+- **GLUC-012 interaction:** extends that ticket's `macros_incomplete` binary
+  exclusion with a second, additive exclusion clause on `carb_coverage` —
+  recorded as an amendment in `docs/GLUCOSE-TICKETS.md` since GLUC-012's own
+  D3 is marked locked
+
+**Dependencies:** FOOD-012 (macro lookup), FOOD-014 (portion estimation —
+consumes the composite cache entry unchanged), GLUC-012 (training exclusion
+— gains the `carb_coverage` clause)
+
+---
+
 ## Build Order Summary
 
 | Sprint | Tickets | Goal |
