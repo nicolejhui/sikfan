@@ -863,6 +863,206 @@ consumes the composite cache entry unchanged), GLUC-012 (training exclusion
 
 ---
 
+## Macro Correction — Pipeline Support (Post-MVP)
+
+> Surfaced 2026-08-29 from the macro-correction design (Claude Design project
+> `23216dca-776e-4021-ae6d-814c5407e7e2`, `results.jsx`). `POST /confirm-dish`
+> lets a user correct *what a dish is*; nothing lets them correct *how much of
+> it there is*, even though that number drives the glucose projection, the
+> macro card, and the training set. These two tickets supply the pipeline
+> capabilities `API-013` needs; they are independent of each other and can be
+> built in either order or in parallel.
+
+### FOOD-020 — Durable per-dish portion priors
+
+**User Story**
+As a user, when I tell the app the carbs are too high for a dish, I want that
+judgement to change *future* scans of the same dish — not just the meal in
+front of me — so I'm not re-correcting the same bowl of noodles every week.
+
+**Why this exists / the problem**
+The read path already exists and has never been wired to anything.
+`pipeline/portion.py`'s `_read_multiplier()` (L106) is consulted by
+`estimate_portion()` on every scan (L177) and by both mixed-bowl paths
+(L235, L278) — `portion_g = base_g * multiplier`. FOOD-014 also shipped the
+writer, `apply_multiplier()` (L299), but it is called from **nowhere in
+production code**, only from `scripts/verify_food014.py`. There is no way for
+a correction to persist a learned prior.
+
+Two defects block reusing what's there. `apply_multiplier()` writes into
+`data/macro_cache/{slug}.json` for the common case, and that file is
+full-replaced by `api.py`'s `_write_macro_cache_entry` on composite resolution
+and deleted outright by `clear_cache()` / `clear_decomposition()` — so a prior
+written there survives only until the next correction touches the same dish,
+which is the normal path, not a rare race. Separately, `_read_multiplier()`
+returns as soon as an override *file* exists (L108–113), so a macro-only
+override like the real `data/overrides/mapo_tofu.json` — which has no
+`portion_multiplier` key — yields `1.0` and never falls through.
+
+**Acceptance Criteria**
+- [ ] `save_portion_prior(dish_name, factor, reason, direction)` writes
+      `data/portion_priors/{slug}.json` atomically via
+      `pipeline.nutrition._atomic_write`, slugged through `_slug()` (=
+      `feedback.normalize_dish_name()`) like every other per-dish key
+- [ ] **A `leftover` correction never produces a `portion_multiplier`**, and an
+      unrecognized reason raises `ValueError` — enforced inside
+      `pipeline/portion.py` via `PERSISTED_REASONS`/`COUNTED_REASONS`, not by
+      the calling route
+- [ ] A prior **activates on the second** correction in the same direction, not
+      the first; a conflicting correction replaces the evidence and resets the
+      count; `looks_right` clears pending evidence and spares an active prior
+- [ ] `looks_right` reaches `save_portion_prior()` rather than being short-circuited
+      by the route, and is accepted with `reason=None` — validation is
+      direction-aware, not a flat reason-set check (D8)
+- [ ] `too_low` factors are reciprocals of the `too_high` ones (1/0.85, 1/0.60),
+      so a correction followed by its opposite returns the multiplier to
+      exactly 1.0
+- [ ] Multiplier clamped to `[0.5, 2.0]` and rounded to 2dp — an arbitrary
+      float is accepted, not quantized to a grid (see Implementation Notes)
+- [ ] A prior whose `last_scanned` is older than 180 days stops being applied
+      but survives as evidence; `touch_portion_prior()` (called from `api.py`'s
+      scan-completion path, never from `_read_multiplier()`) revives it
+- [ ] The record stores the *evidence*, not just a float: `n_corrections` and
+      a per-`reason` count, both accumulating across repeated corrections —
+      including for `leftover`, which is counted but never acted on
+- [ ] `_read_multiplier()` reads priors > overrides > macro_cache, falling
+      through any layer whose file lacks a `portion_multiplier` key rather
+      than any layer whose file is absent (fixes the early-return bug)
+- [ ] A prior survives a `data/macro_cache/{slug}.json` overwrite,
+      `clear_cache()`, and `clear_decomposition()` — durable by construction,
+      since no existing cache-clearing path can reach the new directory
+- [ ] `estimate_portion()` and both mixed-bowl paths pick the prior up through
+      the existing `base_g * multiplier` lines, with no edit to them
+- [ ] `apply_multiplier()` and `_VALID_MULTIPLIERS` left untouched;
+      `scripts/verify_food014.py` still passes unmodified
+- [ ] `scripts/verify_food020.py` passes (temp `data/` root — never touches
+      real user data)
+
+**Implementation Notes**
+- **A new store, not an existing one.** `data/overrides/` means "macros the
+  user typed by hand" (`nutrition.set_manual_override()`, validated by
+  `_validate_macros()`); `apply_multiplier()` already has to bypass that
+  validation to write there. Piling a second meaning onto the file makes
+  `reset_override()` ambiguous — it would discard the learned prior along with
+  the hand-typed macros.
+- **Continuous float, not a widened `_VALID_MULTIPLIERS`.** The factors
+  *compound* (0.85 corrected again by 0.85 needs 0.7225). Quantizing to a grid
+  means a second correction snaps back to the same point and appears to do
+  nothing — the exact failure the correction UI exists to fix.
+- **Three guards against a permanently wrong number** (added 2026-08-29 after
+  review; full reasoning in `plans/FOOD-020-plan.md` D4–D7). Each addresses a
+  way a correction could silently under-count a dish forever, which in a T1D app
+  means chronically under-dosed insulin:
+  1. *The store owns the reason rule.* A route-level `if` keeping `leftover`
+     out is correct today and one refactor from being wrong, with no visible
+     symptom when it breaks.
+  2. *Two corrections before learning.* One atypical photo shouldn't bias a
+     dish permanently.
+  3. *Reciprocal factors + a `[0.5, 2.0]` clamp.* The design's symmetric
+     percentages aren't invertible — down-a-lot then up-a-lot lands at 0.84,
+     not 1.0, so a user who over-corrects can never return to the original
+     estimate and oscillation ratchets downward. **This diverges from
+     `results.jsx:612` and should be flagged to the design project.**
+- **Compounding itself is correct and stays.** The user judges the number in
+  front of them: at a prior of 0.60 showing 36 g, "still too high, a little"
+  means 36 × 0.85, so the prior becomes 0.51. Replacing it with 0.85 would jump
+  the dish back to 51 g, undoing a correction they never asked to undo.
+- **Staleness is counted in scans, not corrections.** A prior you never have to
+  correct is a prior that's working — expiring on correction-silence would break
+  exactly the right ones. Only a dish you've stopped scanning decays.
+- The early-return fix is kept in this ticket rather than split out: adding a
+  third layer to `_read_multiplier()` without fixing precedence would leave
+  the new layer subject to the same bug.
+- Full decision log: `plans/FOOD-020-plan.md`
+
+**Dependencies:** FOOD-014 (`_read_multiplier`, the gram tables),
+`pipeline/nutrition` (`_atomic_write`, `_slug`, `_load_json`). Blocks API-013.
+
+---
+
+### FOOD-021 — Component folding + LLM ingredient candidates
+
+**User Story**
+As a user, when the breakdown lists an ingredient that isn't in my dish — or
+misses one that is — I want to swap it, remove it, or add the missing one and
+have the macros re-fold correctly, so a wrong ingredient doesn't quietly
+distort the carb total.
+
+**Why this exists / the problem**
+Two pipeline capabilities are missing for the ingredient-level fix flow.
+First, `resolve_composite_macros()` (L430–524) inlines the `Decimal` weighted
+fold over `_component_per_100g()` plus the `macro_coverage`/`carb_coverage`
+computation — so that fold can't be reused on a *user-edited* component list,
+which is exactly what `API-013` needs. Second, the design mock hardcodes
+`item.alts` (plausible alternatives for a misread component) and
+`MEAL.addable` (commonly-missed items) as literal tables in `theme.jsx`. Real
+ones have to be generated.
+
+**Acceptance Criteria**
+- [ ] `fold_components(components)` extracted; `resolve_composite_macros()`
+      delegates to it with byte-for-byte identical output for identical input
+      (pure refactor, asserted in the verify script)
+- [ ] `fold_components()` raises `ValueError` on an empty component list or one
+      whose proportions sum to zero, rather than dividing by zero computing
+      `macro_coverage` — it is a public pipeline function, so it validates its
+      own input rather than trusting `API-013`'s `empty_dish` guard to run first
+- [ ] `suggest_alternatives(dish_name, component_name)` and
+      `suggest_additions(dish_name, present_components)` each make at most one
+      Anthropic call, cache per dish, and fail closed to `[]`
+- [ ] Every returned candidate carries real USDA-backed per-100g macros —
+      resolved through `lookup_macros(name, suggest_query=...)` +
+      `select_best_usda_candidate()`; an unbacked candidate is **dropped**,
+      never returned zero-filled
+- [ ] `suggest_additions()` excludes everything already in
+      `present_components` — the exclusion happens at suggestion time, in the
+      model's judgement, not in a client-side matcher
+- [ ] No hardcoded food-name table, keyword set, or string-similarity
+      threshold anywhere in the new code (CLAUDE.md rule)
+- [ ] Candidate cache at `data/macro_cache/candidates/{slug}.json`, invalidated
+      on `schema_version`/`model` mismatch and clearable via
+      `scripts/clear_decompositions.py`
+- [ ] A decomposition record carrying `user_edited: true` survives
+      schema/model invalidation in `_load_decomposition()`; a normal one does
+      not
+- [ ] `scripts/verify_food021.py` passes; `scripts/verify_food019.py` still
+      passes unmodified (no drift from the refactor)
+
+**Implementation Notes**
+- **Candidates are LLM-generated, not tabled.** A per-dish alternatives table
+  is the brittleness CLAUDE.md records being removed from this path twice
+  (`_PINYIN_FALLBACK`, deleted; `_MATCH_STOPWORDS`, added and rejected in the
+  same session) — and worse, since it only ever covers the dishes someone
+  thought to type, in an app whose whole premise is no fixed class list. The
+  chosen shape matches `suggest_usda_query()` / `select_best_usda_candidate()`:
+  one cached call, structured output, fails closed. An empty list is a valid
+  answer the UI degrades to gracefully; a failure is never a wrong number.
+- **USDA resolution before display.** An LLM can name a plausible ingredient it
+  cannot cost. Showing a candidate whose macros we'd then have to guess would
+  make a "correction" *less* trustworthy than the scan it replaced. Three real
+  options beat five with two invented. This costs one USDA call per candidate
+  on a cold cache, which is why the result is cached per dish.
+- **`sameFood()` is not ported.** `results.jsx:319` dedupes the add-list with a
+  word-set match, which fails silently in both directions on real data ("sauce,
+  soy" vs "soy sauce" collapse; "chicken breast" vs "chicken, breast, fried"
+  don't) and produces double-counted carbs. Exact-slug equality via
+  `normalize_dish_name()` is the backstop — identity matching, not similarity.
+- **`user_edited` survives invalidation** because once a user has hand-corrected
+  a breakdown, discarding it on the next model bump throws away a human
+  judgement in favour of a machine one.
+- **Open decision — the `_SCHEMA_VERSION` bump.** The plan bumps it because the
+  record gains an optional `user_edited` key, but that invalidates the entire
+  existing `data/macro_cache/decompositions/` corpus (~60 dishes) and forces a
+  full re-decomposition on next scan of each. Since the field is additive and a
+  missing key already reads as `false` via `.get()`, not bumping is the cheaper
+  and equally correct option. Settle before implementing.
+- Full decision log: `plans/FOOD-021-plan.md`
+
+**Dependencies:** FOOD-019 (`dish_decompose.py`, `resolve_composite_macros`,
+`_component_per_100g`, `select_best_usda_candidate`), FOOD-012
+(`lookup_macros`). Blocks API-013.
+
+---
+
 ## Build Order Summary
 
 | Sprint | Tickets | Goal |

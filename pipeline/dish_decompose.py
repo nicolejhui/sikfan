@@ -24,10 +24,20 @@ A failed decomposition call (no key, network, malformed output) fails open to
 a single-component passthrough that is NEVER cached, so one bad call can't
 permanently pin a dish to "does not decompose".
 
+FOOD-021 adds ingredient-level fix support: fold_components() is the fold
+step of resolve_composite_macros() lifted out so a caller (API-013) can
+re-fold a user-edited component list through identical math, and
+suggest_alternatives()/suggest_additions() generate USDA-backed candidate
+ingredient lists per dish — no hardcoded per-dish table anywhere.
+
 Public API:
-    decompose_dish(dish_name)           -> list[dict]
-    resolve_composite_macros(dish_name) -> dict | None
-    clear_decomposition(dish_name)      -> None
+    decompose_dish(dish_name)                       -> list[dict]
+    resolve_composite_macros(dish_name)              -> dict | None
+    fold_components(components)                      -> dict
+    suggest_alternatives(dish_name, component_name)  -> list[dict]
+    suggest_additions(dish_name, present_components)  -> list[dict]
+    clear_decomposition(dish_name)                    -> None
+    clear_candidates(dish_name)                       -> None
 """
 
 from __future__ import annotations
@@ -46,10 +56,13 @@ from pipeline.nutrition import CACHE_DIR, _atomic_write, _load_json, _slug
 _log = logging.getLogger(__name__)
 
 DECOMPOSITION_CACHE_DIR = CACHE_DIR / "decompositions"
+CANDIDATES_CACHE_DIR = CACHE_DIR / "candidates"
 
 # Bump whenever _DECOMPOSE_SYSTEM or the component schema changes below — this
 # self-invalidates every cached decomposition (plans/FOOD-019-plan.md D9).
-_SCHEMA_VERSION = 1
+# FOOD-021 bumped this: decomposition records gained an optional
+# `user_edited` key.
+_SCHEMA_VERSION = 2
 
 _DEFAULT_MODEL = "claude-sonnet-5"
 
@@ -166,10 +179,18 @@ def _load_decomposition(dish_name: str, model: str) -> Optional[dict]:
     schema_version or model doesn't match current config. This is what makes
     a prompt edit or a config model swap (D8) self-invalidating: no manual
     cache-clear step, no migration script (D9).
+
+    FOOD-021: an entry with user_edited=True skips this check entirely. A
+    hand-corrected breakdown is a human judgement; discarding it on the next
+    prompt/model bump would throw that away in favor of a machine one that
+    was never re-confirmed by the user (plans/FOOD-021-plan.md, "User-edited
+    decompositions must survive cache invalidation").
     """
     entry = _load_json(_decomposition_path(dish_name))
     if entry is None:
         return None
+    if entry.get("user_edited"):
+        return entry
     if entry.get("schema_version") != _SCHEMA_VERSION:
         return None
     if entry.get("model") != model:
@@ -192,8 +213,9 @@ def clear_decomposition(dish_name: str) -> None:
     """
     Delete the decomposition cache entry for a dish, plus the derived
     macro_cache entry if it was built from a decomposition (source ==
-    "composite"). Never touches data/overrides/ — user overrides outrank
-    both layers in pipeline.nutrition.get_macros() and must survive.
+    "composite"), plus its ingredient-candidate cache entry (FOOD-021).
+    Never touches data/overrides/ — user overrides outrank both layers in
+    pipeline.nutrition.get_macros() and must survive.
     """
     decomp_path = _decomposition_path(dish_name)
     if decomp_path.exists():
@@ -205,6 +227,16 @@ def clear_decomposition(dish_name: str) -> None:
     if cached is not None and cached.get("source") == "composite":
         macro_path.unlink()
         _log.info("dish_decompose: cleared derived composite macro cache for %r", dish_name)
+
+    clear_candidates(dish_name)
+
+
+def clear_candidates(dish_name: str) -> None:
+    """Delete the ingredient-candidate cache entry (alts/addable) for a dish."""
+    path = _candidates_path(dish_name)
+    if path.exists():
+        path.unlink()
+        _log.info("dish_decompose: cleared candidate cache for %r", dish_name)
 
 
 # ---------------------------------------------------------------------------
@@ -427,28 +459,30 @@ def _component_per_100g(component: dict) -> tuple[dict, str]:
     return {field: 0.0 for field in _MACRO_FIELDS}, "unresolved"
 
 
-def resolve_composite_macros(dish_name: str, config_path: str = "config.yaml") -> Optional[dict]:
+def fold_components(components: list[dict]) -> dict:
     """
-    Decompose `dish_name` and fold its components into a single per-100g
-    macro profile, shaped exactly like a pipeline.nutrition cache entry.
+    Fold a component list into a per-100g profile + coverage figures.
 
-    Returns None when the dish didn't actually decompose (exactly one
-    component) — the signal to the caller to fall back to the existing
-    lookup_macros() path, unchanged, using the ORIGINAL dish_name (not
-    whatever the LLM renamed it to). No behavior change for simple dishes.
+    Each component must carry "name", "proportion", and enough for
+    _component_per_100g() to resolve macros ("fallback_macros" optional).
+    Proportions are used as-is (not renormalized) — decompose_dish() already
+    normalizes its output to sum to 1.0, and a caller re-folding a
+    user-edited list is responsible for the same invariant.
 
-    Deliberately checks component COUNT only, not name equality against the
-    input. A real model reliably renames even a genuinely simple dish into
-    USDA-style phrasing ("white rice" -> "rice, white, cooked") — confirmed
-    via a live call on 2026-08-28. An exact-string check against the
-    original name would treat every simple dish as composite, defeating the
-    "no behavior change for simple dishes" guarantee this function exists to
-    provide, for essentially every real dish name.
+    Returns {calories, carbs_g, fiber_g, protein_g, fat_g,
+             reference_weight_g: 100.0, macro_coverage, carb_coverage,
+             components}.
+
+    Raises ValueError if `components` is empty or its proportions sum to <= 0
+    — dividing by that total is what powers macro_coverage/carb_coverage
+    below, and API-013 rejects an empty edited dish with 422 `empty_dish`
+    before ever reaching here; this is fold_components() protecting its own
+    other callers.
     """
-    components = decompose_dish(dish_name, config_path=config_path)
-
-    if len(components) == 1:
-        return None
+    if not components:
+        raise ValueError("fold_components() requires at least one component")
+    if sum(float(c["proportion"]) for c in components) <= 0:
+        raise ValueError("fold_components() requires proportions summing to > 0")
 
     totals = {field: Decimal("0") for field in _MACRO_FIELDS}
     mass_resolved = Decimal("0")
@@ -511,8 +545,6 @@ def resolve_composite_macros(dish_name: str, config_path: str = "config.yaml") -
     carb_coverage *= float(known_mass)
 
     result = {
-        "dish_name": _slug(dish_name),
-        "source": "composite",
         "reference_weight_g": 100.0,
         "macro_coverage": round(macro_coverage, 4),
         "carb_coverage": round(carb_coverage, 4),
@@ -521,6 +553,35 @@ def resolve_composite_macros(dish_name: str, config_path: str = "config.yaml") -
     for field, value in totals.items():
         result[field] = float(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
+    return result
+
+
+def resolve_composite_macros(dish_name: str, config_path: str = "config.yaml") -> Optional[dict]:
+    """
+    Decompose `dish_name` and fold its components into a single per-100g
+    macro profile, shaped exactly like a pipeline.nutrition cache entry.
+
+    Returns None when the dish didn't actually decompose (exactly one
+    component) — the signal to the caller to fall back to the existing
+    lookup_macros() path, unchanged, using the ORIGINAL dish_name (not
+    whatever the LLM renamed it to). No behavior change for simple dishes.
+
+    Deliberately checks component COUNT only, not name equality against the
+    input. A real model reliably renames even a genuinely simple dish into
+    USDA-style phrasing ("white rice" -> "rice, white, cooked") — confirmed
+    via a live call on 2026-08-28. An exact-string check against the
+    original name would treat every simple dish as composite, defeating the
+    "no behavior change for simple dishes" guarantee this function exists to
+    provide, for essentially every real dish name.
+    """
+    components = decompose_dish(dish_name, config_path=config_path)
+
+    if len(components) == 1:
+        return None
+
+    result = fold_components(components)
+    result["dish_name"] = _slug(dish_name)
+    result["source"] = "composite"
     return result
 
 
@@ -638,3 +699,286 @@ def suggest_usda_query(dish_name: str, config_path: str = "config.yaml") -> Opti
     if not suggested or _slug(suggested) == _slug(dish_name):
         return None
     return suggested
+
+
+# ---------------------------------------------------------------------------
+# FOOD-021: component-fix ingredient candidates (alternatives / additions)
+# ---------------------------------------------------------------------------
+#
+# No hardcoded per-dish table anywhere here — see plans/FOOD-021-plan.md,
+# "Candidate lists must be LLM-generated, not a table". Each candidate name
+# is validated through the same lookup_macros()/select_best_usda_candidate()
+# path as everything else in this module and dropped if USDA can't back it;
+# a wrong "correction" would be worse than the scan it replaced.
+
+CANDIDATES_SCHEMA_VERSION = 1
+
+_ALTERNATIVES_SYSTEM = """You help correct a photo-based food identification. \
+Given a dish name and one component a vision system detected in it, list \
+foods that component might plausibly actually have been — visually similar \
+or easily-confused items, for THIS kind of dish.
+
+Respond with ONLY valid JSON in this exact schema — no prose, no markdown \
+fences:
+{
+  "alternatives": [
+    {"name": "a USDA-searchable English name", "grams_hint": 80}
+  ]
+}
+
+Return at most 5 alternatives, most plausible first. grams_hint is a rough \
+typical serving weight in grams. If nothing plausible comes to mind, return \
+an empty list.
+"""
+
+_ADDITIONS_SYSTEM = """You help complete a photo-based food identification. \
+Given a dish name and the components already detected in it, list foods that \
+are commonly part of this dish but easy for a photo to miss — hidden under \
+other food, poured on after plating, or served alongside just off-camera.
+
+Do NOT repeat, rename, or re-describe anything already detected.
+
+Respond with ONLY valid JSON in this exact schema — no prose, no markdown \
+fences:
+{
+  "additions": [
+    {"name": "a USDA-searchable English name", "grams_hint": 30}
+  ]
+}
+
+Return at most 5 additions, most likely first. grams_hint is a rough typical \
+serving weight in grams. If nothing plausible comes to mind, return an empty \
+list.
+"""
+
+_CANDIDATE_ITEM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "grams_hint": {"type": "number"},
+    },
+    "required": ["name", "grams_hint"],
+    "additionalProperties": False,
+}
+
+_ALTERNATIVES_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "alternatives": {"type": "array", "items": _CANDIDATE_ITEM_SCHEMA},
+    },
+    "required": ["alternatives"],
+    "additionalProperties": False,
+}
+
+_ADDITIONS_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "additions": {"type": "array", "items": _CANDIDATE_ITEM_SCHEMA},
+    },
+    "required": ["additions"],
+    "additionalProperties": False,
+}
+
+
+def _candidates_path(dish_name: str):
+    return CANDIDATES_CACHE_DIR / f"{_slug(dish_name)}.json"
+
+
+def _load_candidate_cache(dish_name: str, model: str) -> Optional[dict]:
+    """Same schema_version + model invalidation as _load_decomposition()."""
+    entry = _load_json(_candidates_path(dish_name))
+    if entry is None:
+        return None
+    if entry.get("schema_version") != CANDIDATES_SCHEMA_VERSION:
+        return None
+    if entry.get("model") != model:
+        return None
+    return entry
+
+
+def _save_candidate_entry(
+    dish_name: str,
+    model: str,
+    alts_update: Optional[dict] = None,
+    addable: Optional[list] = None,
+) -> None:
+    """Read-modify-write the per-dish candidate cache entry. Starts fresh
+    (dropping anything on disk) whenever the existing entry is stale by
+    schema_version/model, so a model bump can't leave old-model alternatives
+    sitting under a new-model stamp."""
+    # No "addable" key by default — only set once suggest_additions() has
+    # actually generated it. Defaulting it to [] here would make
+    # suggest_additions() mistake "never computed" for "computed, and empty"
+    # on a dish that only ever had suggest_alternatives() called on it.
+    path = _candidates_path(dish_name)
+    entry = _load_json(path)
+    if entry is None or entry.get("schema_version") != CANDIDATES_SCHEMA_VERSION or entry.get("model") != model:
+        entry = {"dish_name": _slug(dish_name), "alts": {}}
+    entry["schema_version"] = CANDIDATES_SCHEMA_VERSION
+    entry["model"] = model
+    entry["cached_at"] = _now_iso()
+    if alts_update:
+        entry.setdefault("alts", {}).update(alts_update)
+    if addable is not None:
+        entry["addable"] = addable
+    _atomic_write(path, entry)
+
+
+def _resolve_candidate(name: str, grams_hint: Optional[float]) -> Optional[dict]:
+    """
+    Resolve one LLM-suggested ingredient name to real USDA-backed per-100g
+    macros, or None if USDA can't back it — dropped rather than shown with
+    invented/zeroed macros (plans/FOOD-021-plan.md, "Candidates are resolved
+    through USDA before being shown").
+    """
+    try:
+        result = lookup_macros(name)
+    except Exception:
+        return None
+    if result.source == "no_results" or result.carbs_g is None:
+        return None
+
+    if result.candidates:
+        idx = select_best_usda_candidate(name, [c["usda_name"] for c in result.candidates])
+        if idx is None:
+            return None
+        chosen = result.candidates[idx]
+    else:
+        chosen = {
+            "calories": result.calories, "carbs_g": result.carbs_g,
+            "fiber_g": result.fiber_g, "protein_g": result.protein_g,
+            "fat_g": result.fat_g,
+        }
+
+    per_100g = {field: float(chosen.get(field) or 0.0) for field in _MACRO_FIELDS}
+    return {
+        "name": name,
+        "grams_hint": float(grams_hint) if grams_hint is not None else None,
+        "per_100g": per_100g,
+        "carbs_g": per_100g["carbs_g"],
+    }
+
+
+def _call_llm_alternatives(dish_name: str, component_name: str, model: str) -> list[dict]:
+    import anthropic
+
+    client = anthropic.Anthropic()
+    response = client.messages.create(
+        model=model,
+        max_tokens=512,
+        output_config={
+            "effort": "low",
+            "format": {"type": "json_schema", "schema": _ALTERNATIVES_RESPONSE_SCHEMA},
+        },
+        system=[{
+            "type": "text",
+            "text": _ALTERNATIVES_SYSTEM,
+            "cache_control": {"type": "ephemeral"},
+        }],
+        messages=[{
+            "role": "user",
+            "content": f"Dish: {dish_name}\nDetected component: {component_name}",
+        }],
+    )
+    text = next(b.text for b in response.content if b.type == "text")
+    return json.loads(text)["alternatives"]
+
+
+def _call_llm_additions(dish_name: str, present_components: list[str], model: str) -> list[dict]:
+    import anthropic
+
+    client = anthropic.Anthropic()
+    present_list = ", ".join(present_components) if present_components else "(none detected)"
+    response = client.messages.create(
+        model=model,
+        max_tokens=512,
+        output_config={
+            "effort": "low",
+            "format": {"type": "json_schema", "schema": _ADDITIONS_RESPONSE_SCHEMA},
+        },
+        system=[{
+            "type": "text",
+            "text": _ADDITIONS_SYSTEM,
+            "cache_control": {"type": "ephemeral"},
+        }],
+        messages=[{
+            "role": "user",
+            "content": f"Dish: {dish_name}\nAlready detected: {present_list}",
+        }],
+    )
+    text = next(b.text for b in response.content if b.type == "text")
+    return json.loads(text)["additions"]
+
+
+def suggest_alternatives(
+    dish_name: str,
+    component_name: str,
+    config_path: str = "config.yaml",
+) -> list[dict]:
+    """
+    Plausible alternatives for `component_name` as detected in `dish_name` —
+    what a photo-based vision system might have misread it as. One cached
+    Anthropic call per (dish, component) pair; every name is USDA-validated
+    before being returned. Fails closed to [] on any error, malformed
+    response, or timeout — a missing suggestion is invisible, a wrong one
+    silently changes a diabetic carb count.
+    """
+    model = _load_decompose_model(config_path)
+    key = _slug(component_name)
+
+    cached = _load_candidate_cache(dish_name, model)
+    if cached is not None and key in cached.get("alts", {}):
+        return cached["alts"][key]
+
+    try:
+        raw = _call_llm_alternatives(dish_name, component_name, model)
+    except Exception as exc:
+        _log.warning(
+            "dish_decompose: suggest_alternatives failed for dish=%r component=%r "
+            "(%s: %s) — returning []",
+            dish_name, component_name, type(exc).__name__, exc,
+        )
+        return []
+
+    resolved = [c for c in (_resolve_candidate(item["name"], item.get("grams_hint")) for item in raw) if c is not None]
+    _save_candidate_entry(dish_name, model, alts_update={key: resolved})
+    return resolved
+
+
+def suggest_additions(
+    dish_name: str,
+    present_components: list[str],
+    config_path: str = "config.yaml",
+) -> list[dict]:
+    """
+    Foods commonly part of `dish_name` but easy for a photo to miss, always
+    excluding whatever's already in `present_components`. One cached
+    Anthropic call per dish (the exclusion is re-applied on every call, not
+    baked into the cache, so it stays correct as the present list changes
+    across calls); every name is USDA-validated. Fails closed to [].
+
+    Deliberately does NOT use a string-similarity matcher to dedupe against
+    present_components (plans/FOOD-021-plan.md, "Do not port sameFood()") —
+    only exact normalized-slug equality, which is identity matching, not a
+    food-name heuristic.
+    """
+    model = _load_decompose_model(config_path)
+
+    cached = _load_candidate_cache(dish_name, model)
+    if cached is not None and "addable" in cached:
+        addable = cached["addable"]
+    else:
+        try:
+            raw = _call_llm_additions(dish_name, present_components, model)
+        except Exception as exc:
+            _log.warning(
+                "dish_decompose: suggest_additions failed for dish=%r (%s: %s) — "
+                "returning []",
+                dish_name, type(exc).__name__, exc,
+            )
+            return []
+        addable = [c for c in (_resolve_candidate(item["name"], item.get("grams_hint")) for item in raw) if c is not None]
+        _save_candidate_entry(dish_name, model, addable=addable)
+
+    present_slugs = {_slug(name) for name in present_components}
+    return [c for c in addable if _slug(c["name"]) not in present_slugs]

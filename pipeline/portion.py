@@ -9,15 +9,23 @@ All thresholds and gram defaults live in config.yaml under `portion_defaults`.
 Multiplier (0.5x/1x/1.5x/2x) is persisted per dish in data/overrides/ or
 data/macro_cache/ as an optional `portion_multiplier` field.
 
+FOOD-020 adds a durable per-dish portion prior in data/portion_priors/,
+read as the new highest-priority layer ahead of overrides/macro_cache — see
+plans/FOOD-020-plan.md.
+
 Public API:
     estimate_portion(crop_result, dish_name, role=None)   -> dict
     estimate_portions_mixed(crop_result)                  -> dict
-    apply_multiplier(dish_name, multiplier)               -> dict
+    apply_multiplier(dish_name, multiplier)                -> dict
+    save_portion_prior(dish_name, factor, reason, direction) -> dict
+    touch_portion_prior(dish_name)                          -> None
 """
 
 from __future__ import annotations
 
 import json
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -102,15 +110,197 @@ def _dish_category(dish_name: Optional[str], role: Optional[str]) -> str:
 
 _VALID_MULTIPLIERS = {0.5, 1.0, 1.5, 2.0}
 
+# FOOD-020: durable per-dish portion priors — see plans/FOOD-020-plan.md.
+PRIORS_DIR = Path("data/portion_priors")
+
+# PERSISTED_REASONS describe the DISH ("this dish's real portion is
+# different from the pixel estimate") and teach a prior. COUNTED_REASONS
+# describe the MEAL in front of the user right now ("I didn't finish this
+# one plate") and must never influence a future scan of the same dish —
+# enforced here, not by the caller (D4).
+PERSISTED_REASONS = {"portion", "broth", "hidden"}
+COUNTED_REASONS = {"leftover"}
+
+_MULTIPLIER_MIN, _MULTIPLIER_MAX = 0.5, 2.0
+_ACTIVATION_THRESHOLD = 2
+_PRIOR_STALE_DAYS = 180
+
+# too_low factors are the reciprocals of too_high so that a correction and
+# its opposite return the multiplier to exactly 1.0 (D6) — the design's
+# symmetric 15%/40% (results.jsx:612) is NOT invertible and was rejected.
+_FACTORS = {
+    ("too_high", "little"): 0.85,
+    ("too_low", "little"): 1 / 0.85,
+    ("too_high", "lot"): 0.60,
+    ("too_low", "lot"): 1 / 0.60,
+}
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _is_stale(record: dict) -> bool:
+    """A prior stops being applied once its dish hasn't been scanned in
+    _PRIOR_STALE_DAYS (D7) — measured from last_scanned, not last_updated,
+    so a prior that's still correct (and so never corrected) never expires."""
+    last_scanned = record.get("last_scanned")
+    if not last_scanned:
+        return False
+    try:
+        scanned_at = datetime.strptime(last_scanned, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return False
+    return (datetime.now(timezone.utc) - scanned_at).days > _PRIOR_STALE_DAYS
+
+
+def _clamp_multiplier(value: float) -> float:
+    return round(max(_MULTIPLIER_MIN, min(_MULTIPLIER_MAX, value)), 2)
+
+
+def _prior_path(dish_name: str) -> Path:
+    return PRIORS_DIR / f"{_slug(dish_name)}.json"
+
+
+def save_portion_prior(
+    dish_name: str,
+    factor: float,
+    reason: Optional[str],
+    direction: str,
+) -> dict:
+    """
+    Persist one correction (or confirmation) as evidence about a dish's
+    portion size, and — once there's enough evidence — activate a learned
+    multiplier. See plans/FOOD-020-plan.md D4/D5/D6/D8 for the full decision
+    log behind every branch here.
+
+    Args:
+        dish_name: Any casing/spacing — normalized before saving.
+        factor:    The multiplier this single correction represents (e.g.
+                   one of _FACTORS' values), or 1.0 for direction="looks_right".
+        reason:    One of PERSISTED_REASONS | COUNTED_REASONS for a
+                   correction; must be None for "looks_right".
+        direction: "too_high" | "too_low" | "looks_right".
+
+    Returns:
+        The written record dict, with a "prior_state" key describing what
+        just happened: "counted" | "pending" | "activated" | "compounded" |
+        "cleared" | "confirmed".
+
+    Raises:
+        ValueError: reason/direction combination isn't recognized, or
+                    "looks_right" is given a reason or a non-1.0 factor.
+    """
+    if direction not in ("too_high", "too_low", "looks_right"):
+        raise ValueError(f"unknown direction {direction!r}")
+
+    if direction == "looks_right":
+        if reason is not None:
+            raise ValueError("looks_right must not carry a reason")
+        if factor != 1.0:
+            raise ValueError("looks_right must carry factor=1.0")
+    elif reason not in PERSISTED_REASONS | COUNTED_REASONS:
+        raise ValueError(
+            f"unknown reason {reason!r} for direction {direction!r}; "
+            f"must be one of {sorted(PERSISTED_REASONS | COUNTED_REASONS)}"
+        )
+
+    slug = _slug(dish_name)
+    path = _prior_path(dish_name)
+    record = _load_json(path)
+    if record is None:
+        record = {"dish_name": slug, "active": False, "n_corrections": 0, "reasons": {}}
+
+    now = _now_iso()
+    record["last_updated"] = now
+    record.setdefault("last_scanned", now)
+
+    if direction == "looks_right":
+        if record.get("pending_direction") is not None:
+            record.pop("pending_direction", None)
+            record.pop("pending_factor", None)
+            record["prior_state"] = "cleared"
+        else:
+            record["prior_state"] = "confirmed"
+        # An active prior is left untouched — "looks right" about the
+        # CORRECTED number confirms the prior is working, not that it
+        # should be discarded (D8).
+        _atomic_write(path, record)
+        return record
+
+    # too_high / too_low: evidence always accumulates, even for a counted
+    # (leftover) reason — only whether it ever becomes a multiplier differs.
+    record["n_corrections"] = record.get("n_corrections", 0) + 1
+    record["reasons"][reason] = record["reasons"].get(reason, 0) + 1
+
+    if reason in COUNTED_REASONS:
+        record["prior_state"] = "counted"
+        _atomic_write(path, record)
+        return record
+
+    active = record.get("active", False)
+    pending_direction = record.get("pending_direction")
+
+    if active:
+        current = record.get("portion_multiplier", 1.0)
+        record["portion_multiplier"] = _clamp_multiplier(current * factor)
+        record["prior_state"] = "compounded"
+    elif pending_direction is None:
+        record["pending_direction"] = direction
+        record["pending_factor"] = factor
+        record["prior_state"] = "pending"
+    elif pending_direction == direction:
+        record["portion_multiplier"] = _clamp_multiplier(1.0 * factor)
+        record["active"] = True
+        record.pop("pending_direction", None)
+        record.pop("pending_factor", None)
+        record["prior_state"] = "activated"
+    else:
+        # Conflicting direction: the user changed their mind. Two
+        # contradictory corrections are not two pieces of evidence, so
+        # replace the pending evidence and reset the tally (D5).
+        record["pending_direction"] = direction
+        record["pending_factor"] = factor
+        record["n_corrections"] = 1
+        record["reasons"] = {reason: 1}
+        record["prior_state"] = "pending"
+
+    _atomic_write(path, record)
+    return record
+
+
+def touch_portion_prior(dish_name: str) -> None:
+    """Update last_scanned on an existing prior record (D7). No-op if the
+    dish has no prior yet. Deliberately not called from _read_multiplier(),
+    which stays a pure read — call this from the scan-completion path."""
+    path = _prior_path(dish_name)
+    record = _load_json(path)
+    if record is None:
+        return
+    record["last_scanned"] = _now_iso()
+    _atomic_write(path, record)
+
 
 def _read_multiplier(dish_name: str) -> float:
-    """Read persisted portion_multiplier for a dish (default 1.0)."""
-    override = _load_json(OVERRIDES_DIR / f"{_slug(dish_name)}.json")
-    if override is not None:
-        return float(override.get("portion_multiplier", 1.0))
-    cached = _load_json(CACHE_DIR / f"{_slug(dish_name)}.json")
-    if cached is not None:
-        return float(cached.get("portion_multiplier", 1.0))
+    """Read persisted portion_multiplier for a dish (default 1.0).
+
+    Layer order: priors > overrides > macro_cache (highest priority first).
+    Every layer falls through when the file is present but lacks a
+    portion_multiplier key (fixes the early-return bug where a macro-only
+    override — e.g. a real data/overrides/mapo_tofu.json with no multiplier
+    key — used to short-circuit to 1.0 instead of falling through to a
+    multiplier stored underneath it). A stale prior (D7) is skipped, not
+    deleted — it remains as evidence for save_portion_prior()."""
+    slug = _slug(dish_name)
+    for directory in (PRIORS_DIR, OVERRIDES_DIR, CACHE_DIR):
+        record = _load_json(directory / f"{slug}.json")
+        if record is None or "portion_multiplier" not in record:
+            continue
+        if directory is PRIORS_DIR and _is_stale(record):
+            continue
+        return float(record["portion_multiplier"])
     return 1.0
 
 

@@ -396,6 +396,251 @@ Replace the placeholder boxes used for meal thumbnails on Home, Results, and Mea
 
 ---
 
+### MOB-014 — Composite dish breakdown on Results — IMPLEMENTED
+
+**Status note (backfilled 2026-08-29):** shipped 2026-08-28 and verified then
+(`expo-doctor` 20/22, `tsc --noEmit` clean, clean-cache Metro bundle of 2681
+modules) — but the ticket itself was never written into this file, only
+referenced in passing from the Known Issues section below and from
+`docs/API-LAYER-TICKETS.md`'s API-012. Recorded here so the Epic 9 sequence has
+no gap and so MOB-016 has something to declare a dependency on.
+
+**Goal**
+Surface FOOD-019's component decomposition in the Results screen's Macros card,
+so a composite dish ("tomato egg rice with shredded chicken and bok choy") shows
+what it was actually broken into rather than a single opaque carb number.
+
+**What shipped** (`mobile/screens/ResultsScreen.tsx`)
+- `compositeDishes` (~L214) filters `dishes` to those with a non-empty
+  `.components`; `totalComponents` counts across them
+- A collapsible "Breakdown · N items" toggle (~L433) reveals a row per
+  component (~L448), with the dish name as a sub-heading when more than one
+  dish is composite
+- `componentGrams()` / `componentCarbs()` (~L47–56) derive each row's grams and
+  carbs from `component.proportion * dishPortionG` and
+  `per_100g.carbs_g * grams / 100` — display-side arithmetic over server
+  values, no macro estimation on the client
+- An estimated-macros notice (~L423) names any dish carrying
+  LLM-`estimated` rather than USDA-backed components, so a partly-guessed
+  total is never presented as measured
+
+**Known follow-ups** (both filed separately, not defects in this ticket)
+- MOB-015 — a *non-composite* second dish still has no rendering path at all
+- MOB-017 — the macro bar colours in this card don't match `theme.jsx`
+
+**Dependencies:** MOB-007, FOOD-019, API-012
+
+---
+
+### MOB-015 — Results screen only surfaces the primary dish; extra dishes are invisible
+
+**Goal**
+A meal with more than one detected dish (e.g. a rice bowl + a separate plate
+of dumplings) only shows the *first* dish (`dishes[0]`) anywhere on the
+Results screen — its name in the header, its `ConfirmDishSheet`, and (if
+composite) its ingredient "Breakdown." Every other dish in `dishes[]` is
+folded into the top Macros card's totals (`sumMacros` reduces over the full
+array) with **zero UI representation**: no name, no card, no confirm/correct
+affordance. Confirmed live 2026-08-29 — a scan returned `tomato_egg_rice_with_shredded_chicken_
+and_bok_choy` (6.36g carbs, shown with its 5-item breakdown) and a second
+dish `dumplings` (9.96g carbs, `components: null`) that never appeared
+anywhere on screen; the Macros card correctly totalled 16.32g but nothing
+explained where the extra ~10g came from.
+
+**Acceptance Criteria**
+- [ ] Every dish in `mealStore.dishes` (or `loggedMeal.dishes`) gets *some*
+      visible representation on Results — at minimum a name + its own
+      carbs_g, even for a non-composite dish with no `.components`
+- [ ] `estimatedDishes`/`dishesMissingMacros` messaging (which already names
+      dishes by iterating the full array) is the existing precedent to
+      follow for how a second dish's name reaches the UI
+- [ ] Decide (see plan) whether dish 2+ gets a full `DishHeader`-style card
+      with its own edit/confirm affordance, or a lighter-weight
+      name+macros row — `ConfirmDishSheet` is currently wired to exactly one
+      `cropId` (`primaryDish.crop_id`), so multi-dish correction is a real
+      scope question, not just a rendering one
+- [ ] `formatDishName()` used for any newly-rendered dish name, per the
+      existing repo-wide rule (`CLAUDE.md` "Mobile Dish-Name Display")
+
+**Implementation Notes**
+- Root cause is in `mobile/screens/ResultsScreen.tsx`: `primaryDish =
+  (loggedMeal ? loggedMeal.dishes[0] : scanDishes[0])` (~line 100) drives
+  the header/confirm sheet, and `compositeDishes = dishes.filter(d =>
+  d.components && d.components.length > 0)` (~line 214) drives the
+  Breakdown section — neither loop covers a simple, non-primary dish
+  (`components: null`, not `dishes[0]`)
+- `macros` (top Macros card totals) is already correct — `sumMacros` in
+  `mobile/store/mealStore.ts` (`applyResult`) sums `carbs_g`/etc. across
+  **all** dishes; this ticket is about visibility of the breakdown, not the
+  totals math
+
+**Dependencies:** MOB-007, MOB-010
+
+---
+
+### MOB-016 — Macro correction UI
+
+**Goal**
+Let the user say the carbs are wrong, and why, from the Results screen — then
+see both the macro card and the glucose projection update in place. Ported from
+`results.jsx` (`MacroCard`, `IngredientSheet`, `AddIngredientSheet`) in the
+Claude Design project `23216dca-776e-4021-ae6d-814c5407e7e2`, which specifies
+the whole interaction. Backed by API-013. Full plan and decision log:
+`plans/MOB-016-plan.md`.
+
+The design's own framing:
+> The scan's carb estimate drives the whole projection, so the user can tell us
+> it reads too low / too high instead of typing exact grams.
+> Misidentified food is a different kind of answer — send them to the thing
+> that's actually wrong instead of guessing a percentage.
+
+**Acceptance Criteria**
+- [ ] Correction is an **inline block inside the Macros card**, collapsed by
+      default — positioned after the estimated-macros notice (~L423–431) and
+      before the breakdown toggle (~L433), the design's own ordering
+- [ ] Entry row (44pt min height) has both states: untouched → `surfaceSoft`
+      icon square, "Estimate look off?"; corrected → `brand` square, "Edit your
+      correction"
+- [ ] Panel is driven by an explicit `correcting` flag (not by whether
+      corrections exist) and has a close (X) button beside "Do the carbs look
+      right?"
+- [ ] Segmented control: **Too high · Looks right · Too low**
+- [ ] Reason chips filtered by direction, so no nonsensical pair is offered —
+      too high → *Portion was smaller* / *It's mostly broth* / *Not eating the
+      full portion*; too low → *Portion was bigger* / *More food than it looks*
+- [ ] Magnitude chips *A little* / *A lot*; picking a reason pre-selects
+      "little" (`results.jsx:611`)
+- [ ] Footer row "An ingredient is wrong or missing" always available inside
+      the panel → opens fix mode; "Undo all" appears once anything is corrected
+      → `POST /reset-corrections`
+- [ ] "Undo all" reverts the carb correction **and** any ingredient
+      swaps/removals/additions, including the saved breakdown used by future
+      scans — but not a learned portion prior. Don't imply it resets everything;
+      the response's `decomposition_reverted`/`prior_retained` say what actually
+      happened (API-013)
+- [ ] Fix mode on the breakdown: header becomes "Which ingredient is wrong?"
+      with a **Done** button replacing the chevron; rows become buttons opening
+      `IngredientSheet`; a dashed "Something's missing" row opens
+      `AddIngredientSheet`; swapped/added rows carry "fixed"/"added" pills
+- [ ] The last remaining component can't be removed: `IngredientSheet`'s "It's
+      not in my dish" row is disabled (with a short reason) when removing it
+      would empty the dish. The server refuses this with 422 `empty_dish`
+      regardless — the client guard exists so the user never reaches a dead end,
+      not as the enforcement. If the 422 does arrive, surface it inline like any
+      other correction failure
+- [ ] A dish with no `portion_g` gets no fix-mode affordance at all —
+      `/correct-ingredients` 422s with `no_portion_estimate`, since proportions
+      can't be converted to grams without one
+- [ ] "Carbs updated" summary row at the top of the Macros card when the total
+      has changed — old value struck through → `arrowR` → new value, with a
+      `+Ng`/`−Ng` `brand` pill (`results.jsx:390–403`)
+- [ ] The confirmation line's percentage is **derived from the factor the server
+      applied**, not hardcoded to 15/40 — FOOD-020 D6 makes `too_low` factors
+      reciprocals of `too_high` so corrections are reversible, so an up-a-lot
+      correction reads "raised 67%" (1/0.60), not "raised 40%"
+- [ ] Every correction **and** the reset call one shared
+      `refreshAfterCorrection(mealId)` — macros and the glucose curve both
+      update, through a single path
+- [ ] No client-side macro or curve math anywhere
+- [ ] `sameFood()` not ported (see Implementation Notes)
+- [ ] Requests fire on selection (no submit button); controls disable in
+      flight; a failure shows an **inline** error and reverts the selection —
+      `GlucosePad`'s pattern (`GlucosePad.tsx:59-73`), not a toast, so the user
+      keeps their context
+- [ ] Candidates fetched lazily on first entry into fix mode, not on mount —
+      it's an LLM-backed call and most meals are never corrected
+- [ ] Hidden entirely for logged meals; gated on `!loggedMeal && mealId && cropId`
+- [ ] All colours from `constants/theme.ts`; `formatDishName()` for any dish
+      name rendered (CLAUDE.md rules)
+- [ ] `/mobile_ticket_check` passes
+
+**Implementation Notes**
+- **Inline block, not a bottom sheet.** The first draft assumed a sheet, to
+  match `ConfirmDishSheet`. The design doesn't: the correction is about the
+  numbers directly above it, and a sheet would hide the macro bars at the exact
+  moment the user is judging them. The two *ingredient* interactions stay
+  bottom sheets, as the design has them — those are modal choices from a list.
+- **Entry point is the Macros card, not the `dishHeader` pencil.** That pencil
+  is identity-shaped: it opens `ConfirmDishSheet` to correct *what the dish is*.
+  Putting a quantity correction there conflates the two questions the design
+  deliberately separates.
+- **No client-side scaling**, even though the design mock does it (`cf` in
+  `ResultsScreen`). The glucose curve can't be scaled on the client — it comes
+  from a trained model against `total_carbs_g` — so a local multiply would leave
+  the two views disagreeing until a refetch. Same reasoning already recorded in
+  `plans/API-011-plan.md` for rejecting a client-side curve shift.
+- **`sameFood()` (`results.jsx:319`) is not ported** — a word-set match over
+  food names is the string-similarity heuristic CLAUDE.md forbids. The server
+  excludes present components at suggestion time instead (FOOD-021); the client
+  renders the read-only "already counted" row for exact matches only and needs
+  no matcher.
+- **Extract `refreshAfterCorrection(mealId)`** from `handleCorrected`
+  (L154–173): `pollMealStatus` → `refreshFromResult` → `fetchPrediction`. The
+  name-reapply step at L164 stays in `handleCorrected` — it exists because
+  `refreshFromResult` overwrites the display name with the server's normalized
+  slug, which is specific to the name-correction path.
+- **New files:** `components/CarbCorrection.tsx`, `components/IngredientSheet.tsx`,
+  `components/AddIngredientSheet.tsx`; `api/meals.ts` gains `correctMacros`,
+  `correctIngredients`, `getIngredientCandidates`, `resetCorrections` beside
+  `confirmDish` (L27–33), via the existing `apiFetchJson`.
+- **Icons (verified against `theme.jsx`, 2026-08-29):** the design's right-arrow
+  is `Icon name="arrowR"`, defined in `theme.jsx`'s own SVG set. That set is a
+  web-preview primitive and is **not** ported to the app — every RN screen uses
+  `@expo/vector-icons` `Ionicons` instead (`CameraScreen`, `AnalyzingScreen`,
+  `MealLogScreen`). So use `Ionicons name="arrow-forward"`, and `"sparkles"` for
+  the confirmation line (already used at `CameraScreen.tsx:96`). Do **not** add an
+  `arrowR` token to `theme.ts`.
+- **`th.brandTint` does not exist — confirmed.** `results.jsx` references it with
+  a `|| th.surfaceSoft` fallback, but `theme.jsx`'s palettes define only
+  `canvas/canvas2/surface/surfaceSoft/ink/inkSoft/inkFaint/hair/shadow/brand` plus
+  the `good`/`warn`/`low` groups. Use `surfaceSoft`; do not invent the token.
+- **Multi-dish limitation:** this targets the primary dish's `crop_id`, so a
+  multi-dish meal can only have its first dish corrected until MOB-015 lands.
+
+**Dependencies:** API-013 (all four routes), MOB-007 (Results screen), MOB-010
+(`ConfirmDishSheet`, `@gorhom/bottom-sheet`), MOB-012 (`GlucosePad`'s
+inline-error pattern), MOB-014 (the breakdown UI this extends). Related:
+MOB-015.
+
+---
+
+### MOB-017 — Macro bar colours don't match the design source of truth
+
+**Goal**
+`ResultsScreen.tsx`'s macro bars (~L418–421) colour carbs `brand`, protein
+`good.fg`, fat `warn.fg`, calories `low.fg`. The design's `MacroBars`
+(`results.jsx`, project `23216dca-776e-4021-ae6d-814c5407e7e2`) colours carbs
+`warn.fg`, protein `good.fg`, fat `low.fg`, calories `brand`. Three of the four
+are wrong, and carbs — the number this whole app is about — is the most visible
+of them.
+
+**Acceptance Criteria**
+- [ ] Macro bar colours match `results.jsx`'s `MacroBars` exactly: carbs
+      `warn.fg`, protein `good.fg`, fat `low.fg`, calories `brand`
+- [ ] Colours read from `constants/theme.ts`, no hardcoded hex (CLAUDE.md rule)
+- [ ] Checked side-by-side against the design before closing — if `theme.jsx`
+      has drifted since, that is the authority, not this ticket's snapshot
+- [ ] `/mobile_ticket_check` passes
+
+**Implementation Notes**
+- **Verified first-hand against `theme.jsx` (2026-08-29)**, not inferred.
+  `MacroBars`'s `rows` array reads exactly: `carbs → th.warn.fg`,
+  `protein → th.good.fg`, `fat → th.low.fg`, `calories → th.brand`.
+- The same function carries bar-scaling maxima worth matching while you're in
+  there: carbs 90, protein 50, fat 40, calories 800 — each bar's fill is
+  `min(100, g / max * 100)%`. Calories renders with **no `g` suffix**
+  (`unit: ''`); the other three append `g`.
+- Surfaced 2026-08-29 while planning MOB-016 and deliberately kept out of it: a
+  silent visual change bundled into a feature ticket is hard to review and
+  harder to attribute later. It is a one-line-per-bar fix, but it changes the
+  look of the primary screen, so it gets its own commit.
+- Same class of drift as MOB-001's fabricated `theme.ts`, corrected during
+  MOB-004 (see CLAUDE.md "Mobile Design System — Source of Truth").
+
+**Dependencies:** MOB-007, MOB-014
+
+---
+
 ## Known Issues (deferred, not blocking)
 
 Surfaced 2026-08-28 by `npx expo-doctor` while verifying MOB-014 (composite

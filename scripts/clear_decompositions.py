@@ -7,6 +7,14 @@ model stamp — see plans/FOOD-019-plan.md D9), so normal drift needs no manual
 step. This script covers what that can't: a specific dish that decomposed
 badly and needs to be re-derived on the next lookup.
 
+FOOD-021: also reaches data/macro_cache/candidates/{slug}.json (the
+ingredient-alternatives/additions cache) — cleared alongside a dish's
+decomposition, or independently by --stale, since the two caches invalidate
+on the same schema_version/model contract but are generated separately. A
+decomposition with user_edited=True is a human judgement and is never
+treated as stale by --stale (it can still be cleared explicitly by --dish
+or --all).
+
 Usage:
     python scripts/clear_decompositions.py --dish "japanese curry chicken katsu with white rice"
     python scripts/clear_decompositions.py --stale
@@ -21,9 +29,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pipeline.dish_decompose import (
+    CANDIDATES_CACHE_DIR,
+    CANDIDATES_SCHEMA_VERSION,
     DECOMPOSITION_CACHE_DIR,
     _load_decompose_model,
     _load_decomposition,
+    clear_candidates,
     clear_decomposition,
 )
 from pipeline.nutrition import _load_json
@@ -45,14 +56,32 @@ def clear_stale() -> int:
     """Clear only entries whose schema_version or model no longer matches
     current config — i.e. entries _load_decomposition() would already treat
     as a miss on next read. Provided as an explicit, auditable bulk action
-    rather than waiting for each dish to be re-looked-up organically."""
+    rather than waiting for each dish to be re-looked-up organically.
+
+    Also sweeps data/macro_cache/candidates/ (FOOD-021) the same way — a
+    stale candidate entry (from a since-changed decompose_model) is not
+    necessarily paired with a stale decomposition entry, since the two are
+    independently generated and cached."""
     current_model = _load_decompose_model()
     count = 0
     for path in sorted(DECOMPOSITION_CACHE_DIR.glob("*.json")):
         dish_name = _dish_name_from_entry(path)
+        entry = _load_json(path)
+        if entry is not None and entry.get("user_edited"):
+            continue  # FOOD-021: a hand-corrected decomposition never expires
         if _load_decomposition(dish_name, current_model) is None:
             clear_decomposition(dish_name)
             count += 1
+
+    if CANDIDATES_CACHE_DIR.exists():
+        for path in sorted(CANDIDATES_CACHE_DIR.glob("*.json")):
+            entry = _load_json(path)
+            if entry is None:
+                continue
+            if entry.get("schema_version") != CANDIDATES_SCHEMA_VERSION or entry.get("model") != current_model:
+                clear_candidates(_dish_name_from_entry(path))
+                count += 1
+
     return count
 
 
@@ -64,7 +93,7 @@ def main() -> None:
     group.add_argument("--all", action="store_true", help="Clear every decomposition cache entry.")
     args = parser.parse_args()
 
-    if not DECOMPOSITION_CACHE_DIR.exists():
+    if not DECOMPOSITION_CACHE_DIR.exists() and not CANDIDATES_CACHE_DIR.exists():
         print(f"No decomposition cache directory at {DECOMPOSITION_CACHE_DIR} — nothing to clear.")
         return
 

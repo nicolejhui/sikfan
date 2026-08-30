@@ -1566,6 +1566,201 @@ route `_recompute_dish_macros()` serves), API-004 (`POST /log-meal`, the
 
 ---
 
+## API-013 — Macro correction endpoints
+
+### Goal
+`POST /confirm-dish` lets the app correct *what the dish is*. Nothing lets it
+correct *how much of it there is*. If the dish name is right and the carbs are
+wrong, the number stands — and it drives the glucose projection, the macro
+card, and the training set.
+
+Four routes backing the correction design (`results.jsx`, Claude Design project
+`23216dca-776e-4021-ae6d-814c5407e7e2`), which has two distinct flows plus an
+undo:
+
+- **Scalar** — "Do the carbs look right?" → Too high / Looks right / Too low →
+  a reason → A little (15%) / A lot (40%).
+- **Ingredient** — "An ingredient is wrong or missing" → swap a component,
+  remove it, or add one the photo missed.
+- **Undo all** — reverts every correction on a dish.
+
+Both flows must leave the meal's macros *and* its glucose projection
+consistent — the design says "projection updated" after every one of them.
+Full design + decision log: `plans/API-013-plan.md`.
+
+### Acceptance Criteria
+- [ ] Four routes, all `dependencies=[Depends(verify_api_key)]`, all resolving
+      the crop through a shared `_resolve_dish_entry(meal_id, crop_id)` lifted
+      out of `confirm_dish()` (api.py L1034–1051) rather than duplicating it
+- [ ] `POST /correct-macros` factors are **imported** from
+      `pipeline.portion._FACTORS`, never redefined in the route — `too_high`
+      0.85/0.60 and `too_low` their reciprocals 1.176/1.667, so a correction
+      followed by its opposite returns to exactly 1.0 (FOOD-020 D6; this
+      deliberately diverges from `results.jsx`'s symmetric 1.15/1.40 —
+      flag upstream). `looks_right` logs a `factor: 1.0` confirmation and
+      changes nothing
+- [ ] **Every** correction is passed to `save_portion_prior()`, `leftover`
+      included — the store decides what persists, and this route contains no
+      reason branching at all (FOOD-020 D4). `leftover` is counted, never
+      applied; `portion`/`broth`/`hidden` activate a prior only on the second
+      consistent correction (FOOD-020 D5)
+- [ ] `looks_right` also calls `save_portion_prior()` (`factor: 1.0`,
+      `reason: None`) before returning — it changes no macros, but must not
+      short-circuit ahead of the store, or a confirmation can never clear
+      pending evidence (FOOD-020 D8)
+- [ ] `touch_portion_prior()` called for each resolved dish when a scan job
+      completes, so a prior only goes stale when the dish stops being eaten
+      (FOOD-020 D7)
+- [ ] Never calls `apply_multiplier()` (the legacy writer into
+      `data/overrides/` / `data/macro_cache/`) or `record_feedback()` (ChromaDB
+      centroids) — both are cross-meal channels with no part in a quantity
+      correction
+- [ ] 400 `missing_correction_detail` when a correction direction arrives
+      without both `reason` and `magnitude` (mirrors `missing_corrected_label`)
+- [ ] 422 `no_portion_estimate` when `portion_g` is missing — **not** a
+      `100.0` fallback
+- [ ] `POST /correct-ingredients` computes edits in absolute grams
+      (`proportion × portion_g`), recomputes `portion_g` as the sum of
+      surviving grams, then renormalizes proportions to 1.0
+- [ ] A swap whose replacement USDA can't back is rejected with 422
+      `unresolved_ingredient`, never zero-filled
+- [ ] An edit batch whose **net result** is zero surviving components — or whose
+      surviving grams sum to `<= 0` — is refused with 422 `empty_dish`, leaving
+      the meal, the decomposition cache and the prior untouched. Checked *after*
+      edits are applied, so a remove-three-add-one batch is judged on its result
+- [ ] `POST /correct-ingredients` returns 422 `no_portion_estimate` when
+      `portion_g` is null — it needs a portion to convert proportions to grams
+- [ ] `IngredientEdit.grams` is `Field(gt=0)`, so a zero or negative `add` is
+      rejected by Pydantic before route logic runs
+- [ ] 422 `no_components` when the dish has no `components` (the non-composite
+      scope boundary API-012 describes)
+- [ ] Edited component lists persisted to
+      `data/macro_cache/decompositions/{slug}.json` with `user_edited: true`,
+      so the next scan of the dish starts from the corrected breakdown
+- [ ] `GET /ingredient-candidates/{meal_id}/{crop_id}` returns
+      `{alts: {...}, addable: [...]}` — **200 with empty lists** on LLM
+      failure, never a 5xx
+- [ ] `_baseline` snapshotted on the *first* correction to a crop only;
+      `POST /reset-corrections` restores it exactly and deletes the key; 404
+      `no_corrections` if none exists
+- [ ] After reset, the meal is fully back to its scanned state: macros, portion
+      and components restored from `_baseline`, `total_carbs_g` recomputed, and
+      `GET /glucose/{meal_id}` returning the pre-correction curve (it derives
+      from `total_carbs_g`, so this needs no separate glucose bookkeeping —
+      but it is *recomputed*, not a snapshot, so a manual glucose entry or a
+      model retrain in between can shift it slightly)
+- [ ] **Reset's scope is stated, not inferred.** It reverts (a) this meal's
+      macros/portion/components from `_baseline` and (b) an edited
+      decomposition — writing the baseline component list back to
+      `data/macro_cache/decompositions/{slug}.json` and dropping `user_edited`,
+      without deleting the record. It does **not** roll back a persisted portion
+      prior. The response reports both: `decomposition_reverted`,
+      `prior_retained`
+- [ ] `total_carbs_g` recomputed and `job_status` written after every mutation,
+      via a shared `_write_corrected()` mirroring api.py L1070–1072
+- [ ] All mutations logged to `data/macro_correction_log.jsonl`, each carrying
+      `prior_state` (`"counted" | "pending" | "activated" | "compounded" |
+      "clamped" | "cleared" | "confirmed"`) so the learning behaviour is auditable
+      offline
+- [ ] `POST /confirm-dish` behaviour unchanged after the `_resolve_dish_entry`
+      refactor
+- [ ] Error matrix rows below added to this document's matrix section
+
+### Implementation Notes
+- **Two endpoints, not one.** The flows share nothing but the crop lookup — the
+  scalar flow multiplies `portion_g` and re-resolves macros wholesale; the
+  ingredient flow rewrites a component list and re-folds it, never touching the
+  multiplier. A union payload would be a discriminated type where every field
+  is optional for one arm: it would document nothing and validate nothing.
+  Separate routes keep every field required, so Pydantic `Literal`s reject bad
+  input before route logic runs — the property API-006 already relies on.
+- **The reason decides whether a prior is persisted — but the *store* decides,
+  not this route.** All four reasons change *this* meal identically; they differ
+  entirely in what they imply about future ones. `leftover` is a property of the
+  meal, not the dish — persisting it would mean a user who leaves half a bowl
+  once silently under-counts that dish forever, and under-counted carbs mean
+  under-dosed insulin. Enforcing that with an `if` here would be correct today
+  and one refactor from being silently wrong, so `pipeline/portion.py` owns the
+  rule and refuses the write itself (FOOD-020 D4).
+- **`multiplier_persisted` is now `null` more often than the reason table
+  implies.** With two-stage activation (FOOD-020 D5), the *first*
+  `portion`/`broth`/`hidden` correction records evidence without writing a
+  multiplier, so it reports `null` exactly as `leftover` does — distinguishable
+  in the log via `prior_state` (`"pending"` vs `"counted"`).
+- **A dish must survive its own edits.** Removing every component divides by
+  zero twice over — once renormalizing proportions, once computing
+  `macro_coverage` in `fold_components()` — and if both were survived it would
+  persist a 0 g / 0-carb dish and write the empty list to the decomposition
+  cache as `user_edited: true`, poisoning every future scan. Rejected with 422
+  `empty_dish` rather than reinterpreted: treating it as "delete this dish"
+  sounds right but is a different operation (the dish vanishes from Results,
+  `crop_id` dangles for `ConfirmDishSheet`, and there's no undo for it) — a user
+  who means that wants `POST /confirm-dish` to fix the dish's identity. Picking
+  a survivor server-side would be arbitrary. `fold_components()` also guards
+  itself with a `ValueError` (FOOD-021), since it has callers beyond this route.
+- **Ingredient edits in grams, not proportions.** Editing proportions directly
+  means removing the rice silently *inflates* everything else to refill the
+  bowl. Converting to grams means removing rice shrinks the dish, which is what
+  the user meant. Consequence worth flagging: after an ingredient edit
+  `portion_g` no longer reflects the pixel estimate at all — correct (the
+  user's list outranks a pixel count), but it means a subsequent scalar
+  correction multiplies a user-derived base.
+- **Baseline snapshot, not re-derivation.** Every correction mutates
+  `job_status` in place, so without a snapshot the scanned estimate is
+  unrecoverable. Re-running the scan pipeline to recover it is
+  non-deterministic (LLM decomposition, USDA flakiness) and might not reproduce
+  the number the user is trying to get back to.
+- **Reset reverts the edited decomposition but not the portion prior**, and the
+  asymmetry is deliberate. `_baseline` already snapshots `components`, so the
+  pre-edit list can be restored exactly; a prior is an aggregate across meals
+  that others may already have been scanned against, with no snapshot to return
+  to. The decomposition also needs it more: one edit is enough to write it, it
+  never decays, and FOOD-021 makes it survive schema/model invalidation — so
+  without this, a mistaken "it's not in my dish" would be permanent and fixable
+  only by running `scripts/clear_decompositions.py --dish`. The prior is guarded
+  by two-stage activation and 180-day staleness instead, and a `reset` record in
+  the correction log lets it be reconsidered offline.
+- **Pre-log only.** `POST /log-meal` snapshots `total_carbs_g`,
+  `macros_incomplete`, `unresolved_dishes` and `carb_coverage` into
+  `meal_logs.json` (api.py L722–746), which no correction path touches, and
+  409s on `already_logged`. Correcting a logged meal would desync the two and
+  leave the glucose model trained on a number no longer displayed. Same
+  boundary FOOD-016a documents at `ResultsScreen.tsx:143-148`. Post-log
+  correction is deferred, not forgotten — it needs a `meal_logs.json` update
+  path and a retraining decision, which is its own ticket.
+- **Correction log is `data/macro_correction_log.jsonl`**, deliberately not
+  `correction_log.jsonl`, whose schema offline scripts consume as *name*
+  corrections. No `fcntl` locking, per API-006's reasoning: same append-only
+  JSONL under `PIPE_BUF`, same single-user assumption.
+
+### Error matrix rows to add
+| Endpoint | `code` | status |
+|---|---|---|
+| `POST /correct-macros` | `missing_correction_detail` | 400 |
+| `POST /correct-macros` | `no_portion_estimate` | 422 |
+| `POST /correct-ingredients` | `no_components` | 422 |
+| `POST /correct-ingredients` | `unresolved_ingredient` | 422 |
+| `POST /correct-ingredients` | `empty_dish` | 422 |
+| `POST /correct-ingredients` | `no_portion_estimate` | 422 |
+| `POST /reset-corrections` | `no_corrections` | 404 |
+| all four | `meal_not_found` / `crop_not_found` / `invalid_api_key` | 404 / 404 / 401 |
+
+### Verification
+Blueprint of curl calls in `plans/API-013-plan.md`. Two things a single request
+cannot show, both to check by hand:
+- **The learned prior** — re-scan the same dish and confirm `portion_g` comes
+  back scaled with no correction applied. That is the point of the feature.
+- **The edited breakdown** — re-scan and confirm a removed ingredient stays
+  gone (`user_edited: true` survived).
+
+### Dependencies
+FOOD-020 (`save_portion_prior`, `_read_multiplier`), FOOD-021
+(`fold_components`, the suggesters), API-002 (`job_status`), API-006
+(`/confirm-dish` — the pattern and the refactor target), API-012
+(`_recompute_dish_macros`), FOOD-019 (`DishResult.components`). Blocks MOB-016.
+
+---
+
 ## Ticket Summary — updated row to add
 
 Replace the existing Ticket Summary table footer with:
