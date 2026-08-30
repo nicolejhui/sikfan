@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Image, useWindowDimensions } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
@@ -13,10 +13,14 @@ import { formatDishName, formatPortion, verdictWord } from '../store/types';
 import type { DishComponent } from '../store/types';
 import ConfirmDishSheet from '../components/ConfirmDishSheet';
 import GlucosePad from '../components/GlucosePad';
+import CarbCorrection from '../components/CarbCorrection';
+import IngredientSheet from '../components/IngredientSheet';
+import AddIngredientSheet from '../components/AddIngredientSheet';
 import { MVP_MODE } from '../constants/config';
 import { useMealThumbnail } from '../hooks/useMealThumbnail';
-import { logMeal, pollMealStatus } from '../api/meals';
+import { logMeal, pollMealStatus, getIngredientCandidates } from '../api/meals';
 import { ApiError } from '../api/client';
+import type { CorrectIngredientsResponse, IngredientCandidates } from '../api/types';
 
 function sumMacros(dishes: { carbs_g: number; protein_g: number; fat_g: number; calories: number }[]) {
   return dishes.reduce(
@@ -138,6 +142,26 @@ export default function ResultsScreen() {
   const hasLoggedRef = useRef(false);
   const alreadyLogged = useHistoryStore((s) => !!mealId && s.meals.some((m) => m.meal_id === mealId));
 
+  // MOB-016: one shared refresh path for every correction (name, macro, or
+  // ingredient) and reset — this is the mechanism that keeps the macro card
+  // and the glucose curve both in sync with the server, since the curve
+  // can't be scaled client-side (it comes from a trained model against
+  // total_carbs_g, not a local multiply — see plans/MOB-016-plan.md).
+  const refreshAfterCorrection = useCallback(async (id: string) => {
+    try {
+      const job = await pollMealStatus(id);
+      if (job.result) {
+        useMealStore.getState().refreshFromResult(job.result);
+      }
+    } catch {
+      // Keep whatever is currently displayed — the user can retry from
+      // whichever panel/sheet triggered this.
+    }
+    // Re-fetch on every correction (not gated on whether macros changed) —
+    // the user wants the glucose card to always reflect the latest state.
+    void useGlucoseStore.getState().fetchPrediction(id);
+  }, []);
+
   const handleCorrected = (correctedName: string, macrosChanged: boolean) => {
     if (!cropId) return;
     if (loggedMeal) {
@@ -152,26 +176,116 @@ export default function ResultsScreen() {
     if (!mealId) return;
 
     void (async () => {
-      try {
-        const job = await pollMealStatus(mealId);
-        if (job.result) {
-          useMealStore.getState().refreshFromResult(job.result);
-          // refreshFromResult just overwrote dishName/dishes[].name with the
-          // server's normalized DB key (e.g. "bok_choy") — DishResult.name
-          // is always that slug, by design, everywhere else in the app. For
-          // display we want what the user actually typed, so reapply it on
-          // top; the macros/other fields from the fresh fetch stay intact.
-          useMealStore.getState().updateDishName(cropId, correctedName);
-        }
-      } catch {
-        // Keep the optimistic name; macros stay whatever they were —
-        // user can reopen the edit sheet to retry.
-      }
-      // Re-fetch on every correction (not gated on macrosChanged) — the
-      // user wants the glucose card to always reflect the latest correction.
-      void useGlucoseStore.getState().fetchPrediction(mealId);
+      await refreshAfterCorrection(mealId);
+      // refreshFromResult just overwrote dishName/dishes[].name with the
+      // server's normalized DB key (e.g. "bok_choy") — DishResult.name
+      // is always that slug, by design, everywhere else in the app. For
+      // display we want what the user actually typed, so reapply it on
+      // top; the macros/other fields from the fresh fetch stay intact.
+      useMealStore.getState().updateDishName(cropId, correctedName);
     })();
   };
+
+  // ---------------------------------------------------------------------
+  // MOB-016: macro & ingredient correction (API-013)
+  // ---------------------------------------------------------------------
+  const [macroCorrected, setMacroCorrected] = useState(false);
+  const [confirmationText, setConfirmationText] = useState<string | null>(null);
+  const originalCarbsRef = useRef<number | null>(null);
+
+  // Declared here (rather than beside compositeDishes below, its only other
+  // reader) because enterFixMode(), defined a few lines down, also needs to
+  // force the breakdown open when the user starts fixing an ingredient.
+  const [showBreakdown, setShowBreakdown] = useState(false);
+
+  const [fixMode, setFixMode] = useState(false);
+  const [candidates, setCandidates] = useState<IngredientCandidates | null>(null);
+  const [candidatesLoading, setCandidatesLoading] = useState(false);
+  const [fixedNames, setFixedNames] = useState<Set<string>>(new Set());
+  const [addedNames, setAddedNames] = useState<Set<string>>(new Set());
+  const [activeComponent, setActiveComponent] = useState<DishComponent | null>(null);
+  const ingredientSheetRef = useRef<BottomSheetModal>(null);
+  const addIngredientSheetRef = useRef<BottomSheetModal>(null);
+
+  // Correction UI (and the whole feature) is pre-log only — see FOOD-016a /
+  // plans/API-013-plan.md's "Pre-log only" section: POST /log-meal snapshots
+  // macros elsewhere, and this feature never touches that snapshot. Gated
+  // inline at each render site (`!loggedMeal && mealId && cropId`) rather
+  // than through a single boolean so TypeScript narrows mealId/cropId to
+  // non-null there.
+
+  const handleMacroCorrected = useCallback(
+    (text: string | null) => {
+      if (!mealId) return;
+      if (originalCarbsRef.current == null && macros) {
+        originalCarbsRef.current = macros.carbs_g;
+      }
+      if (text != null) {
+        setMacroCorrected(true);
+        setConfirmationText(text);
+      }
+      void refreshAfterCorrection(mealId);
+    },
+    [mealId, macros, refreshAfterCorrection]
+  );
+
+  const handleMacroReset = useCallback(() => {
+    if (!mealId) return;
+    originalCarbsRef.current = null;
+    setMacroCorrected(false);
+    setConfirmationText(null);
+    setFixedNames(new Set());
+    setAddedNames(new Set());
+    void refreshAfterCorrection(mealId);
+  }, [mealId, refreshAfterCorrection]);
+
+  const handleIngredientsCorrected = useCallback(
+    (
+      _response: CorrectIngredientsResponse,
+      summary: string,
+      meta: { kind: 'swap'; name: string } | { kind: 'remove' } | { kind: 'add'; name: string }
+    ) => {
+      if (!mealId) return;
+      if (originalCarbsRef.current == null && macros) {
+        originalCarbsRef.current = macros.carbs_g;
+      }
+      setMacroCorrected(true);
+      setConfirmationText(summary);
+      if (meta.kind === 'swap') {
+        setFixedNames((prev) => new Set(prev).add(meta.name));
+      } else if (meta.kind === 'add') {
+        setAddedNames((prev) => new Set(prev).add(meta.name));
+      }
+      void refreshAfterCorrection(mealId);
+    },
+    [mealId, macros, refreshAfterCorrection]
+  );
+
+  const enterFixMode = useCallback(() => {
+    setFixMode(true);
+    setShowBreakdown(true);
+    if (!candidates && mealId && cropId) {
+      setCandidatesLoading(true);
+      void getIngredientCandidates(mealId, cropId)
+        .then(setCandidates)
+        // GET /ingredient-candidates already fails closed to {alts:{},
+        // addable:[]} server-side; this catch only guards a network-level
+        // failure (no response at all) with the same empty shape.
+        .catch(() => setCandidates({ alts: {}, addable: [] }))
+        .finally(() => setCandidatesLoading(false));
+    }
+  }, [candidates, mealId, cropId]);
+
+  const exitFixMode = useCallback(() => setFixMode(false), []);
+
+  const openIngredientSheet = useCallback((component: DishComponent) => {
+    setActiveComponent(component);
+    ingredientSheetRef.current?.present();
+  }, []);
+
+  const openAddIngredientSheet = useCallback(() => {
+    addIngredientSheetRef.current?.present();
+  }, []);
 
   useEffect(() => {
     if (!mealId) return;
@@ -216,7 +330,6 @@ export default function ResultsScreen() {
   const estimatedDishes = dishes.filter(
     (d) => !d.needs_macro_entry && (d.macro_coverage ?? 1) > 0 && (d.macro_coverage ?? 1) < 1
   );
-  const [showBreakdown, setShowBreakdown] = useState(false);
 
   const [logging, setLogging] = useState(false);
 
@@ -415,6 +528,22 @@ export default function ResultsScreen() {
         {macros && (
           <View style={styles.macrosCard}>
             <Text style={styles.macrosTitle}>Macros</Text>
+
+            {macroCorrected && originalCarbsRef.current != null &&
+              Math.round(originalCarbsRef.current) !== Math.round(macros.carbs_g) && (
+                <View style={styles.carbsUpdatedRow}>
+                  <Text style={styles.carbsUpdatedOld}>{Math.round(originalCarbsRef.current)}g</Text>
+                  <Ionicons name="arrow-forward" size={12} color={defaultPalette.inkFaint} />
+                  <Text style={styles.carbsUpdatedNew}>{Math.round(macros.carbs_g)}g</Text>
+                  <View style={styles.carbsUpdatedPill}>
+                    <Text style={styles.carbsUpdatedPillText}>
+                      {macros.carbs_g >= originalCarbsRef.current ? '+' : '−'}
+                      {Math.abs(Math.round(macros.carbs_g - originalCarbsRef.current))}g
+                    </Text>
+                  </View>
+                </View>
+              )}
+
             <MacroBar label="Carbs" value={macros.carbs_g} max={macroMax} color={defaultPalette.brand} />
             <MacroBar label="Protein" value={macros.protein_g} max={macroMax} color={defaultPalette.good.fg} />
             <MacroBar label="Fat" value={macros.fat_g} max={macroMax} color={defaultPalette.warn.fg} />
@@ -430,19 +559,42 @@ export default function ResultsScreen() {
               </View>
             )}
 
+            {!loggedMeal && mealId && cropId && (
+              <CarbCorrection
+                mealId={mealId}
+                cropId={cropId}
+                corrected={macroCorrected}
+                confirmationText={confirmationText}
+                onToast={showToast}
+                onCorrected={handleMacroCorrected}
+                onReset={handleMacroReset}
+                onOpenFixMode={enterFixMode}
+              />
+            )}
+
             {compositeDishes.length > 0 && (
-              <TouchableOpacity
-                style={styles.breakdownToggle}
-                onPress={() => setShowBreakdown((v) => !v)}
-                activeOpacity={0.7}
-              >
-                <Text style={styles.breakdownToggleText}>Breakdown · {totalComponents} items</Text>
-                <Ionicons
-                  name={showBreakdown ? 'chevron-up' : 'chevron-down'}
-                  size={14}
-                  color={defaultPalette.inkSoft}
-                />
-              </TouchableOpacity>
+              <View style={styles.breakdownToggle}>
+                <Text style={styles.breakdownToggleText}>
+                  {fixMode ? 'Which ingredient is wrong?' : `Breakdown · ${totalComponents} items`}
+                </Text>
+                {fixMode ? (
+                  <TouchableOpacity onPress={exitFixMode} hitSlop={8}>
+                    <Text style={styles.doneText}>Done</Text>
+                  </TouchableOpacity>
+                ) : (
+                  <TouchableOpacity onPress={() => setShowBreakdown((v) => !v)} hitSlop={8}>
+                    <Ionicons
+                      name={showBreakdown ? 'chevron-up' : 'chevron-down'}
+                      size={14}
+                      color={defaultPalette.inkSoft}
+                    />
+                  </TouchableOpacity>
+                )}
+              </View>
+            )}
+
+            {candidatesLoading && fixMode && (
+              <Text style={styles.candidatesLoadingText}>Loading suggestions…</Text>
             )}
 
             {showBreakdown && compositeDishes.map((dish) => (
@@ -453,8 +605,11 @@ export default function ResultsScreen() {
                 {(dish.components ?? []).map((component, idx) => {
                   const grams = componentGrams(component, dish.portion_g);
                   const carbs = componentCarbs(component, dish.portion_g);
-                  return (
-                    <View key={`${dish.crop_id}-${idx}`} style={styles.componentRow}>
+                  // MOB-015: a multi-dish meal can only have its primary
+                  // dish's crop_id corrected until dish 2+ becomes visible.
+                  const editable = fixMode && !loggedMeal && dish.crop_id === cropId;
+                  const rowInner = (
+                    <>
                       <Text style={styles.componentName} numberOfLines={1}>{formatDishName(component.name)}</Text>
                       {grams != null && <Text style={styles.componentGrams}>{Math.round(grams)}g</Text>}
                       <Text style={styles.componentCarbs}>
@@ -466,9 +621,46 @@ export default function ResultsScreen() {
                           <Text style={styles.estimatedBadgeText}>estimated</Text>
                         </View>
                       )}
+                      {fixedNames.has(component.name) && (
+                        <View style={styles.fixedBadge}>
+                          <Text style={styles.fixedBadgeText}>fixed</Text>
+                        </View>
+                      )}
+                      {addedNames.has(component.name) && (
+                        <View style={styles.fixedBadge}>
+                          <Text style={styles.fixedBadgeText}>added</Text>
+                        </View>
+                      )}
+                      {editable && (
+                        <Ionicons name="chevron-forward" size={12} color={defaultPalette.inkFaint} />
+                      )}
+                    </>
+                  );
+                  return editable ? (
+                    <TouchableOpacity
+                      key={`${dish.crop_id}-${idx}`}
+                      style={styles.componentRow}
+                      onPress={() => openIngredientSheet(component)}
+                      activeOpacity={0.7}
+                    >
+                      {rowInner}
+                    </TouchableOpacity>
+                  ) : (
+                    <View key={`${dish.crop_id}-${idx}`} style={styles.componentRow}>
+                      {rowInner}
                     </View>
                   );
                 })}
+                {fixMode && !loggedMeal && dish.crop_id === cropId && (
+                  <TouchableOpacity
+                    style={styles.addComponentRow}
+                    onPress={openAddIngredientSheet}
+                    activeOpacity={0.7}
+                  >
+                    <Ionicons name="add-circle-outline" size={14} color={defaultPalette.brand} />
+                    <Text style={styles.addComponentText}>Something's missing</Text>
+                  </TouchableOpacity>
+                )}
               </View>
             ))}
 
@@ -533,6 +725,31 @@ export default function ResultsScreen() {
           last={preMealGlucose ?? 0}
           onSet={handleManualGlucoseSet}
           onClose={() => {}}
+        />
+      )}
+
+      {!loggedMeal && mealId && cropId && (
+        <IngredientSheet
+          sheetRef={ingredientSheetRef}
+          mealId={mealId}
+          cropId={cropId}
+          component={activeComponent}
+          dish={dishes.find((d) => d.crop_id === cropId) ?? null}
+          candidates={activeComponent ? candidates?.alts[activeComponent.name] ?? [] : []}
+          onToast={showToast}
+          onCorrected={handleIngredientsCorrected}
+        />
+      )}
+
+      {!loggedMeal && mealId && cropId && (
+        <AddIngredientSheet
+          sheetRef={addIngredientSheetRef}
+          mealId={mealId}
+          cropId={cropId}
+          candidates={candidates?.addable ?? []}
+          presentComponentNames={(dishes.find((d) => d.crop_id === cropId)?.components ?? []).map((c) => c.name)}
+          onToast={showToast}
+          onCorrected={handleIngredientsCorrected}
         />
       )}
     </SafeAreaView>
@@ -791,6 +1008,16 @@ const styles = StyleSheet.create({
     fontWeight: fontWeight.medium,
     color: defaultPalette.inkSoft,
   },
+  doneText: {
+    fontSize: fontSize.xs,
+    fontWeight: fontWeight.semibold,
+    color: defaultPalette.brand,
+  },
+  candidatesLoadingText: {
+    fontSize: fontSize.xs,
+    color: defaultPalette.inkFaint,
+    marginTop: spacing.xs,
+  },
   breakdownGroup: {
     marginTop: spacing.sm,
   },
@@ -834,6 +1061,63 @@ const styles = StyleSheet.create({
     fontSize: 9,
     color: defaultPalette.inkSoft,
     marginLeft: 2,
+  },
+  fixedBadge: {
+    backgroundColor: defaultPalette.brand,
+    borderRadius: radius.full,
+    paddingHorizontal: spacing.xs,
+    paddingVertical: 1,
+    marginLeft: spacing.xs,
+  },
+  fixedBadgeText: {
+    fontSize: 9,
+    color: '#fff',
+    fontWeight: fontWeight.medium,
+  },
+  addComponentRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    minHeight: 44,
+    marginTop: spacing.xs,
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderColor: defaultPalette.hair,
+    borderRadius: radius.md,
+    paddingHorizontal: spacing.sm,
+    gap: spacing.xs / 2,
+  },
+  addComponentText: {
+    fontSize: fontSize.xs,
+    fontWeight: fontWeight.medium,
+    color: defaultPalette.brand,
+  },
+  carbsUpdatedRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: spacing.sm,
+    gap: spacing.xs,
+  },
+  carbsUpdatedOld: {
+    fontSize: fontSize.sm,
+    color: defaultPalette.inkFaint,
+    textDecorationLine: 'line-through',
+  },
+  carbsUpdatedNew: {
+    fontSize: fontSize.sm,
+    fontWeight: fontWeight.semibold,
+    color: defaultPalette.ink,
+  },
+  carbsUpdatedPill: {
+    backgroundColor: defaultPalette.brand,
+    borderRadius: radius.full,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 1,
+    marginLeft: spacing.xs,
+  },
+  carbsUpdatedPillText: {
+    fontSize: fontSize.xs,
+    fontWeight: fontWeight.semibold,
+    color: '#fff',
   },
   macrosTitle: {
     color: defaultPalette.ink,

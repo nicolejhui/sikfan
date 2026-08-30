@@ -39,6 +39,9 @@ The mobile app switches on `detail.code` for logic and displays `detail.message`
 | `POST /log-meal` | `no_dishes` | `"confirmed_dishes cannot be empty."` |
 | `POST /confirm-dish` | `missing_corrected_label` | `"corrected_label is required for CORRECT and ADD_NEW actions."` |
 | `POST /confirm-dish` | _(Pydantic 422, not custom)_ | Invalid `action` value rejected automatically by `Literal` type before route logic runs |
+| `POST /correct-macros` | `missing_correction_detail` | `"reason and magnitude are required unless direction is looks_right."` |
+| `POST /correct-ingredients` | `missing_replacement_name` | `"replacement_name is required for a swap edit."` |
+| `POST /correct-ingredients` | `missing_grams` | `"grams is required for an add edit."` |
 
 ### 401 Unauthorized — missing or wrong API key
 
@@ -54,6 +57,9 @@ The mobile app switches on `detail.code` for logic and displays `detail.message`
 | `POST /log-meal` | `meal_not_found` | `"No analysis job found for this meal ID. Run /analyze-meal first."` |
 | `GET /glucose/{meal_id}` | `meal_not_found` | `"No logged meal found with this ID."` |
 | `POST /confirm-dish` | `crop_not_found` | `"No crop found with this crop ID for the given meal."` |
+| `POST /correct-macros`, `POST /correct-ingredients`, `GET /ingredient-candidates/{meal_id}/{crop_id}`, `POST /reset-corrections` | `meal_not_found` | `"No analysis job found for this meal ID."` |
+| `POST /correct-macros`, `POST /correct-ingredients`, `GET /ingredient-candidates/{meal_id}/{crop_id}`, `POST /reset-corrections` | `crop_not_found` | `"No crop found with this crop ID for the given meal."` |
+| `POST /reset-corrections` | `no_corrections` | `"No corrections have been made to this dish."` |
 
 ### 409 Conflict — duplicate or premature operation
 
@@ -67,6 +73,11 @@ The mobile app switches on `detail.code` for logic and displays `detail.message`
 | Endpoint | `code` | `message` |
 |---|---|---|
 | `GET /glucose/{meal_id}` | `no_pre_meal_glucose` | `"No CGM reading found near this meal time. Enter a manual pre-meal BG to enable glucose prediction."` |
+| `POST /correct-macros` | `no_portion_estimate` | `"This dish has no portion estimate to correct."` |
+| `POST /correct-ingredients` | `no_components` | `"This dish has no ingredient breakdown to edit."` |
+| `POST /correct-ingredients` | `no_portion_estimate` | `"This dish has no portion estimate to convert ingredient edits against."` |
+| `POST /correct-ingredients` | `unresolved_ingredient` | `"Could not find a USDA match for '<name>'."` |
+| `POST /correct-ingredients` | `empty_dish` | `"This edit would remove every ingredient from the dish."` |
 
 ### 503 Service Unavailable — model or runtime failure
 
@@ -1175,6 +1186,11 @@ Side-effects: `data/embeddings/` updated with live container state.
 | API-006 | POST /confirm-dish              | `api.py`, `correction_log.jsonl`       | API-007 |
 | API-007 | Fly.io config (no deploy)       | `Dockerfile`, `fly.toml`, `scripts/`   | API-008 |
 | API-008 | Deploy + E2E smoke test (GATE)  | `scripts/smoke_test.sh`                | Epic 9  |
+| API-009 | GET /meal-image/{meal_id}       | `api.py`, `data/meals/`                | Epic 9  |
+| API-010 | Glucose preview before logging  | `api.py`, `glucose_analysis.py`        | API-011 |
+| API-011 | POST /manual-glucose            | `api.py`, `pipeline/glucose_store.py`  | Epic 9  |
+| API-012 | Composite decomposition in correction path | `api.py`, `pipeline/dish_decompose.py` | API-013 |
+| API-013 | POST /correct-macros, POST /correct-ingredients, GET /ingredient-candidates/{meal_id}/{crop_id}, POST /reset-corrections | `api.py`, `pipeline/portion.py`, `pipeline/dish_decompose.py`, `data/macro_correction_log.jsonl` | MOB-016 |
 
 # API-009 Patch
 # Append the ticket below to API-LAYER-TICKETS.md (before the Ticket Summary table),
@@ -1759,11 +1775,3 @@ FOOD-020 (`save_portion_prior`, `_read_multiplier`), FOOD-021
 (`/confirm-dish` — the pattern and the refactor target), API-012
 (`_recompute_dish_macros`), FOOD-019 (`DishResult.components`). Blocks MOB-016.
 
----
-
-## Ticket Summary — updated row to add
-
-Replace the existing Ticket Summary table footer with:
-
-| API-008 | Deploy + E2E smoke test (GATE)  | `scripts/smoke_test.sh`                | Epic 9  |
-| API-009 | GET /meal-image/{meal_id}       | `api.py`, `data/meals/`                | Epic 9  |

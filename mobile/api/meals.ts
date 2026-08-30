@@ -1,6 +1,17 @@
 import { File, Paths } from 'expo-file-system';
 import { apiFetchJson, ApiError, BASE_URL, API_KEY } from './client';
-import type { ConfirmDishRequest, ConfirmDishResponse, JobStatusResponse, LogMealResponse } from './types';
+import type {
+  ConfirmDishRequest,
+  ConfirmDishResponse,
+  JobStatusResponse,
+  LogMealResponse,
+  CorrectMacrosRequest,
+  CorrectMacrosResponse,
+  CorrectIngredientsRequest,
+  CorrectIngredientsResponse,
+  IngredientCandidates,
+  ResetCorrectionsResponse,
+} from './types';
 
 export async function submitMeal(imageUri: string): Promise<{ meal_id: string; status: string }> {
   const formData = new FormData();
@@ -29,6 +40,44 @@ export async function confirmDish(body: ConfirmDishRequest): Promise<ConfirmDish
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+  });
+}
+
+// MOB-016 / API-013
+
+export async function correctMacros(body: CorrectMacrosRequest): Promise<CorrectMacrosResponse> {
+  return apiFetchJson('/correct-macros', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function correctIngredients(
+  body: CorrectIngredientsRequest
+): Promise<CorrectIngredientsResponse> {
+  return apiFetchJson('/correct-ingredients', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function getIngredientCandidates(
+  mealId: string,
+  cropId: string
+): Promise<IngredientCandidates> {
+  return apiFetchJson(`/ingredient-candidates/${mealId}/${cropId}`);
+}
+
+export async function resetCorrections(
+  mealId: string,
+  cropId: string
+): Promise<ResetCorrectionsResponse> {
+  return apiFetchJson('/reset-corrections', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ meal_id: mealId, crop_id: cropId }),
   });
 }
 

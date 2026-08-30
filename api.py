@@ -36,14 +36,21 @@ from analyze_meal import analyze_meal as _analyze_meal
 from glucose_analysis import MealNotFoundError, MissingCGMDataError
 from glucose_analysis import analyze_glucose as _analyze_glucose
 from glucose_analysis import analyze_glucose_preview as _analyze_glucose_preview
-from pipeline.dish_decompose import resolve_composite_macros, select_best_usda_candidate
+from pipeline.dish_decompose import (
+    DECOMPOSITION_CACHE_DIR,
+    fold_components,
+    resolve_composite_macros,
+    select_best_usda_candidate,
+    suggest_additions,
+    suggest_alternatives,
+)
 from pipeline.embedding_store import EmbeddingStore, _get_clip
 from pipeline.feedback import FeedbackAction, _append_correction_log, normalize_dish_name, record_feedback
 from pipeline.glucose_store import save_cgm_reading
 from pipeline.macro_lookup import lookup_macros, select_candidate
 from pipeline.nutrition import CACHE_DIR as _MACRO_CACHE_DIR
 from pipeline.nutrition import _atomic_write as _write_macro_cache_entry
-from pipeline.portion import scale_macros
+from pipeline.portion import _FACTORS, save_portion_prior, scale_macros, touch_portion_prior
 from pipeline.segmentation import _get_model, segment_meal
 
 _log = logging.getLogger(__name__)
@@ -327,6 +334,73 @@ class ConfirmDishResponse(BaseModel):
     macros_changed: bool = False  # True if CORRECT/ADD_NEW's carbs_g differs from the pre-correction value
 
 
+# --- POST /correct-macros (API-013) ---
+
+class CorrectMacrosRequest(BaseModel):
+    meal_id: str
+    crop_id: str
+    direction: Literal["too_high", "too_low", "looks_right"]
+    reason: Literal["portion", "broth", "hidden", "leftover"] | None = None
+    magnitude: Literal["little", "lot"] | None = None
+
+
+class CorrectMacrosResponse(BaseModel):
+    crop_id: str
+    direction: Literal["too_high", "too_low", "looks_right"]
+    old_portion_g: float | None
+    new_portion_g: float | None
+    old_carbs_g: float
+    new_carbs_g: float
+    multiplier_persisted: float | None
+    prior_state: str
+    dish: DishResult
+
+
+# --- POST /correct-ingredients (API-013) ---
+
+class IngredientEdit(BaseModel):
+    action: Literal["remove", "swap", "add"]
+    component_name: str
+    replacement_name: str | None = None   # required for "swap"
+    grams: float | None = Field(None, gt=0)   # required for "add" — positive only
+
+
+class CorrectIngredientsRequest(BaseModel):
+    meal_id: str
+    crop_id: str
+    edits: list[IngredientEdit]
+
+
+class CorrectIngredientsResponse(BaseModel):
+    crop_id: str
+    old_portion_g: float
+    new_portion_g: float
+    old_carbs_g: float
+    new_carbs_g: float
+    dish: DishResult
+
+
+# --- GET /ingredient-candidates/{meal_id}/{crop_id} (API-013) ---
+
+class IngredientCandidatesResponse(BaseModel):
+    alts: dict[str, list[dict]]
+    addable: list[dict]
+
+
+# --- POST /reset-corrections (API-013) ---
+
+class ResetCorrectionsRequest(BaseModel):
+    meal_id: str
+    crop_id: str
+
+
+class ResetCorrectionsResponse(BaseModel):
+    crop_id: str
+    decomposition_reverted: bool
+    prior_retained: bool
+    dish: DishResult
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -539,6 +613,11 @@ def _run_analysis(meal_id: str, image_path: Path, status_path: Path) -> None:
         result = _analyze_meal(str(image_path), store=_store)
         dish_results = _build_dish_results(result["detected_items"])
         total_carbs = _fill_missing_macros(dish_results, result["total_macros"].get("carbs_g", 0.0))
+        # FOOD-020 D7: a portion prior goes stale after 180 days without a
+        # scan of its dish — touch it on every completed scan so a dish
+        # that's still being eaten never falls out of an active prior.
+        for dish in dish_results:
+            touch_portion_prior(dish["name"])
         meal_result = {
             "meal_id": meal_id,
             "dishes": dish_results,
@@ -1017,6 +1096,127 @@ def _recompute_dish_macros(corrected_label: str, portion_g: float | None) -> dic
     }
 
 
+def _resolve_dish_entry(meal_id: str, crop_id: str) -> tuple[Path, dict, dict]:
+    """Resolve a (meal_id, crop_id) pair to its job_status file, the parsed
+    job dict, and the mutable dish dict within it — the same 404s
+    confirm_dish() has always raised, lifted out (API-013) so every
+    correction route resolves a crop identically."""
+    status_path = Path("data/job_status") / f"{meal_id}.json"
+    if not status_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "meal_not_found", "message": "No analysis job found for this meal ID."},
+        )
+
+    job = json.loads(status_path.read_text())
+    dishes = (job.get("result") or {}).get("dishes") or []
+
+    dish_entry = next((d for d in dishes if d["crop_id"] == crop_id), None)
+    if dish_entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "crop_not_found", "message": "No crop found with this crop ID for the given meal."},
+        )
+    return status_path, job, dish_entry
+
+
+# API-013: fields a correction can mutate on a dish entry, and so the exact
+# set _snapshot_baseline() must preserve for reset-corrections to restore.
+# Defaults mirror DishResult's own field defaults — a plainly-scanned
+# (non-composite) dish entry never carries macro_coverage/carb_coverage/
+# needs_macro_entry keys at all (_build_dish_results() doesn't set the first
+# two), so a bare .get() would snapshot None and reset() would then write an
+# explicit None back, which DishResult rejects (a missing key defaults to
+# 1.0/False; an explicit None does not).
+_BASELINE_DEFAULTS = {
+    "portion_g": None, "carbs_g": 0.0, "protein_g": 0.0, "fat_g": 0.0, "calories": 0.0,
+    "components": None, "macro_coverage": 1.0, "carb_coverage": 1.0, "needs_macro_entry": False,
+}
+
+
+def _snapshot_baseline(dish_entry: dict) -> None:
+    """Copy the pristine (pre-correction) macro fields into dish_entry['_baseline']
+    on the FIRST correction to this crop only — a no-op if already present, so a
+    second correction can never overwrite the true original (plans/API-013-plan.md).
+
+    Also snapshots the raw pre-edit decomposition-cache file verbatim, under
+    '_decomposition'. This is NOT the same shape as dish_entry['components']:
+    the latter is fold_components()'s OUTPUT shape (name/role/proportion/
+    per_100g/macro_source, used for display), while the decomposition cache
+    holds decompose_dish()'s INPUT shape (name/role/proportion/usda_likely/
+    fallback_macros). Restoring the decomposition cache FROM the display
+    shape would silently drop fallback_macros for any component that only
+    resolves via the LLM's estimate rather than a USDA match — reset must
+    write back the real original file, not reconstruct a lossy approximation
+    of it.
+    """
+    if "_baseline" in dish_entry:
+        return
+    baseline = {k: dish_entry.get(k, default) for k, default in _BASELINE_DEFAULTS.items()}
+    decomp_path = DECOMPOSITION_CACHE_DIR / f"{normalize_dish_name(dish_entry['name'])}.json"
+    try:
+        baseline["_decomposition"] = json.loads(decomp_path.read_text())
+    except (OSError, ValueError):
+        baseline["_decomposition"] = None
+    dish_entry["_baseline"] = baseline
+
+
+def _write_corrected(status_path: Path, job: dict, dishes: list[dict]) -> None:
+    """Recompute total_carbs_g and write job_status — mirrors confirm_dish()'s
+    own L1070-1072 write exactly, reused by every API-013 correction route."""
+    result = job.setdefault("result", {})
+    result["total_carbs_g"] = round(sum(d.get("carbs_g", 0.0) for d in dishes), 2)
+    _write_job_status(status_path, job)
+
+
+_MACRO_CORRECTION_LOG_PATH = "data/macro_correction_log.jsonl"
+
+
+def _log_macro_correction(entry: dict) -> None:
+    """Deliberately a separate file from data/correction_log.jsonl, whose
+    schema offline scripts consume as *name* corrections (API-006), not
+    quantity corrections."""
+    _append_correction_log(entry, _MACRO_CORRECTION_LOG_PATH)
+
+
+def _validate_ingredient_name(name: str) -> bool:
+    """
+    Confirm `name` resolves to a real USDA match before it enters a dish's
+    component list via an ingredient edit — same judgment-call pattern as
+    _validate_usda_match() above, reused here rather than trusting
+    lookup_macros()'s unconditional candidates[0].
+
+    Re-selects the correct candidate in the cache (via select_candidate())
+    when the best match isn't index 0, so fold_components()'s own
+    lookup_macros() call (which always reads whatever the cache currently
+    points at) picks up the validated match rather than silently re-reading
+    the wrong one.
+
+    Fails closed: any error or "no match" returns False rather than letting
+    the edit through with the wrong (or invented) macros.
+    """
+    try:
+        macro_result = lookup_macros(name)
+    except Exception:
+        return False
+    if macro_result.source == "no_results" or macro_result.carbs_g is None:
+        return False
+    if not macro_result.candidates:
+        return True
+
+    candidate_names = [c.get("usda_name", "") for c in macro_result.candidates]
+    best = select_best_usda_candidate(name, candidate_names)
+    if best is None:
+        return False
+    if candidate_names[best] != macro_result.usda_name:
+        try:
+            select_candidate(name, best)
+        except (ValueError, IndexError) as exc:
+            _log.warning("select_candidate failed for %r: %s", name, exc)
+            return False
+    return True
+
+
 @app.post("/confirm-dish", response_model=ConfirmDishResponse, dependencies=[Depends(verify_api_key)])
 def confirm_dish(body: ConfirmDishRequest):
     """Send CONFIRM / CORRECT / ADD_NEW feedback for a detected crop.
@@ -1031,24 +1231,9 @@ def confirm_dish(body: ConfirmDishRequest):
             detail={"code": "missing_corrected_label", "message": "corrected_label is required for CORRECT and ADD_NEW actions."},
         )
 
-    # 2. Read job_status to resolve crop_id → dish info.
-    status_path = Path("data/job_status") / f"{body.meal_id}.json"
-    if not status_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail={"code": "meal_not_found", "message": "No analysis job found for this meal ID."},
-        )
-
-    job = json.loads(status_path.read_text())
+    # 2-3. Resolve job_status + the dish entry for this crop_id.
+    status_path, job, dish_entry = _resolve_dish_entry(body.meal_id, body.crop_id)
     dishes = (job.get("result") or {}).get("dishes") or []
-
-    # 3. Find the DishResult entry matching crop_id.
-    dish_entry = next((d for d in dishes if d["crop_id"] == body.crop_id), None)
-    if dish_entry is None:
-        raise HTTPException(
-            status_code=404,
-            detail={"code": "crop_not_found", "message": "No crop found with this crop ID for the given meal."},
-        )
 
     original_name = dish_entry["name"]
     confidence = float(dish_entry["confidence"])
@@ -1130,6 +1315,362 @@ def confirm_dish(body: ConfirmDishRequest):
         updated_label=updated_label,
         chromadb_updated=chromadb_updated,
         macros_changed=macros_changed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# API-013 routes
+# ---------------------------------------------------------------------------
+
+@app.post("/correct-macros", response_model=CorrectMacrosResponse, dependencies=[Depends(verify_api_key)])
+def correct_macros(body: CorrectMacrosRequest):
+    """Scalar "does this look right?" correction — scales portion_g by a
+    factor from pipeline.portion._FACTORS and recomputes macros wholesale.
+    Every correction (looks_right included) is passed to save_portion_prior();
+    the store — not this route — decides whether it persists (FOOD-020 D4)."""
+    if body.direction != "looks_right" and (body.reason is None or body.magnitude is None):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "missing_correction_detail",
+                "message": "reason and magnitude are required unless direction is looks_right.",
+            },
+        )
+
+    status_path, job, dish_entry = _resolve_dish_entry(body.meal_id, body.crop_id)
+    dishes = (job.get("result") or {}).get("dishes") or []
+    dish_name = dish_entry["name"]
+    old_portion_g = dish_entry.get("portion_g")
+    old_carbs_g = dish_entry.get("carbs_g", 0.0)
+    now = datetime.now(timezone.utc).isoformat()
+
+    if body.direction == "looks_right":
+        # Must run before any early return — this is what lets a
+        # confirmation clear PENDING evidence (FOOD-020 D8).
+        record = save_portion_prior(dish_name, 1.0, None, "looks_right")
+        _log_macro_correction({
+            "timestamp": now, "meal_id": body.meal_id, "crop_id": body.crop_id,
+            "dish_name": dish_name, "flow": "scalar", "direction": body.direction,
+            "reason": None, "magnitude": None, "factor": 1.0, "edits": None,
+            "old_portion_g": old_portion_g, "new_portion_g": old_portion_g,
+            "old_carbs_g": old_carbs_g, "new_carbs_g": old_carbs_g,
+            "multiplier_persisted": None, "prior_state": record.get("prior_state"),
+        })
+        return CorrectMacrosResponse(
+            crop_id=body.crop_id, direction=body.direction,
+            old_portion_g=old_portion_g, new_portion_g=old_portion_g,
+            old_carbs_g=old_carbs_g, new_carbs_g=old_carbs_g,
+            multiplier_persisted=None, prior_state=record.get("prior_state"),
+            dish=DishResult(**dish_entry),
+        )
+
+    if old_portion_g is None:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "no_portion_estimate", "message": "This dish has no portion estimate to correct."},
+        )
+
+    _snapshot_baseline(dish_entry)
+
+    factor = _FACTORS[(body.direction, body.magnitude)]
+    new_portion_g = round(old_portion_g * factor, 1)
+
+    record = save_portion_prior(dish_name, factor, body.reason, body.direction)
+    prior_state = record.get("prior_state")
+    multiplier_persisted = (
+        record.get("portion_multiplier") if prior_state in ("activated", "compounded") else None
+    )
+
+    dish_entry["portion_g"] = new_portion_g
+    dish_entry.update(_recompute_dish_macros(dish_name, new_portion_g))
+    new_carbs_g = dish_entry["carbs_g"]
+
+    _write_corrected(status_path, job, dishes)
+
+    _log_macro_correction({
+        "timestamp": now, "meal_id": body.meal_id, "crop_id": body.crop_id,
+        "dish_name": dish_name, "flow": "scalar", "direction": body.direction,
+        "reason": body.reason, "magnitude": body.magnitude, "factor": factor, "edits": None,
+        "old_portion_g": old_portion_g, "new_portion_g": new_portion_g,
+        "old_carbs_g": old_carbs_g, "new_carbs_g": new_carbs_g,
+        "multiplier_persisted": multiplier_persisted, "prior_state": prior_state,
+    })
+
+    return CorrectMacrosResponse(
+        crop_id=body.crop_id, direction=body.direction,
+        old_portion_g=old_portion_g, new_portion_g=new_portion_g,
+        old_carbs_g=old_carbs_g, new_carbs_g=new_carbs_g,
+        multiplier_persisted=multiplier_persisted, prior_state=prior_state,
+        dish=DishResult(**dish_entry),
+    )
+
+
+def _write_edited_decomposition(dish_name: str, components: list[dict]) -> None:
+    """Persist a user-edited component list to the decomposition cache with
+    user_edited: True — decompose_dish()'s _load_decomposition() short-circuits
+    on that flag ahead of its schema_version/model staleness check, so this
+    survives a later prompt or model bump untouched (FOOD-021)."""
+    path = DECOMPOSITION_CACHE_DIR / f"{normalize_dish_name(dish_name)}.json"
+    entry = {
+        "dish_name": normalize_dish_name(dish_name),
+        "components": components,
+        "user_edited": True,
+        "cached_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_macro_cache_entry(path, entry)
+
+
+@app.post("/correct-ingredients", response_model=CorrectIngredientsResponse, dependencies=[Depends(verify_api_key)])
+def correct_ingredients(body: CorrectIngredientsRequest):
+    """Ingredient-level correction — remove / swap / add components, computed
+    in absolute grams (proportion x portion_g) so removing rice shrinks the
+    dish rather than inflating everything else to refill the bowl."""
+    status_path, job, dish_entry = _resolve_dish_entry(body.meal_id, body.crop_id)
+    dishes = (job.get("result") or {}).get("dishes") or []
+    dish_name = dish_entry["name"]
+
+    components = dish_entry.get("components")
+    if not components:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "no_components", "message": "This dish has no ingredient breakdown to edit."},
+        )
+
+    portion_g = dish_entry.get("portion_g")
+    if portion_g is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "no_portion_estimate",
+                "message": "This dish has no portion estimate to convert ingredient edits against.",
+            },
+        )
+
+    _snapshot_baseline(dish_entry)
+
+    old_portion_g = portion_g
+    old_carbs_g = dish_entry.get("carbs_g", 0.0)
+
+    # Step 1: components (proportions) -> absolute grams.
+    grams_list = [
+        {"name": c["name"], "role": c.get("role"), "grams": float(c["proportion"]) * portion_g}
+        for c in components
+    ]
+
+    # Step 2: apply edits.
+    for edit in body.edits:
+        target_slug = normalize_dish_name(edit.component_name)
+        if edit.action == "remove":
+            grams_list = [g for g in grams_list if normalize_dish_name(g["name"]) != target_slug]
+        elif edit.action == "swap":
+            idx = next((i for i, g in enumerate(grams_list) if normalize_dish_name(g["name"]) == target_slug), None)
+            if idx is None:
+                continue  # nothing to swap — component already absent
+            if not edit.replacement_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "missing_replacement_name", "message": "replacement_name is required for a swap edit."},
+                )
+            if not _validate_ingredient_name(edit.replacement_name):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "unresolved_ingredient",
+                        "message": f"Could not find a USDA match for {edit.replacement_name!r}.",
+                    },
+                )
+            grams_list[idx] = {
+                "name": edit.replacement_name,
+                "role": grams_list[idx]["role"],
+                "grams": grams_list[idx]["grams"],
+            }
+        elif edit.action == "add":
+            if not edit.grams:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "missing_grams", "message": "grams is required for an add edit."},
+                )
+            if not _validate_ingredient_name(edit.component_name):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "unresolved_ingredient",
+                        "message": f"Could not find a USDA match for {edit.component_name!r}.",
+                    },
+                )
+            grams_list.append({"name": edit.component_name, "role": None, "grams": edit.grams})
+
+    # Step 3-4: guard on the NET result, after every edit is applied.
+    total_grams = sum(g["grams"] for g in grams_list)
+    if not grams_list or total_grams <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "empty_dish", "message": "This edit would remove every ingredient from the dish."},
+        )
+
+    # Step 5: new portion_g = surviving grams; renormalize proportions.
+    new_components = [
+        {
+            "name": g["name"], "role": g.get("role"), "proportion": g["grams"] / total_grams,
+            "usda_likely": True, "fallback_macros": None,
+        }
+        for g in grams_list
+    ]
+
+    # Step 6: fold -> per-100g + coverages; scale to the new portion_g.
+    folded = fold_components(new_components)
+    new_portion_g = round(total_grams, 1)
+    scaled = scale_macros(folded, new_portion_g)
+
+    dish_entry["portion_g"] = new_portion_g
+    if scaled is None:
+        dish_entry["carbs_g"] = 0.0
+        dish_entry["protein_g"] = 0.0
+        dish_entry["fat_g"] = 0.0
+        dish_entry["calories"] = 0.0
+        dish_entry["needs_macro_entry"] = True
+    else:
+        dish_entry["carbs_g"] = scaled["carbs_g"]
+        dish_entry["protein_g"] = scaled["protein_g"]
+        dish_entry["fat_g"] = scaled["fat_g"]
+        dish_entry["calories"] = scaled["calories"]
+        dish_entry["needs_macro_entry"] = folded["macro_coverage"] == 0.0
+    dish_entry["components"] = folded["components"]
+    dish_entry["macro_coverage"] = folded["macro_coverage"]
+    dish_entry["carb_coverage"] = folded["carb_coverage"]
+    new_carbs_g = dish_entry["carbs_g"]
+
+    _write_corrected(status_path, job, dishes)
+
+    # Step 7: persist the edited breakdown so the next scan starts from it —
+    # both the decomposition cache (read by a future correction) and the
+    # plain per-100g macro cache (read by pipeline.portion's get_macros() at
+    # scan time, which never consults the decomposition cache directly).
+    _write_edited_decomposition(dish_name, new_components)
+    composite_cache_entry = dict(folded)
+    composite_cache_entry["dish_name"] = normalize_dish_name(dish_name)
+    composite_cache_entry["source"] = "composite"
+    _write_macro_cache_entry(_MACRO_CACHE_DIR / f"{normalize_dish_name(dish_name)}.json", composite_cache_entry)
+
+    _log_macro_correction({
+        "timestamp": datetime.now(timezone.utc).isoformat(), "meal_id": body.meal_id,
+        "crop_id": body.crop_id, "dish_name": dish_name, "flow": "ingredient",
+        "direction": None, "reason": None, "magnitude": None, "factor": None,
+        "edits": [e.model_dump() for e in body.edits],
+        "old_portion_g": old_portion_g, "new_portion_g": new_portion_g,
+        "old_carbs_g": old_carbs_g, "new_carbs_g": new_carbs_g,
+        "multiplier_persisted": None, "prior_state": None,
+    })
+
+    return CorrectIngredientsResponse(
+        crop_id=body.crop_id,
+        old_portion_g=old_portion_g, new_portion_g=new_portion_g,
+        old_carbs_g=old_carbs_g, new_carbs_g=new_carbs_g,
+        dish=DishResult(**dish_entry),
+    )
+
+
+@app.get(
+    "/ingredient-candidates/{meal_id}/{crop_id}",
+    response_model=IngredientCandidatesResponse,
+    dependencies=[Depends(verify_api_key)],
+)
+def get_ingredient_candidates(meal_id: str, crop_id: str):
+    """Alternatives per detected component + additions the photo might have
+    missed. Always 200 — suggest_alternatives()/suggest_additions() already
+    fail closed to [] on any LLM error, and this route never turns that into
+    a 5xx: the UI degrades to hiding the affordance, never an error state."""
+    _, _, dish_entry = _resolve_dish_entry(meal_id, crop_id)
+    dish_name = dish_entry["name"]
+    components = dish_entry.get("components") or []
+    component_names = [c["name"] for c in components]
+
+    alts: dict[str, list[dict]] = {}
+    for name in component_names:
+        try:
+            alts[name] = suggest_alternatives(dish_name, name)
+        except Exception as exc:
+            _log.warning("suggest_alternatives failed for %r/%r: %s", dish_name, name, exc)
+            alts[name] = []
+
+    try:
+        addable = suggest_additions(dish_name, component_names)
+    except Exception as exc:
+        _log.warning("suggest_additions failed for %r: %s", dish_name, exc)
+        addable = []
+
+    return IngredientCandidatesResponse(alts=alts, addable=addable)
+
+
+@app.post("/reset-corrections", response_model=ResetCorrectionsResponse, dependencies=[Depends(verify_api_key)])
+def reset_corrections(body: ResetCorrectionsRequest):
+    """Undo all — restores a dish's macros/portion/components from the
+    snapshot taken on its first correction. Reverts an edited decomposition
+    (if any) but deliberately leaves a persisted portion prior in place —
+    see plans/API-013-plan.md, "What Undo all reverts — stated exhaustively"."""
+    status_path, job, dish_entry = _resolve_dish_entry(body.meal_id, body.crop_id)
+    dishes = (job.get("result") or {}).get("dishes") or []
+    dish_name = dish_entry["name"]
+
+    baseline = dish_entry.get("_baseline")
+    if baseline is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "no_corrections", "message": "No corrections have been made to this dish."},
+        )
+
+    decomposition_reverted = False
+    decomp_path = DECOMPOSITION_CACHE_DIR / f"{normalize_dish_name(dish_name)}.json"
+    try:
+        current_decomp = json.loads(decomp_path.read_text())
+    except (OSError, ValueError):
+        current_decomp = None
+
+    if current_decomp is not None and current_decomp.get("user_edited"):
+        original_decomp = baseline.get("_decomposition")
+        composite_cache_path = _MACRO_CACHE_DIR / f"{normalize_dish_name(dish_name)}.json"
+        if original_decomp is not None:
+            # Write the real pre-edit file back verbatim — not a
+            # reconstruction from dish_entry['components'], which is a
+            # different (lossy, for fallback_macros) shape. See
+            # _snapshot_baseline().
+            _write_macro_cache_entry(decomp_path, original_decomp)
+            try:
+                restored_composite = fold_components(original_decomp["components"])
+                restored_composite["dish_name"] = normalize_dish_name(dish_name)
+                restored_composite["source"] = "composite"
+                _write_macro_cache_entry(composite_cache_path, restored_composite)
+            except (ValueError, KeyError):
+                pass  # original components can't fold (shouldn't happen — they were valid once)
+        else:
+            # No decomposition existed before the edit — both cache entries
+            # were created fresh by it. Remove them so a future scan
+            # re-derives from scratch rather than keeping stale records with
+            # nothing genuine to fall back to.
+            decomp_path.unlink(missing_ok=True)
+            composite_cache_path.unlink(missing_ok=True)
+        decomposition_reverted = True
+
+    for key in _BASELINE_DEFAULTS:
+        dish_entry[key] = baseline[key]
+    dish_entry.pop("_baseline", None)
+
+    _write_corrected(status_path, job, dishes)
+
+    _log_macro_correction({
+        "timestamp": datetime.now(timezone.utc).isoformat(), "meal_id": body.meal_id,
+        "crop_id": body.crop_id, "dish_name": dish_name, "flow": "reset",
+        "direction": None, "reason": None, "magnitude": None, "factor": None, "edits": None,
+        "old_portion_g": None, "new_portion_g": dish_entry.get("portion_g"),
+        "old_carbs_g": None, "new_carbs_g": dish_entry.get("carbs_g"),
+        "multiplier_persisted": None, "prior_state": "reset",
+    })
+
+    return ResetCorrectionsResponse(
+        crop_id=body.crop_id,
+        decomposition_reverted=decomposition_reverted,
+        prior_retained=True,
+        dish=DishResult(**dish_entry),
     )
 
 

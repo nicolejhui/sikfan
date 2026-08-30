@@ -11,6 +11,10 @@ let pollMealStatus: typeof import('../api/meals').pollMealStatus;
 let logMeal: typeof import('../api/meals').logMeal;
 let getMealImage: typeof import('../api/meals').getMealImage;
 let analyzeGlucose: typeof import('../api/glucose').analyzeGlucose;
+let correctMacros: typeof import('../api/meals').correctMacros;
+let correctIngredients: typeof import('../api/meals').correctIngredients;
+let getIngredientCandidates: typeof import('../api/meals').getIngredientCandidates;
+let resetCorrections: typeof import('../api/meals').resetCorrections;
 
 beforeAll(() => {
   process.env.EXPO_PUBLIC_API_URL = 'https://api.example.com';
@@ -19,7 +23,16 @@ beforeAll(() => {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   ApiError = require('../api/client').ApiError;
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  ({ submitMeal, pollMealStatus, logMeal, getMealImage } = require('../api/meals'));
+  ({
+    submitMeal,
+    pollMealStatus,
+    logMeal,
+    getMealImage,
+    correctMacros,
+    correctIngredients,
+    getIngredientCandidates,
+    resetCorrections,
+  } = require('../api/meals'));
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   ({ analyzeGlucose } = require('../api/glucose'));
 });
@@ -122,4 +135,107 @@ test('ApiError unwraps this backend\'s {detail: {code, message}} error shape', a
     code: 'no_pre_meal_glucose',
     message: 'No CGM reading found near this meal time.',
   });
+});
+
+// MOB-016 / API-013
+
+test('correctMacros POSTs meal_id/crop_id/direction/reason/magnitude as JSON to /correct-macros', async () => {
+  (global.fetch as jest.Mock).mockResolvedValue(
+    mockJsonResponse(200, {
+      crop_id: 'crop_0',
+      direction: 'too_high',
+      old_portion_g: 100,
+      new_portion_g: 60,
+      old_carbs_g: 20,
+      new_carbs_g: 12,
+      multiplier_persisted: null,
+      prior_state: 'pending',
+      dish: { crop_id: 'crop_0', name: 'brown_rice' },
+    })
+  );
+
+  await correctMacros({
+    meal_id: 'meal_1',
+    crop_id: 'crop_0',
+    direction: 'too_high',
+    reason: 'portion',
+    magnitude: 'lot',
+  });
+
+  const [url, options] = (global.fetch as jest.Mock).mock.calls[0];
+  expect(url).toBe('https://api.example.com/correct-macros');
+  expect(options.method).toBe('POST');
+  expect(JSON.parse(options.body)).toEqual({
+    meal_id: 'meal_1',
+    crop_id: 'crop_0',
+    direction: 'too_high',
+    reason: 'portion',
+    magnitude: 'lot',
+  });
+});
+
+test('correctMacros omits reason/magnitude for a looks_right direction', async () => {
+  (global.fetch as jest.Mock).mockResolvedValue(mockJsonResponse(200, {}));
+
+  await correctMacros({ meal_id: 'meal_1', crop_id: 'crop_0', direction: 'looks_right' });
+
+  const [, options] = (global.fetch as jest.Mock).mock.calls[0];
+  expect(JSON.parse(options.body)).toEqual({
+    meal_id: 'meal_1',
+    crop_id: 'crop_0',
+    direction: 'looks_right',
+  });
+});
+
+test('correctIngredients POSTs meal_id/crop_id/edits as JSON to /correct-ingredients', async () => {
+  (global.fetch as jest.Mock).mockResolvedValue(mockJsonResponse(200, {}));
+
+  await correctIngredients({
+    meal_id: 'meal_1',
+    crop_id: 'crop_0',
+    edits: [{ action: 'remove', component_name: 'white rice' }],
+  });
+
+  const [url, options] = (global.fetch as jest.Mock).mock.calls[0];
+  expect(url).toBe('https://api.example.com/correct-ingredients');
+  expect(options.method).toBe('POST');
+  expect(JSON.parse(options.body)).toEqual({
+    meal_id: 'meal_1',
+    crop_id: 'crop_0',
+    edits: [{ action: 'remove', component_name: 'white rice' }],
+  });
+});
+
+test('getIngredientCandidates GETs /ingredient-candidates/{meal_id}/{crop_id}', async () => {
+  (global.fetch as jest.Mock).mockResolvedValue(mockJsonResponse(200, { alts: {}, addable: [] }));
+
+  const result = await getIngredientCandidates('meal_1', 'crop_0');
+
+  expect(result).toEqual({ alts: {}, addable: [] });
+  const [url, options] = (global.fetch as jest.Mock).mock.calls[0];
+  expect(url).toBe('https://api.example.com/ingredient-candidates/meal_1/crop_0');
+  expect(options.method).toBe('GET');
+});
+
+test('resetCorrections POSTs meal_id/crop_id as JSON to /reset-corrections', async () => {
+  (global.fetch as jest.Mock).mockResolvedValue(
+    mockJsonResponse(200, { crop_id: 'crop_0', decomposition_reverted: false, prior_retained: true, dish: {} })
+  );
+
+  await resetCorrections('meal_1', 'crop_0');
+
+  const [url, options] = (global.fetch as jest.Mock).mock.calls[0];
+  expect(url).toBe('https://api.example.com/reset-corrections');
+  expect(options.method).toBe('POST');
+  expect(JSON.parse(options.body)).toEqual({ meal_id: 'meal_1', crop_id: 'crop_0' });
+});
+
+test('correctMacros throws ApiError with the server code on a 422 empty_dish-style rejection', async () => {
+  (global.fetch as jest.Mock).mockResolvedValue(
+    mockJsonResponse(422, { detail: { code: 'no_portion_estimate', message: 'No portion estimate.' } })
+  );
+
+  await expect(
+    correctMacros({ meal_id: 'meal_1', crop_id: 'crop_0', direction: 'too_high', reason: 'portion', magnitude: 'lot' })
+  ).rejects.toMatchObject({ status: 422, code: 'no_portion_estimate' });
 });
