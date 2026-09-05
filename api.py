@@ -359,10 +359,10 @@ class CorrectMacrosResponse(BaseModel):
 # --- POST /correct-ingredients (API-013) ---
 
 class IngredientEdit(BaseModel):
-    action: Literal["remove", "swap", "add", "include"]
+    action: Literal["remove", "swap", "add", "include", "set_amount"]
     component_name: str
     replacement_name: str | None = None   # required for "swap"
-    grams: float | None = Field(None, gt=0)   # required for "add" — positive only
+    grams: float | None = Field(None, gt=0)   # required for "add" and "set_amount" — positive only
 
 
 class CorrectIngredientsRequest(BaseModel):
@@ -1528,6 +1528,26 @@ def correct_ingredients(body: CorrectIngredientsRequest):
                     },
                 )
             grams_list.append({"name": edit.component_name, "role": None, "grams": edit.grams})
+        elif edit.action == "set_amount":
+            if not edit.grams:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "missing_grams", "message": "grams is required for a set_amount edit."},
+                )
+            idx = next((i for i, g in enumerate(grams_list) if normalize_dish_name(g["name"]) == target_slug), None)
+            if idx is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "unknown_component",
+                        "message": f"{edit.component_name!r} is not part of this dish.",
+                    },
+                )
+            grams_list[idx] = {
+                "name": grams_list[idx]["name"],
+                "role": grams_list[idx]["role"],
+                "grams": edit.grams,
+            }
         elif edit.action == "include":
             # API-013a: put a removed component back at the size it was
             # scanned at — restored from the pre-correction snapshot, not

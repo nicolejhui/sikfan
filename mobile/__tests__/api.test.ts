@@ -223,6 +223,23 @@ test('correctIngredients round-trips an "include" action verbatim', async () => 
   });
 });
 
+test('correctIngredients round-trips a "set_amount" action with grams verbatim', async () => {
+  (global.fetch as jest.Mock).mockResolvedValue(mockJsonResponse(200, {}));
+
+  await correctIngredients({
+    meal_id: 'meal_1',
+    crop_id: 'crop_0',
+    edits: [{ action: 'set_amount', component_name: 'white rice', grams: 315 }],
+  });
+
+  const [, options] = (global.fetch as jest.Mock).mock.calls[0];
+  expect(JSON.parse(options.body)).toEqual({
+    meal_id: 'meal_1',
+    crop_id: 'crop_0',
+    edits: [{ action: 'set_amount', component_name: 'white rice', grams: 315 }],
+  });
+});
+
 test('getIngredientCandidates GETs /ingredient-candidates/{meal_id}/{crop_id}', async () => {
   (global.fetch as jest.Mock).mockResolvedValue(mockJsonResponse(200, { alts: {}, addable: [] }));
 

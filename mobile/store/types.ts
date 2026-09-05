@@ -148,3 +148,20 @@ export function formatPortion(bucket: string | null, grams: number | null): stri
   const approx = `~${Math.round(grams)} g`;
   return bucket ? `${approx} · ${bucket}` : approx;
 }
+
+// FOOD-019: grams/carbs for one decomposed component, derived from the
+// parent dish's own portion_g (the pixel-based estimate) — the decomposer
+// itself never supplies absolute grams, only proportion. Null when the
+// parent dish has no portion_g (component grams then can't be derived; the
+// carbs-per-component figure still can, scaled off proportion alone, so it
+// is computed independently rather than gated on grams being available).
+export function componentGrams(component: DishComponent, dishPortionG: number | null): number | null {
+  if (dishPortionG == null) return null;
+  return component.proportion * dishPortionG;
+}
+
+export function componentCarbs(component: DishComponent, dishPortionG: number | null): number | null {
+  const grams = componentGrams(component, dishPortionG);
+  if (grams == null) return null;
+  return (component.per_100g.carbs_g * grams) / 100;
+}

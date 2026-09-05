@@ -14,7 +14,8 @@ import { useMealStore } from '../store/mealStore';
 import { useGlucoseStore } from '../store/glucoseStore';
 import { useHistoryStore } from '../store/historyStore';
 import { ApiError } from '../api/client';
-import type { GlucoseActuals, GlucosePrediction, LoggedMeal } from '../store/types';
+import { componentGrams, componentCarbs } from '../store/types';
+import type { DishComponent, GlucoseActuals, GlucosePrediction, LoggedMeal } from '../store/types';
 
 beforeEach(() => {
   useMealStore.getState().reset();
@@ -236,5 +237,31 @@ describe('historyStore.addMeal polling integration', () => {
   test('does not start polling in MVP mode', () => {
     useHistoryStore.getState().addMeal(meal);
     expect(useGlucoseStore.getState().pollingActive).toBe(false);
+  });
+});
+
+describe('componentGrams / componentCarbs (MOB-018)', () => {
+  const component: DishComponent = {
+    name: 'white_rice',
+    role: 'base',
+    proportion: 0.5,
+    per_100g: { calories: 130, carbs_g: 28, fiber_g: 0.4, protein_g: 2.7, fat_g: 0.3 },
+    macro_source: 'usda_api',
+  };
+
+  test('derives grams from proportion x dish portion_g', () => {
+    expect(componentGrams(component, 420)).toBe(210);
+  });
+
+  test('grams is null when the dish has no portion_g', () => {
+    expect(componentGrams(component, null)).toBeNull();
+  });
+
+  test('derives carbs from grams and per_100g.carbs_g', () => {
+    expect(componentCarbs(component, 420)).toBeCloseTo((28 * 210) / 100);
+  });
+
+  test('carbs is null when grams cannot be derived', () => {
+    expect(componentCarbs(component, null)).toBeNull();
   });
 });
