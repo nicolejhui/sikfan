@@ -67,7 +67,7 @@ export interface CorrectMacrosResponse {
   dish: DishResult;
 }
 
-export type IngredientEditAction = 'remove' | 'swap' | 'add';
+export type IngredientEditAction = 'remove' | 'swap' | 'add' | 'include';
 
 export interface IngredientEdit {
   action: IngredientEditAction;

@@ -45,25 +45,37 @@ interface CarbCorrectionProps {
   mealId: string;
   cropId: string;
   corrected: boolean;
+  // MOB-016 rev-2: results.jsx's `unsure` state — confidence below LOW_CONF.
+  // Styles the entry row warn-colored with "Fix the estimate" copy instead
+  // of the neutral default, and only while the dish hasn't been corrected
+  // yet (a correction already answers "does this look right?").
+  unsure: boolean;
   confirmationText: string | null;
+  // MOB-016 rev-2: results.jsx renders these as independent lines driven
+  // straight off `excluded.length`/`Object.keys(swaps).length` — not folded
+  // into one combined sentence, and never shown for an "add" (the design has
+  // no confirmation line for that case, only the row's own "added" pill).
+  removedCount: number;
+  correctedCount: number;
   onToast: (message: string) => void;
   // null means "something changed but there's no new headline to show" (a
   // "looks right" confirmation) — the caller still refetches but leaves the
   // existing corrected/confirmationText state alone.
   onCorrected: (confirmationText: string | null) => void;
   onReset: () => void;
-  onOpenFixMode: () => void;
 }
 
 export default function CarbCorrection({
   mealId,
   cropId,
   corrected,
+  unsure,
   confirmationText,
+  removedCount,
+  correctedCount,
   onToast,
   onCorrected,
   onReset,
-  onOpenFixMode,
 }: CarbCorrectionProps) {
   const [correcting, setCorrecting] = useState(false);
   const [direction, setDirection] = useState<CorrectionDirection | null>(null);
@@ -140,13 +152,15 @@ export default function CarbCorrection({
 
   const handleReasonPress = useCallback(
     (r: CorrectionReason) => {
+      // Selecting a reason only updates local state — the correction isn't
+      // submitted until a magnitude is also chosen (handleMagnitudePress).
+      // Firing here too used to send two separate persisted corrections for
+      // one user gesture, which double- (or with any back-and-forth,
+      // multi-) counts as evidence toward FOOD-020's learned portion prior.
       if (submitting || direction === null || direction === 'looks_right') return;
       setReason(r);
-      const mag = magnitude ?? 'little';
-      setMagnitude(mag);
-      void fireDirectionCorrection(direction, r, mag);
     },
-    [submitting, direction, magnitude, fireDirectionCorrection]
+    [submitting, direction]
   );
 
   const handleMagnitudePress = useCallback(
@@ -157,11 +171,6 @@ export default function CarbCorrection({
     },
     [submitting, direction, reason, fireDirectionCorrection]
   );
-
-  const handleFixIngredient = useCallback(() => {
-    closePanel();
-    onOpenFixMode();
-  }, [closePanel, onOpenFixMode]);
 
   const handleUndoAll = useCallback(async () => {
     if (submitting) return;
@@ -185,20 +194,40 @@ export default function CarbCorrection({
   return (
     <View>
       <TouchableOpacity
-        style={[styles.entryRow, corrected && styles.entryRowCorrected]}
+        style={[
+          styles.entryRow,
+          corrected && styles.entryRowCorrected,
+          !corrected && unsure && styles.entryRowUnsure,
+        ]}
         onPress={() => setCorrecting(true)}
         activeOpacity={0.8}
       >
-        <View style={[styles.entryIcon, corrected && styles.entryIconCorrected]}>
-          <Ionicons name="pencil" size={14} color={corrected ? '#fff' : defaultPalette.inkSoft} />
+        <View
+          style={[
+            styles.entryIcon,
+            corrected && styles.entryIconCorrected,
+            !corrected && unsure && styles.entryIconUnsure,
+          ]}
+        >
+          <Ionicons
+            name="pencil"
+            size={14}
+            color={corrected || unsure ? '#fff' : defaultPalette.inkSoft}
+          />
         </View>
-        <Text style={[styles.entryText, corrected && styles.entryTextCorrected]}>
-          {corrected ? 'Edit your correction' : 'Estimate look off?'}
+        <Text
+          style={[
+            styles.entryText,
+            corrected && styles.entryTextCorrected,
+            !corrected && unsure && styles.entryTextUnsure,
+          ]}
+        >
+          {corrected ? 'Edit your correction' : unsure ? 'Fix the estimate' : 'Estimate look off?'}
         </Text>
         <Ionicons
           name="arrow-forward"
           size={14}
-          color={corrected ? defaultPalette.brand : defaultPalette.inkFaint}
+          color={corrected ? defaultPalette.brand : unsure ? defaultPalette.warn.deep : defaultPalette.inkFaint}
         />
       </TouchableOpacity>
 
@@ -285,18 +314,30 @@ export default function CarbCorrection({
               <Text style={styles.confirmationText}>{confirmationText}</Text>
             </View>
           )}
+          {!submitting && removedCount > 0 && (
+            <View style={styles.confirmationRow}>
+              <Ionicons name="sparkles" size={13} color={defaultPalette.brand} />
+              <Text style={styles.confirmationText}>
+                {removedCount} ingredient{removedCount > 1 ? 's' : ''} removed · projection updated
+              </Text>
+            </View>
+          )}
+          {!submitting && correctedCount > 0 && (
+            <View style={styles.confirmationRow}>
+              <Ionicons name="sparkles" size={13} color={defaultPalette.brand} />
+              <Text style={styles.confirmationText}>
+                {correctedCount} ingredient{correctedCount > 1 ? 's' : ''} corrected · projection updated
+              </Text>
+            </View>
+          )}
 
-          <View style={styles.footerRow}>
-            <TouchableOpacity onPress={handleFixIngredient} disabled={submitting} style={styles.footerLink}>
-              <Text style={styles.footerLinkText}>An ingredient is wrong or missing</Text>
-              <Ionicons name="arrow-forward" size={13} color={defaultPalette.brand} />
-            </TouchableOpacity>
-            {corrected && (
+          {corrected && (
+            <View style={styles.footerRow}>
               <TouchableOpacity onPress={handleUndoAll} disabled={submitting}>
-                <Text style={styles.undoText}>Undo all</Text>
+                <Text style={styles.undoText}>Undo all corrections</Text>
               </TouchableOpacity>
-            )}
-          </View>
+            </View>
+          )}
         </View>
       )}
     </View>
@@ -314,6 +355,7 @@ const styles = StyleSheet.create({
     borderTopColor: defaultPalette.hair,
   },
   entryRowCorrected: {},
+  entryRowUnsure: {},
   entryIcon: {
     width: 30,
     height: 30,
@@ -326,6 +368,9 @@ const styles = StyleSheet.create({
   entryIconCorrected: {
     backgroundColor: defaultPalette.brand,
   },
+  entryIconUnsure: {
+    backgroundColor: defaultPalette.warn.deep,
+  },
   entryText: {
     flex: 1,
     fontSize: fontSize.sm,
@@ -334,6 +379,10 @@ const styles = StyleSheet.create({
   },
   entryTextCorrected: {
     color: defaultPalette.brand,
+    fontWeight: fontWeight.semibold,
+  },
+  entryTextUnsure: {
+    color: defaultPalette.warn.deep,
     fontWeight: fontWeight.semibold,
   },
   panel: {
@@ -431,21 +480,11 @@ const styles = StyleSheet.create({
   footerRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
+    justifyContent: 'flex-end',
     marginTop: spacing.md,
     paddingTop: spacing.sm,
     borderTopWidth: 1,
     borderTopColor: defaultPalette.hair,
-  },
-  footerLink: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-  },
-  footerLinkText: {
-    fontSize: fontSize.xs,
-    fontWeight: fontWeight.medium,
-    color: defaultPalette.brand,
   },
   undoText: {
     fontSize: fontSize.xs,

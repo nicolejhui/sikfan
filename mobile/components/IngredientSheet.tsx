@@ -18,16 +18,22 @@ interface IngredientSheetProps {
   component: DishComponent | null;
   dish: DishResult | null;
   candidates: IngredientCandidate[];
+  // MOB-016 rev-2: when this component is itself the result of an earlier
+  // swap, its true original name — lets the current-reading row act as a
+  // revert (results.jsx's "the current reading is itself a row").
+  originalName: string | null;
   onToast: (message: string) => void;
-  // summary is the confirmation-line text ("1 ingredient corrected" /
-  // "1 ingredient removed"), matched to CarbCorrection's own copy. meta
-  // identifies what happened so the breakdown list can show a "fixed" pill
-  // on the resulting row — the response's folded component list alone
-  // doesn't say which entry is new vs. carried over.
+  // summary is unused by the caller now (ResultsScreen computes its own
+  // aggregate confirmation copy) but kept so a swap's resulting name and a
+  // remove's captured figures reach the caller — the response's folded
+  // component list alone doesn't say which entry is new vs. carried over,
+  // and a removed component vanishes from it entirely.
   onCorrected: (
     response: CorrectIngredientsResponse,
     summary: string,
-    meta: { kind: 'swap'; name: string } | { kind: 'remove' }
+    meta:
+      | { kind: 'swap'; name: string; fromName: string }
+      | { kind: 'remove'; name: string; grams: number | null; carbs: number | null }
   ) => void;
 }
 
@@ -43,6 +49,7 @@ export default function IngredientSheet({
   component,
   dish,
   candidates,
+  originalName,
   onToast,
   onCorrected,
 }: IngredientSheetProps) {
@@ -72,7 +79,9 @@ export default function IngredientSheet({
   const submit = async (
     payload: Parameters<typeof correctIngredients>[0]['edits'],
     summary: string,
-    meta: { kind: 'swap'; name: string } | { kind: 'remove' }
+    meta:
+      | { kind: 'swap'; name: string; fromName: string }
+      | { kind: 'remove'; name: string; grams: number | null; carbs: number | null }
   ) => {
     setSubmitting(true);
     setError(null);
@@ -89,12 +98,12 @@ export default function IngredientSheet({
     }
   };
 
-  const handleSwap = (candidate: IngredientCandidate) => {
+  const handleSwap = (replacementName: string) => {
     if (submitting || !component) return;
     void submit(
-      [{ action: 'swap', component_name: component.name, replacement_name: candidate.name }],
+      [{ action: 'swap', component_name: component.name, replacement_name: replacementName }],
       '1 ingredient corrected · projection updated',
-      { kind: 'swap', name: candidate.name }
+      { kind: 'swap', name: replacementName, fromName: component.name }
     );
   };
 
@@ -104,7 +113,7 @@ export default function IngredientSheet({
     void submit(
       [{ action: 'remove', component_name: component.name }],
       '1 ingredient removed · projection updated',
-      { kind: 'remove' }
+      { kind: 'remove', name: component.name, grams, carbs }
     );
   };
 
@@ -120,49 +129,54 @@ export default function IngredientSheet({
     >
       <BottomSheetScrollView contentContainerStyle={styles.content}>
         <Text style={styles.header}>We read this as</Text>
-        <View style={styles.currentRow}>
-          <View style={styles.radioSelected} />
-          <View style={styles.rowInfo}>
-            <Text style={styles.rowName}>{formatDishName(component?.name)}</Text>
-            <Text style={styles.rowMeta}>
-              {grams != null ? `${Math.round(grams)}g` : '—'}
-              {carbs != null ? ` · ${Math.round(carbs)}g carbs` : ''}
-            </Text>
-          </View>
-        </View>
+        <Text style={styles.titleName}>{formatDishName(component?.name)}</Text>
+        <Text style={styles.titleMeta}>
+          {grams != null ? `${Math.round(grams)}g` : '—'}
+          {carbs != null ? ` · ${Math.round(carbs)}g carbs as scanned` : ''}
+        </Text>
 
-        {candidates.length > 0 && (
-          <>
-            <Text style={styles.sectionLabel}>Or maybe</Text>
-            {candidates.map((candidate) => {
-              const altGrams = grams;
-              const altCarbs = altGrams != null ? (candidate.per_100g.carbs_g * altGrams) / 100 : null;
-              return (
-                <TouchableOpacity
-                  key={candidate.name}
-                  style={styles.altRow}
-                  onPress={() => handleSwap(candidate)}
-                  disabled={submitting}
-                  activeOpacity={0.7}
-                >
-                  <View style={styles.radio} />
-                  <View style={styles.rowInfo}>
-                    <Text style={styles.rowName}>{formatDishName(candidate.name)}</Text>
-                    <Text style={styles.rowMeta}>
-                      {altGrams != null ? `${Math.round(altGrams)}g` : '—'}
-                      {altCarbs != null ? ` · ${Math.round(altCarbs)}g carbs` : ''}
-                    </Text>
-                  </View>
-                </TouchableOpacity>
-              );
-            })}
-          </>
-        )}
+        <Text style={styles.sectionLabel}>What is it actually?</Text>
+        <View style={styles.radioList}>
+          {originalName && (
+            <TouchableOpacity
+              style={styles.altRow}
+              onPress={() => handleSwap(originalName)}
+              disabled={submitting}
+              activeOpacity={0.7}
+            >
+              <View style={styles.radio} />
+              <Text style={styles.rowName}>{formatDishName(originalName)}</Text>
+            </TouchableOpacity>
+          )}
+          {candidates.map((candidate) => {
+            const altGrams = grams;
+            const altCarbs = altGrams != null ? (candidate.per_100g.carbs_g * altGrams) / 100 : null;
+            return (
+              <TouchableOpacity
+                key={candidate.name}
+                style={styles.altRow}
+                onPress={() => handleSwap(candidate.name)}
+                disabled={submitting}
+                activeOpacity={0.7}
+              >
+                <View style={styles.radio} />
+                <Text style={styles.rowName}>{formatDishName(candidate.name)}</Text>
+                <Text style={styles.rowCarbs}>
+                  {altCarbs != null ? `${Math.round(altCarbs)}g` : altGrams != null ? `${Math.round(altGrams)}g` : ''}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
 
         {error && <Text style={styles.errorText}>{error}</Text>}
 
         <TouchableOpacity
-          style={[styles.destructiveRow, (onlyComponent || submitting || removed) && styles.destructiveRowDisabled]}
+          style={[
+            styles.destructiveRow,
+            removed && styles.destructiveRowActive,
+            (onlyComponent || submitting || removed) && styles.destructiveRowDisabled,
+          ]}
           onPress={handleRemove}
           disabled={onlyComponent || submitting || removed}
           activeOpacity={0.7}
@@ -170,9 +184,9 @@ export default function IngredientSheet({
           {submitting && removed ? (
             <ActivityIndicator size="small" color={defaultPalette.warn.fg} />
           ) : (
-            <Ionicons name="close-circle-outline" size={16} color={defaultPalette.warn.fg} />
+            <Ionicons name="close" size={14} color={removed ? defaultPalette.warn.deep : defaultPalette.inkSoft} />
           )}
-          <Text style={styles.destructiveText}>
+          <Text style={[styles.destructiveText, removed && styles.destructiveTextActive]}>
             {removed ? 'Not in my dish · removed' : "It's not in my dish"}
           </Text>
         </TouchableOpacity>
@@ -203,28 +217,42 @@ const styles = StyleSheet.create({
   },
   header: {
     fontSize: fontSize.xs,
+    fontWeight: fontWeight.semibold,
     color: defaultPalette.inkFaint,
-    marginBottom: spacing.sm,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
   },
-  currentRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    minHeight: 46,
-    backgroundColor: defaultPalette.surfaceSoft,
-    borderRadius: radius.md,
-    paddingHorizontal: spacing.sm,
-    marginBottom: spacing.md,
+  titleName: {
+    fontSize: fontSize.xl,
+    fontWeight: fontWeight.bold,
+    color: defaultPalette.ink,
+    marginTop: 2,
+  },
+  titleMeta: {
+    fontSize: fontSize.sm,
+    color: defaultPalette.inkSoft,
+    marginTop: 2,
   },
   sectionLabel: {
-    fontSize: fontSize.xs,
-    color: defaultPalette.inkFaint,
+    fontSize: fontSize.sm,
+    fontWeight: fontWeight.semibold,
+    color: defaultPalette.inkSoft,
+    marginTop: spacing.md,
     marginBottom: spacing.xs,
+  },
+  radioList: {
+    gap: spacing.xs,
   },
   altRow: {
     flexDirection: 'row',
     alignItems: 'center',
+    gap: spacing.sm,
     minHeight: 46,
+    borderWidth: 1.5,
+    borderColor: defaultPalette.hair,
+    borderRadius: radius.md,
     paddingHorizontal: spacing.sm,
+    backgroundColor: defaultPalette.surface,
   },
   radio: {
     width: 18,
@@ -232,28 +260,17 @@ const styles = StyleSheet.create({
     borderRadius: radius.full,
     borderWidth: 1.5,
     borderColor: defaultPalette.hair,
-    marginRight: spacing.sm,
-  },
-  radioSelected: {
-    width: 18,
-    height: 18,
-    borderRadius: radius.full,
-    borderWidth: 5,
-    borderColor: defaultPalette.brand,
-    marginRight: spacing.sm,
-  },
-  rowInfo: {
-    flex: 1,
   },
   rowName: {
+    flex: 1,
     fontSize: fontSize.sm,
     fontWeight: fontWeight.medium,
     color: defaultPalette.ink,
   },
-  rowMeta: {
+  rowCarbs: {
     fontSize: fontSize.xs,
-    color: defaultPalette.inkSoft,
-    marginTop: 1,
+    fontWeight: fontWeight.medium,
+    color: defaultPalette.inkFaint,
   },
   errorText: {
     fontSize: fontSize.xs,
@@ -263,20 +280,29 @@ const styles = StyleSheet.create({
   destructiveRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    minHeight: 44,
+    justifyContent: 'center',
+    minHeight: 46,
     marginTop: spacing.md,
-    paddingTop: spacing.sm,
-    borderTopWidth: 1,
-    borderTopColor: defaultPalette.hair,
+    borderWidth: 1.5,
+    borderColor: defaultPalette.hair,
+    borderRadius: radius.md,
+    paddingHorizontal: spacing.sm,
     gap: spacing.xs,
+  },
+  destructiveRowActive: {
+    borderColor: defaultPalette.warn.ring,
+    backgroundColor: defaultPalette.warn.tint,
   },
   destructiveRowDisabled: {
     opacity: 0.5,
   },
   destructiveText: {
     fontSize: fontSize.sm,
-    fontWeight: fontWeight.medium,
-    color: defaultPalette.warn.fg,
+    fontWeight: fontWeight.semibold,
+    color: defaultPalette.inkSoft,
+  },
+  destructiveTextActive: {
+    color: defaultPalette.warn.deep,
   },
   destructiveHelper: {
     fontSize: fontSize.xs,

@@ -78,6 +78,8 @@ The mobile app switches on `detail.code` for logic and displays `detail.message`
 | `POST /correct-ingredients` | `no_portion_estimate` | `"This dish has no portion estimate to convert ingredient edits against."` |
 | `POST /correct-ingredients` | `unresolved_ingredient` | `"Could not find a USDA match for '<name>'."` |
 | `POST /correct-ingredients` | `empty_dish` | `"This edit would remove every ingredient from the dish."` |
+| `POST /correct-ingredients` | `nothing_to_restore` | `"No pre-correction snapshot for this dish."` |
+| `POST /correct-ingredients` | `unknown_component` | `"'<name>' was not part of the original dish."` |
 
 ### 503 Service Unavailable — model or runtime failure
 

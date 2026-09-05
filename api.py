@@ -359,7 +359,7 @@ class CorrectMacrosResponse(BaseModel):
 # --- POST /correct-ingredients (API-013) ---
 
 class IngredientEdit(BaseModel):
-    action: Literal["remove", "swap", "add"]
+    action: Literal["remove", "swap", "add", "include"]
     component_name: str
     replacement_name: str | None = None   # required for "swap"
     grams: float | None = Field(None, gt=0)   # required for "add" — positive only
@@ -1161,6 +1161,35 @@ def _snapshot_baseline(dish_entry: dict) -> None:
     dish_entry["_baseline"] = baseline
 
 
+def _component_fallback_lookup(dish_name: str, baseline: dict | None) -> dict[str, dict | None]:
+    """Map normalized component name -> fallback_macros, sourced from the
+    decomposition cache's INPUT shape (that's where fallback_macros lives;
+    dish_entry['components'] is fold_components()'s lossy display OUTPUT —
+    see _snapshot_baseline()). The baseline snapshot is consulted too (and
+    never overrides a current-cache hit) so a component restored via
+    'include' finds its fallback data even after later edits moved on.
+
+    API-013a fix (MOB-016 rev-2): Step 5 previously hardcoded
+    fallback_macros=None for every surviving component on every edit, which
+    silently zeroed a component that only ever resolved through the LLM's
+    estimate the first time the user touched any *other* ingredient in the
+    dish. This lookup carries that data forward instead."""
+    lookup: dict[str, dict | None] = {}
+    decomp_path = DECOMPOSITION_CACHE_DIR / f"{normalize_dish_name(dish_name)}.json"
+    try:
+        current = json.loads(decomp_path.read_text())
+        for c in current.get("components", []):
+            lookup[normalize_dish_name(c["name"])] = c.get("fallback_macros")
+    except (OSError, ValueError):
+        pass
+    if baseline is not None:
+        original_decomp = baseline.get("_decomposition")
+        if original_decomp:
+            for c in original_decomp.get("components", []):
+                lookup.setdefault(normalize_dish_name(c["name"]), c.get("fallback_macros"))
+    return lookup
+
+
 def _write_corrected(status_path: Path, job: dict, dishes: list[dict]) -> None:
     """Recompute total_carbs_g and write job_status — mirrors confirm_dish()'s
     own L1070-1072 write exactly, reused by every API-013 correction route."""
@@ -1499,6 +1528,47 @@ def correct_ingredients(body: CorrectIngredientsRequest):
                     },
                 )
             grams_list.append({"name": edit.component_name, "role": None, "grams": edit.grams})
+        elif edit.action == "include":
+            # API-013a: put a removed component back at the size it was
+            # scanned at — restored from the pre-correction snapshot, not
+            # re-added via _validate_ingredient_name()'s LLM/USDA round trip
+            # (which would refuse re-entry to a component whose macros only
+            # ever came from fallback_macros). See plans/MOB_016b-plan.md.
+            already_present = any(normalize_dish_name(g["name"]) == target_slug for g in grams_list)
+            if already_present:
+                continue  # idempotent — mirrors swap's skip-if-absent above
+            baseline = dish_entry.get("_baseline")
+            if baseline is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "nothing_to_restore", "message": "No pre-correction snapshot for this dish."},
+                )
+            baseline_portion_g = baseline.get("portion_g")
+            baseline_component = None
+            original_decomp = baseline.get("_decomposition")
+            if original_decomp is not None:
+                baseline_component = next(
+                    (c for c in original_decomp.get("components", []) if normalize_dish_name(c["name"]) == target_slug),
+                    None,
+                )
+            if baseline_component is None:
+                baseline_component = next(
+                    (c for c in (baseline.get("components") or []) if normalize_dish_name(c["name"]) == target_slug),
+                    None,
+                )
+            if baseline_component is None or baseline_portion_g is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "unknown_component",
+                        "message": f"{edit.component_name!r} was not part of the original dish.",
+                    },
+                )
+            grams_list.append({
+                "name": baseline_component["name"],
+                "role": baseline_component.get("role"),
+                "grams": float(baseline_component["proportion"]) * baseline_portion_g,
+            })
 
     # Step 3-4: guard on the NET result, after every edit is applied.
     total_grams = sum(g["grams"] for g in grams_list)
@@ -1509,10 +1579,18 @@ def correct_ingredients(body: CorrectIngredientsRequest):
         )
 
     # Step 5: new portion_g = surviving grams; renormalize proportions.
+    # API-013a: carry fallback_macros forward per component (keyed by
+    # normalized name) instead of hardcoding None for every survivor — see
+    # _component_fallback_lookup(). A genuinely new component (from "add",
+    # or "include" of one that never had fallback data) isn't in the lookup
+    # and falls through to the same usda_likely=True/fallback_macros=None
+    # pair as before.
+    fallback_lookup = _component_fallback_lookup(dish_name, dish_entry.get("_baseline"))
     new_components = [
         {
             "name": g["name"], "role": g.get("role"), "proportion": g["grams"] / total_grams,
-            "usda_likely": True, "fallback_macros": None,
+            "usda_likely": fallback_lookup.get(normalize_dish_name(g["name"])) is None,
+            "fallback_macros": fallback_lookup.get(normalize_dish_name(g["name"])),
         }
         for g in grams_list
     ]

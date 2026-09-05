@@ -206,6 +206,23 @@ test('correctIngredients POSTs meal_id/crop_id/edits as JSON to /correct-ingredi
   });
 });
 
+test('correctIngredients round-trips an "include" action verbatim', async () => {
+  (global.fetch as jest.Mock).mockResolvedValue(mockJsonResponse(200, {}));
+
+  await correctIngredients({
+    meal_id: 'meal_1',
+    crop_id: 'crop_0',
+    edits: [{ action: 'include', component_name: 'white rice' }],
+  });
+
+  const [, options] = (global.fetch as jest.Mock).mock.calls[0];
+  expect(JSON.parse(options.body)).toEqual({
+    meal_id: 'meal_1',
+    crop_id: 'crop_0',
+    edits: [{ action: 'include', component_name: 'white rice' }],
+  });
+});
+
 test('getIngredientCandidates GETs /ingredient-candidates/{meal_id}/{crop_id}', async () => {
   (global.fetch as jest.Mock).mockResolvedValue(mockJsonResponse(200, { alts: {}, addable: [] }));
 

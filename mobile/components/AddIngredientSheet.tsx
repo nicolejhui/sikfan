@@ -1,5 +1,6 @@
 import React, { useCallback, useState } from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
 import { BottomSheetBackdrop, BottomSheetModal, BottomSheetScrollView } from '@gorhom/bottom-sheet';
 import type { BottomSheetBackdropProps } from '@gorhom/bottom-sheet';
 
@@ -82,7 +83,7 @@ export default function AddIngredientSheet({
     >
       <BottomSheetScrollView contentContainerStyle={styles.content}>
         <Text style={styles.header}>What did we miss?</Text>
-        <Text style={styles.subtitle}>Foods that are commonly part of this dish but easy to miss in a photo.</Text>
+        <Text style={styles.subtitle}>Anything hidden under the food or added after the photo.</Text>
 
         {actionable.length === 0 && <Text style={styles.emptyText}>No suggestions right now.</Text>}
 
@@ -90,6 +91,7 @@ export default function AddIngredientSheet({
           const alreadyCounted = presentSlugs.has(normalize(candidate.name));
           const grams = candidate.grams_hint ?? 0;
           const carbs = (candidate.per_100g.carbs_g * grams) / 100;
+          const submitting = submittingName === candidate.name;
           return (
             <TouchableOpacity
               key={candidate.name}
@@ -98,15 +100,19 @@ export default function AddIngredientSheet({
               disabled={alreadyCounted || submittingName !== null}
               activeOpacity={0.7}
             >
+              <Ionicons
+                name={alreadyCounted ? 'checkmark' : submitting ? 'hourglass-outline' : 'add'}
+                size={16}
+                color={alreadyCounted ? defaultPalette.inkFaint : defaultPalette.inkSoft}
+              />
               <View style={styles.rowInfo}>
-                <Text style={styles.rowName}>{formatDishName(candidate.name)}</Text>
-                <Text style={styles.rowMeta}>
-                  {Math.round(grams)}g · {Math.round(carbs)}g carbs
+                <Text style={[styles.rowName, alreadyCounted && styles.rowNameDisabled]}>
+                  {formatDishName(candidate.name)}
                 </Text>
               </View>
-              <Text style={styles.rowState}>
-                {alreadyCounted ? 'already counted' : submittingName === candidate.name ? 'adding…' : 'add'}
-              </Text>
+              <Text style={styles.rowMeta}>{Math.round(grams)}g</Text>
+              <Text style={styles.rowCarbs}>{Math.round(carbs)}g</Text>
+              {alreadyCounted && <Text style={styles.rowState}>already counted</Text>}
             </TouchableOpacity>
           );
         })}
@@ -150,14 +156,18 @@ const styles = StyleSheet.create({
   row: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
+    gap: spacing.sm,
     minHeight: 46,
-    borderTopWidth: 1,
-    borderTopColor: defaultPalette.hair,
-    paddingVertical: spacing.xs,
+    borderWidth: 1.5,
+    borderColor: defaultPalette.hair,
+    borderRadius: radius.md,
+    backgroundColor: defaultPalette.surface,
+    paddingHorizontal: spacing.sm,
+    marginBottom: spacing.xs,
   },
   rowDisabled: {
-    opacity: 0.5,
+    backgroundColor: defaultPalette.surfaceSoft,
+    opacity: 0.65,
   },
   rowInfo: {
     flex: 1,
@@ -167,14 +177,23 @@ const styles = StyleSheet.create({
     fontWeight: fontWeight.medium,
     color: defaultPalette.ink,
   },
+  rowNameDisabled: {
+    color: defaultPalette.inkFaint,
+  },
   rowMeta: {
     fontSize: fontSize.xs,
+    color: defaultPalette.inkFaint,
+  },
+  rowCarbs: {
+    fontSize: fontSize.xs,
+    fontWeight: fontWeight.semibold,
     color: defaultPalette.inkSoft,
-    marginTop: 1,
+    width: 34,
+    textAlign: 'right',
   },
   rowState: {
     fontSize: fontSize.xs,
     fontWeight: fontWeight.medium,
-    color: defaultPalette.brand,
+    color: defaultPalette.inkFaint,
   },
 });

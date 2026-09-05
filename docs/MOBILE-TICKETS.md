@@ -510,25 +510,45 @@ The design's own framing:
       full portion*; too low → *Portion was bigger* / *More food than it looks*
 - [ ] Magnitude chips *A little* / *A lot*; picking a reason pre-selects
       "little" (`results.jsx:611`)
-- [ ] Footer row "An ingredient is wrong or missing" always available inside
-      the panel → opens fix mode; "Undo all" appears once anything is corrected
-      → `POST /reset-corrections`
-- [ ] "Undo all" reverts the carb correction **and** any ingredient
+- [ ] "Undo all corrections" appears once anything is corrected →
+      `POST /reset-corrections`. No fix-mode footer link — see rev-2 below
+- [ ] "Undo all corrections" reverts the carb correction **and** any ingredient
       swaps/removals/additions, including the saved breakdown used by future
       scans — but not a learned portion prior. Don't imply it resets everything;
       the response's `decomposition_reverted`/`prior_retained` say what actually
       happened (API-013)
-- [ ] Fix mode on the breakdown: header becomes "Which ingredient is wrong?"
-      with a **Done** button replacing the chevron; rows become buttons opening
-      `IngredientSheet`; a dashed "Something's missing" row opens
-      `AddIngredientSheet`; swapped/added rows carry "fixed"/"added" pills
+- [ ] **(rev-2, MOB-016b)** One list, no fix mode: the Breakdown *is* the
+      correction surface. Header stays "Breakdown · N items" with only a
+      chevron toggle — no "Which ingredient is wrong?" text, no **Done**
+      button. Rows are always tappable (subject to the gates below); a helper
+      line "Tap any item to correct it — or add what we missed." shows under
+      the header while open; a dashed "Something's missing" row is permanent
+      at the list foot, not something a mode unlocks
+- [ ] **(rev-2)** Removal is a reversible toggle in place: tapping "It's not
+      in my dish" in `IngredientSheet` removes the component, but the row
+      **stays in the Breakdown list** — struck through, `surfaceSoft`
+      background, with a close icon. Tapping that icon fires `include`
+      (API-013a) and the row returns to normal, live figures restored
+- [ ] **(rev-2)** `IngredientSheet` header is "What is it actually?"; the
+      current reading is itself the first (selected) radio row. If this
+      component is the result of an earlier swap, tapping that row again
+      reverts it (fires `swap` back to the original name) — "or maybe"
+      candidates are unchanged below it
+- [ ] **(rev-2)** Confirmation copy after any ingredient edit is an aggregate
+      count, not a per-edit sentence: "N ingredients removed / corrected ·
+      projection updated" (removed + swapped count together; added counted
+      separately when nothing else changed)
+- [ ] **(rev-2)** Below `LOW_CONF` (70%) confidence, the breakdown auto-opens
+      on load and CarbCorrection's entry row goes warn-colored with "Fix the
+      estimate" copy instead of the neutral "Estimate look off?" — cleared
+      once the dish has been corrected
 - [ ] The last remaining component can't be removed: `IngredientSheet`'s "It's
       not in my dish" row is disabled (with a short reason) when removing it
       would empty the dish. The server refuses this with 422 `empty_dish`
       regardless — the client guard exists so the user never reaches a dead end,
       not as the enforcement. If the 422 does arrive, surface it inline like any
       other correction failure
-- [ ] A dish with no `portion_g` gets no fix-mode affordance at all —
+- [ ] A dish with no `portion_g` gets no tap affordance at all —
       `/correct-ingredients` 422s with `no_portion_estimate`, since proportions
       can't be converted to grams without one
 - [ ] "Carbs updated" summary row at the top of the Macros card when the total
@@ -547,7 +567,7 @@ The design's own framing:
       flight; a failure shows an **inline** error and reverts the selection —
       `GlucosePad`'s pattern (`GlucosePad.tsx:59-73`), not a toast, so the user
       keeps their context
-- [ ] Candidates fetched lazily on first entry into fix mode, not on mount —
+- [ ] Candidates fetched lazily on first breakdown expand, not on mount —
       it's an LLM-backed call and most meals are never corrected
 - [ ] Hidden entirely for logged meals; gated on `!loggedMeal && mealId && cropId`
 - [ ] All colours from `constants/theme.ts`; `formatDishName()` for any dish
@@ -596,11 +616,19 @@ The design's own framing:
   the `good`/`warn`/`low` groups. Use `surfaceSoft`; do not invent the token.
 - **Multi-dish limitation:** this targets the primary dish's `crop_id`, so a
   multi-dish meal can only have its first dish corrected until MOB-015 lands.
+- **rev-2 (MOB-016b, `plans/MOB-016b-plan.md`):** ported a design revision that
+  deletes fix mode entirely — the Breakdown list is always the correction
+  surface. Added client-only overlay state (`removed`, `swapOrigins` maps in
+  `ResultsScreen`) so a removed/pre-swap row can still render after the
+  server's response drops it; both are display-only, cleared on reset or a
+  new scan. Backed by a new server action, `include` (API-013a), which
+  restores a removed component from the pre-correction `_baseline` snapshot
+  rather than re-`add`-ing it through the LLM/USDA validation path.
 
-**Dependencies:** API-013 (all four routes), MOB-007 (Results screen), MOB-010
-(`ConfirmDishSheet`, `@gorhom/bottom-sheet`), MOB-012 (`GlucosePad`'s
-inline-error pattern), MOB-014 (the breakdown UI this extends). Related:
-MOB-015.
+**Dependencies:** API-013 + API-013a (all five actions), MOB-007 (Results
+screen), MOB-010 (`ConfirmDishSheet`, `@gorhom/bottom-sheet`), MOB-012
+(`GlucosePad`'s inline-error pattern), MOB-014 (the breakdown UI this
+extends). Related: MOB-015.
 
 ---
 

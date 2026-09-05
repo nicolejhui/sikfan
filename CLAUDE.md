@@ -159,6 +159,21 @@ reciprocals instead (`1/0.85 = 1.176`, `1/0.60 = 1.667`), and the prior is clamp
 don't quietly disagree. Any UI copy stating the percentage must derive it from the
 applied factor, never hardcode 15/40.
 
+**Closed 2026-08-30 (MOB-016 rev-2):** the component itself no longer disagrees —
+`results.jsx:436`'s `MacroCard` now takes `pctApplied` as a prop (used at line 546)
+instead of computing it from the hardcoded `mag === 'lot' ? 40 : 15`; that hardcoded
+pair survives only in the mock harness at line 696, which never reaches the repo.
+`CarbCorrection.tsx`'s `buildConfirmationText()` already derives the percentage from
+`new_portion_g / old_portion_g`, so this repo and the design component now agree — only
+the design's own mock data still disagrees with both.
+
+**Still open:** `AddIngredientSheet` in the current `results.jsx` still defines
+`sameFood()` (line 319), the string-similarity-over-food-names heuristic this file
+forbids (see "Macro Lookup — No Hardcoded Food Tables" below). It has never been
+ported — the mobile `AddIngredientSheet.tsx` does exact-match only, per FOOD-021 — but
+it remains present upstream as of the MOB-016 rev-2 review (2026-08-30), so a future
+sync of this file must not carry it over.
+
 ## Frozen API Schemas (do not change without versioning)
 
 ### analyze_meal(image_path) → dict

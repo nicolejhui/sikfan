@@ -18,7 +18,7 @@ import IngredientSheet from '../components/IngredientSheet';
 import AddIngredientSheet from '../components/AddIngredientSheet';
 import { MVP_MODE } from '../constants/config';
 import { useMealThumbnail } from '../hooks/useMealThumbnail';
-import { logMeal, pollMealStatus, getIngredientCandidates } from '../api/meals';
+import { logMeal, pollMealStatus, getIngredientCandidates, correctIngredients } from '../api/meals';
 import { ApiError } from '../api/client';
 import type { CorrectIngredientsResponse, IngredientCandidates } from '../api/types';
 
@@ -35,6 +35,12 @@ function sumMacros(dishes: { carbs_g: number; protein_g: number; fat_g: number; 
 }
 
 const CHART_HEIGHT = 186;
+
+// MOB-016 rev-2: below this, the breakdown auto-opens and CarbCorrection's
+// entry row goes warn-colored ("Fix the estimate") — matches results.jsx's
+// `unsure` state (confidence is stored 0-1; this constant is the design's
+// percentage form).
+const LOW_CONF = 70;
 
 const VERDICT_ICON: Record<string, React.ComponentProps<typeof Ionicons>['name']> = {
   spike: 'arrow-up',
@@ -193,12 +199,8 @@ export default function ResultsScreen() {
   const [confirmationText, setConfirmationText] = useState<string | null>(null);
   const originalCarbsRef = useRef<number | null>(null);
 
-  // Declared here (rather than beside compositeDishes below, its only other
-  // reader) because enterFixMode(), defined a few lines down, also needs to
-  // force the breakdown open when the user starts fixing an ingredient.
   const [showBreakdown, setShowBreakdown] = useState(false);
 
-  const [fixMode, setFixMode] = useState(false);
   const [candidates, setCandidates] = useState<IngredientCandidates | null>(null);
   const [candidatesLoading, setCandidatesLoading] = useState(false);
   const [fixedNames, setFixedNames] = useState<Set<string>>(new Set());
@@ -206,6 +208,71 @@ export default function ResultsScreen() {
   const [activeComponent, setActiveComponent] = useState<DishComponent | null>(null);
   const ingredientSheetRef = useRef<BottomSheetModal>(null);
   const addIngredientSheetRef = useRef<BottomSheetModal>(null);
+
+  // MOB-016 rev-2: one list, no fix mode. `removed` holds struck-through rows
+  // (the server's response drops a removed component entirely, but the
+  // design keeps it on screen, reversible) — display-only, figures captured
+  // at removal time, never recomputed. `swapOrigins` traces a swapped
+  // component back to what it originally was, so re-selecting "the current
+  // reading" in IngredientSheet can revert it. Both survive
+  // refreshAfterCorrection and are cleared by handleMacroReset.
+  const [removed, setRemoved] = useState<Map<string, { name: string; grams: number | null; carbs: number | null }>>(
+    new Map()
+  );
+  const [swapOrigins, setSwapOrigins] = useState<Map<string, string>>(new Map());
+
+  const slugify = (name: string) => name.trim().toLowerCase();
+
+  const fetchCandidatesOnce = useCallback(() => {
+    if (!candidates && mealId && cropId) {
+      setCandidatesLoading(true);
+      void getIngredientCandidates(mealId, cropId)
+        .then(setCandidates)
+        // GET /ingredient-candidates already fails closed to {alts:{},
+        // addable:[]} server-side; this catch only guards a network-level
+        // failure (no response at all) with the same empty shape.
+        .catch(() => setCandidates({ alts: {}, addable: [] }))
+        .finally(() => setCandidatesLoading(false));
+    }
+  }, [candidates, mealId, cropId]);
+
+  const toggleBreakdown = useCallback(() => {
+    setShowBreakdown((v) => {
+      const next = !v;
+      if (next) fetchCandidatesOnce();
+      return next;
+    });
+  }, [fetchCandidatesOnce]);
+
+  const unsure = confidence != null && confidence * 100 < LOW_CONF;
+  const autoOpenedRef = useRef(false);
+  useEffect(() => {
+    if (unsure && !autoOpenedRef.current) {
+      autoOpenedRef.current = true;
+      setShowBreakdown(true);
+      fetchCandidatesOnce();
+    }
+  }, [unsure, fetchCandidatesOnce]);
+
+  // navigation.navigate('Results', { mealId }) (HomeScreen/MealLogScreen)
+  // reuses this screen's existing mounted instance rather than remounting it
+  // when a second meal is scanned — without this reset, a correction made on
+  // meal A's dish (macroCorrected/confirmationText/fix-mode state) stayed on
+  // screen when meal B's results rendered, looking like the new dish had
+  // already been corrected.
+  useEffect(() => {
+    setMacroCorrected(false);
+    setConfirmationText(null);
+    originalCarbsRef.current = null;
+    setFixedNames(new Set());
+    setAddedNames(new Set());
+    setShowBreakdown(false);
+    setCandidates(null);
+    setActiveComponent(null);
+    setRemoved(new Map());
+    setSwapOrigins(new Map());
+    autoOpenedRef.current = false;
+  }, [mealId]);
 
   // Correction UI (and the whole feature) is pre-log only — see FOOD-016a /
   // plans/API-013-plan.md's "Pre-log only" section: POST /log-meal snapshots
@@ -236,47 +303,87 @@ export default function ResultsScreen() {
     setConfirmationText(null);
     setFixedNames(new Set());
     setAddedNames(new Set());
+    setRemoved(new Map());
+    setSwapOrigins(new Map());
     void refreshAfterCorrection(mealId);
   }, [mealId, refreshAfterCorrection]);
 
+  // MOB-016 rev-2: results.jsx renders these as independent, stacked
+  // confirmation lines driven straight off `excluded.length` /
+  // `Object.keys(swaps).length` (no combined string, no "added" line at
+  // all) — CarbCorrection derives the same lines itself off
+  // `removedCount`/`correctedCount` below, rather than this screen
+  // building one aggregate sentence.
   const handleIngredientsCorrected = useCallback(
     (
       _response: CorrectIngredientsResponse,
-      summary: string,
-      meta: { kind: 'swap'; name: string } | { kind: 'remove' } | { kind: 'add'; name: string }
+      _summary: string,
+      meta:
+        | { kind: 'swap'; name: string; fromName: string }
+        | { kind: 'remove'; name: string; grams: number | null; carbs: number | null }
+        | { kind: 'add'; name: string }
     ) => {
       if (!mealId) return;
       if (originalCarbsRef.current == null && macros) {
         originalCarbsRef.current = macros.carbs_g;
       }
       setMacroCorrected(true);
-      setConfirmationText(summary);
+
       if (meta.kind === 'swap') {
         setFixedNames((prev) => new Set(prev).add(meta.name));
+        setSwapOrigins((prev) => {
+          const next = new Map(prev);
+          const fromSlug = slugify(meta.fromName);
+          const toSlug = slugify(meta.name);
+          const chainOrigin = prev.get(fromSlug) ?? meta.fromName;
+          if (toSlug === slugify(chainOrigin)) {
+            // Swapped back to the true original — nothing left to revert.
+            next.delete(toSlug);
+          } else {
+            next.delete(fromSlug);
+            next.set(toSlug, chainOrigin);
+          }
+          return next;
+        });
       } else if (meta.kind === 'add') {
         setAddedNames((prev) => new Set(prev).add(meta.name));
+      } else if (meta.kind === 'remove') {
+        setRemoved((prev) =>
+          new Map(prev).set(slugify(meta.name), { name: meta.name, grams: meta.grams, carbs: meta.carbs })
+        );
       }
+
       void refreshAfterCorrection(mealId);
     },
     [mealId, macros, refreshAfterCorrection]
   );
 
-  const enterFixMode = useCallback(() => {
-    setFixMode(true);
-    setShowBreakdown(true);
-    if (!candidates && mealId && cropId) {
-      setCandidatesLoading(true);
-      void getIngredientCandidates(mealId, cropId)
-        .then(setCandidates)
-        // GET /ingredient-candidates already fails closed to {alts:{},
-        // addable:[]} server-side; this catch only guards a network-level
-        // failure (no response at all) with the same empty shape.
-        .catch(() => setCandidates({ alts: {}, addable: [] }))
-        .finally(() => setCandidatesLoading(false));
-    }
-  }, [candidates, mealId, cropId]);
-
-  const exitFixMode = useCallback(() => setFixMode(false), []);
+  const handleInclude = useCallback(
+    async (name: string) => {
+      if (!mealId || !cropId) return;
+      try {
+        await correctIngredients({
+          meal_id: mealId,
+          crop_id: cropId,
+          edits: [{ action: 'include', component_name: name }],
+        });
+        setRemoved((prev) => {
+          const next = new Map(prev);
+          next.delete(slugify(name));
+          return next;
+        });
+        if (originalCarbsRef.current == null && macros) {
+          originalCarbsRef.current = macros.carbs_g;
+        }
+        setMacroCorrected(true);
+        await refreshAfterCorrection(mealId);
+      } catch (err) {
+        const message = err instanceof ApiError ? err.message : "Couldn't restore — try again";
+        showToast(message);
+      }
+    },
+    [mealId, cropId, macros, refreshAfterCorrection]
+  );
 
   const openIngredientSheet = useCallback((component: DishComponent) => {
     setActiveComponent(component);
@@ -564,40 +671,44 @@ export default function ResultsScreen() {
                 mealId={mealId}
                 cropId={cropId}
                 corrected={macroCorrected}
+                unsure={unsure}
                 confirmationText={confirmationText}
+                removedCount={removed.size}
+                correctedCount={fixedNames.size}
                 onToast={showToast}
                 onCorrected={handleMacroCorrected}
                 onReset={handleMacroReset}
-                onOpenFixMode={enterFixMode}
               />
             )}
 
             {compositeDishes.length > 0 && (
               <View style={styles.breakdownToggle}>
-                <Text style={styles.breakdownToggleText}>
-                  {fixMode ? 'Which ingredient is wrong?' : `Breakdown · ${totalComponents} items`}
-                </Text>
-                {fixMode ? (
-                  <TouchableOpacity onPress={exitFixMode} hitSlop={8}>
-                    <Text style={styles.doneText}>Done</Text>
-                  </TouchableOpacity>
-                ) : (
-                  <TouchableOpacity onPress={() => setShowBreakdown((v) => !v)} hitSlop={8}>
-                    <Ionicons
-                      name={showBreakdown ? 'chevron-up' : 'chevron-down'}
-                      size={14}
-                      color={defaultPalette.inkSoft}
-                    />
-                  </TouchableOpacity>
-                )}
+                <Text style={styles.breakdownToggleText}>{`Breakdown · ${totalComponents + removed.size} items`}</Text>
+                <TouchableOpacity onPress={toggleBreakdown} hitSlop={8}>
+                  <Ionicons
+                    name={showBreakdown ? 'chevron-up' : 'chevron-down'}
+                    size={18}
+                    color={defaultPalette.inkFaint}
+                  />
+                </TouchableOpacity>
               </View>
             )}
 
-            {candidatesLoading && fixMode && (
+            {showBreakdown && (
+              <Text style={styles.breakdownHelperText}>
+                Tap any item to change the amount, correct it, or add what we missed.
+              </Text>
+            )}
+
+            {candidatesLoading && showBreakdown && (
               <Text style={styles.candidatesLoadingText}>Loading suggestions…</Text>
             )}
 
-            {showBreakdown && compositeDishes.map((dish) => (
+            {showBreakdown && compositeDishes.map((dish) => {
+              // MOB-015: a multi-dish meal can only have its primary dish's
+              // crop_id corrected until dish 2+ becomes visible.
+              const dishEditable = !loggedMeal && dish.crop_id === cropId && dish.portion_g != null;
+              return (
               <View key={dish.crop_id} style={styles.breakdownGroup}>
                 {compositeDishes.length > 1 && (
                   <Text style={styles.breakdownDishName} numberOfLines={1}>{formatDishName(dish.name)}</Text>
@@ -605,23 +716,27 @@ export default function ResultsScreen() {
                 {(dish.components ?? []).map((component, idx) => {
                   const grams = componentGrams(component, dish.portion_g);
                   const carbs = componentCarbs(component, dish.portion_g);
-                  // MOB-015: a multi-dish meal can only have its primary
-                  // dish's crop_id corrected until dish 2+ becomes visible.
-                  const editable = fixMode && !loggedMeal && dish.crop_id === cropId;
+                  const swapped = fixedNames.has(component.name);
                   const rowInner = (
                     <>
                       <Text style={styles.componentName} numberOfLines={1}>{formatDishName(component.name)}</Text>
                       {grams != null && <Text style={styles.componentGrams}>{Math.round(grams)}g</Text>}
-                      <Text style={styles.componentCarbs}>
+                      <Text style={[styles.componentCarbs, swapped && styles.componentCarbsBrand]}>
                         {carbs != null ? `${Math.round(carbs)}g carbs` : '—'}
                       </Text>
-                      {component.macro_source !== 'usda_api' && (
-                        <View style={styles.estimatedBadge}>
-                          <Ionicons name="flask-outline" size={9} color={defaultPalette.inkSoft} />
-                          <Text style={styles.estimatedBadgeText}>estimated</Text>
+                      {component.macro_source !== 'usda_api' && !swapped && (
+                        <View style={[styles.estimatedBadge, unsure && styles.estimatedBadgeUnsure]}>
+                          <Ionicons
+                            name="flask-outline"
+                            size={9}
+                            color={unsure ? defaultPalette.warn.deep : defaultPalette.inkFaint}
+                          />
+                          <Text style={[styles.estimatedBadgeText, unsure && styles.estimatedBadgeTextUnsure]}>
+                            est
+                          </Text>
                         </View>
                       )}
-                      {fixedNames.has(component.name) && (
+                      {swapped && (
                         <View style={styles.fixedBadge}>
                           <Text style={styles.fixedBadgeText}>fixed</Text>
                         </View>
@@ -631,38 +746,65 @@ export default function ResultsScreen() {
                           <Text style={styles.fixedBadgeText}>added</Text>
                         </View>
                       )}
-                      {editable && (
-                        <Ionicons name="chevron-forward" size={12} color={defaultPalette.inkFaint} />
+                      {dishEditable && (
+                        <Ionicons
+                          name={swapped ? 'checkmark' : 'chevron-forward'}
+                          size={15}
+                          color={swapped ? defaultPalette.brand : defaultPalette.inkFaint}
+                          style={styles.componentTrailingIcon}
+                        />
                       )}
                     </>
                   );
-                  return editable ? (
+                  return dishEditable ? (
                     <TouchableOpacity
                       key={`${dish.crop_id}-${idx}`}
-                      style={styles.componentRow}
+                      style={[styles.componentRow, swapped && styles.componentRowBrand]}
                       onPress={() => openIngredientSheet(component)}
                       activeOpacity={0.7}
                     >
                       {rowInner}
                     </TouchableOpacity>
                   ) : (
-                    <View key={`${dish.crop_id}-${idx}`} style={styles.componentRow}>
+                    <View key={`${dish.crop_id}-${idx}`} style={[styles.componentRow, swapped && styles.componentRowBrand]}>
                       {rowInner}
                     </View>
                   );
                 })}
-                {fixMode && !loggedMeal && dish.crop_id === cropId && (
+                {dishEditable &&
+                  Array.from(removed.values()).map((row) => (
+                    <View key={`removed-${slugify(row.name)}`} style={[styles.componentRow, styles.removedRow]}>
+                      <Text style={[styles.componentName, styles.removedText]} numberOfLines={1}>
+                        {formatDishName(row.name)}
+                      </Text>
+                      {row.grams != null && (
+                        <Text style={[styles.componentGrams, styles.removedText]}>{Math.round(row.grams)}g</Text>
+                      )}
+                      <Text style={[styles.componentCarbs, styles.removedText]}>
+                        {row.carbs != null ? `${Math.round(row.carbs)}g carbs` : '—'}
+                      </Text>
+                      <TouchableOpacity
+                        onPress={() => handleInclude(row.name)}
+                        hitSlop={8}
+                        style={styles.componentTrailingIcon}
+                      >
+                        <Ionicons name="close" size={15} color={defaultPalette.inkFaint} />
+                      </TouchableOpacity>
+                    </View>
+                  ))}
+                {dishEditable && (
                   <TouchableOpacity
                     style={styles.addComponentRow}
                     onPress={openAddIngredientSheet}
                     activeOpacity={0.7}
                   >
-                    <Ionicons name="add-circle-outline" size={14} color={defaultPalette.brand} />
+                    <Ionicons name="add" size={15} color={defaultPalette.brand} />
                     <Text style={styles.addComponentText}>Something's missing</Text>
                   </TouchableOpacity>
                 )}
               </View>
-            ))}
+              );
+            })}
 
             {dishesMissingMacros.length > 0 && (
               <View style={styles.macroWarning}>
@@ -736,6 +878,7 @@ export default function ResultsScreen() {
           component={activeComponent}
           dish={dishes.find((d) => d.crop_id === cropId) ?? null}
           candidates={activeComponent ? candidates?.alts[activeComponent.name] ?? [] : []}
+          originalName={activeComponent ? swapOrigins.get(slugify(activeComponent.name)) ?? null : null}
           onToast={showToast}
           onCorrected={handleIngredientsCorrected}
         />
@@ -1008,10 +1151,18 @@ const styles = StyleSheet.create({
     fontWeight: fontWeight.medium,
     color: defaultPalette.inkSoft,
   },
-  doneText: {
+  breakdownHelperText: {
     fontSize: fontSize.xs,
-    fontWeight: fontWeight.semibold,
-    color: defaultPalette.brand,
+    color: defaultPalette.inkFaint,
+    marginTop: spacing.xs,
+  },
+  removedRow: {
+    backgroundColor: defaultPalette.surfaceSoft,
+    opacity: 0.7,
+  },
+  removedText: {
+    color: defaultPalette.inkFaint,
+    textDecorationLine: 'line-through',
   },
   candidatesLoadingText: {
     fontSize: fontSize.xs,
@@ -1030,65 +1181,86 @@ const styles = StyleSheet.create({
   componentRow: {
     flexDirection: 'row',
     alignItems: 'center',
+    gap: spacing.xs,
+    minHeight: 44,
+    backgroundColor: defaultPalette.surface,
+    borderWidth: 1.5,
+    borderColor: defaultPalette.hair,
+    borderRadius: radius.md,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: spacing.xs,
     marginBottom: spacing.xs,
+  },
+  componentRowBrand: {
+    borderColor: defaultPalette.brand,
   },
   componentName: {
     flex: 1,
-    fontSize: fontSize.xs,
+    fontSize: fontSize.sm,
     color: defaultPalette.ink,
-    marginRight: spacing.xs,
   },
   componentGrams: {
     fontSize: fontSize.xs,
     color: defaultPalette.inkFaint,
-    marginRight: spacing.sm,
   },
   componentCarbs: {
-    fontSize: fontSize.xs,
-    color: defaultPalette.inkSoft,
-    fontWeight: fontWeight.medium,
+    fontSize: fontSize.sm,
+    color: defaultPalette.ink,
+    fontWeight: fontWeight.semibold,
   },
+  componentCarbsBrand: {
+    color: defaultPalette.brand,
+  },
+  componentTrailingIcon: {},
   estimatedBadge: {
     flexDirection: 'row',
     alignItems: 'center',
     backgroundColor: defaultPalette.surfaceSoft,
+    borderWidth: 1,
+    borderColor: defaultPalette.hair,
     borderRadius: radius.full,
     paddingHorizontal: spacing.xs,
-    paddingVertical: 1,
-    marginLeft: spacing.xs,
+    paddingVertical: 2,
+  },
+  estimatedBadgeUnsure: {
+    backgroundColor: defaultPalette.warn.tint,
+    borderColor: defaultPalette.warn.ring,
   },
   estimatedBadgeText: {
-    fontSize: 9,
-    color: defaultPalette.inkSoft,
-    marginLeft: 2,
+    fontSize: fontSize.xs,
+    color: defaultPalette.inkFaint,
+    marginLeft: 3,
+  },
+  estimatedBadgeTextUnsure: {
+    color: defaultPalette.warn.deep,
   },
   fixedBadge: {
     backgroundColor: defaultPalette.brand,
     borderRadius: radius.full,
     paddingHorizontal: spacing.xs,
-    paddingVertical: 1,
-    marginLeft: spacing.xs,
+    paddingVertical: 2,
   },
   fixedBadgeText: {
-    fontSize: 9,
+    fontSize: fontSize.xs,
     color: '#fff',
-    fontWeight: fontWeight.medium,
+    fontWeight: fontWeight.semibold,
   },
   addComponentRow: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.xs,
     minHeight: 44,
-    marginTop: spacing.xs,
-    borderWidth: 1,
+    marginTop: spacing.xs / 2,
+    borderWidth: 1.5,
     borderStyle: 'dashed',
     borderColor: defaultPalette.hair,
     borderRadius: radius.md,
     paddingHorizontal: spacing.sm,
-    gap: spacing.xs / 2,
   },
   addComponentText: {
-    fontSize: fontSize.xs,
-    fontWeight: fontWeight.medium,
+    fontSize: fontSize.sm,
+    fontWeight: fontWeight.semibold,
     color: defaultPalette.brand,
   },
   carbsUpdatedRow: {
