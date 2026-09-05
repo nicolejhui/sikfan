@@ -8,8 +8,9 @@ import { defaultPalette, spacing, radius, fontSize, fontWeight } from '../consta
 import { correctIngredients } from '../api/meals';
 import { ApiError } from '../api/client';
 import type { CorrectIngredientsResponse, IngredientCandidate } from '../api/types';
-import { formatDishName } from '../store/types';
+import { formatDishName, componentGrams, componentCarbs } from '../store/types';
 import type { DishComponent, DishResult } from '../store/types';
+import AmountStepper, { FRACTIONS, DEFAULT_FRACTION_INDEX } from './AmountStepper';
 
 interface IngredientSheetProps {
   sheetRef: React.RefObject<BottomSheetModal | null>;
@@ -34,12 +35,15 @@ interface IngredientSheetProps {
     meta:
       | { kind: 'swap'; name: string; fromName: string }
       | { kind: 'remove'; name: string; grams: number | null; carbs: number | null }
+      | { kind: 'resize'; name: string; fromGrams: number | null; toGrams: number | null }
   ) => void;
 }
 
-function componentGrams(component: DishComponent, dishPortionG: number | null): number | null {
-  if (dishPortionG == null) return null;
-  return component.proportion * dishPortionG;
+// grams rounded to the nearest 5 — the underlying number comes from a
+// pixel-area estimate times a category density, so displaying e.g. `262.5 g`
+// would be false precision (plans/MOB-018-plan.md Ticket 2).
+function roundedStagedGrams(scannedGrams: number, fraction: number): number {
+  return Math.round((scannedGrams * fraction) / 5) * 5;
 }
 
 export default function IngredientSheet({
@@ -56,12 +60,14 @@ export default function IngredientSheet({
   const [submitting, setSubmitting] = useState(false);
   const [removed, setRemoved] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [fractionIndex, setFractionIndex] = useState(DEFAULT_FRACTION_INDEX);
 
   const handleSheetChange = useCallback((index: number) => {
     if (index < 0) {
       setSubmitting(false);
       setRemoved(false);
       setError(null);
+      setFractionIndex(DEFAULT_FRACTION_INDEX);
     }
   }, []);
 
@@ -76,12 +82,19 @@ export default function IngredientSheet({
   const carbs = component && grams != null ? (component.per_100g.carbs_g * grams) / 100 : null;
   const onlyComponent = (dish?.components?.length ?? 0) <= 1;
 
+  const stagedFraction = FRACTIONS[fractionIndex];
+  const stagedGrams = grams != null ? roundedStagedGrams(grams, stagedFraction) : null;
+  const stagedCarbs =
+    component && stagedGrams != null ? (component.per_100g.carbs_g * stagedGrams) / 100 : null;
+  const amountChanged = fractionIndex !== DEFAULT_FRACTION_INDEX;
+
   const submit = async (
     payload: Parameters<typeof correctIngredients>[0]['edits'],
     summary: string,
     meta:
       | { kind: 'swap'; name: string; fromName: string }
       | { kind: 'remove'; name: string; grams: number | null; carbs: number | null }
+      | { kind: 'resize'; name: string; fromGrams: number | null; toGrams: number | null }
   ) => {
     setSubmitting(true);
     setError(null);
@@ -107,6 +120,15 @@ export default function IngredientSheet({
     );
   };
 
+  const handleSaveAmount = () => {
+    if (submitting || !component || stagedGrams == null) return;
+    void submit(
+      [{ action: 'set_amount', component_name: component.name, grams: stagedGrams }],
+      '1 ingredient corrected · projection updated',
+      { kind: 'resize', name: component.name, fromGrams: grams, toGrams: stagedGrams }
+    ).then(() => setFractionIndex(DEFAULT_FRACTION_INDEX));
+  };
+
   const handleRemove = () => {
     if (submitting || onlyComponent || !component) return;
     setRemoved(true);
@@ -120,7 +142,7 @@ export default function IngredientSheet({
   return (
     <BottomSheetModal
       ref={sheetRef}
-      snapPoints={['62%']}
+      snapPoints={['78%']}
       enablePanDownToClose
       onChange={handleSheetChange}
       backdropComponent={renderBackdrop}
@@ -134,6 +156,36 @@ export default function IngredientSheet({
           {grams != null ? `${Math.round(grams)}g` : '—'}
           {carbs != null ? ` · ${Math.round(carbs)}g carbs as scanned` : ''}
         </Text>
+
+        {grams != null && (
+          <>
+            <Text style={styles.sectionLabel}>How much was actually there?</Text>
+            <AmountStepper
+              index={fractionIndex}
+              onChange={setFractionIndex}
+              grams={stagedGrams}
+              disabled={submitting}
+            />
+            {amountChanged && stagedCarbs != null && carbs != null && (
+              <Text style={styles.amountPreview}>
+                {stagedCarbs >= carbs ? '+' : ''}
+                {Math.round(stagedCarbs - carbs)}g carbs
+              </Text>
+            )}
+            <TouchableOpacity
+              style={[styles.saveAmountButton, (!amountChanged || submitting) && styles.saveAmountButtonDisabled]}
+              onPress={handleSaveAmount}
+              disabled={!amountChanged || submitting}
+              activeOpacity={0.85}
+            >
+              {submitting ? (
+                <ActivityIndicator size="small" color={defaultPalette.surface} />
+              ) : (
+                <Text style={styles.saveAmountText}>Save amount</Text>
+              )}
+            </TouchableOpacity>
+          </>
+        )}
 
         <Text style={styles.sectionLabel}>What is it actually?</Text>
         <View style={styles.radioList}>
@@ -239,6 +291,27 @@ const styles = StyleSheet.create({
     color: defaultPalette.inkSoft,
     marginTop: spacing.md,
     marginBottom: spacing.xs,
+  },
+  amountPreview: {
+    fontSize: fontSize.xs,
+    color: defaultPalette.inkSoft,
+    marginTop: spacing.xs,
+  },
+  saveAmountButton: {
+    marginTop: spacing.sm,
+    minHeight: 44,
+    borderRadius: radius.md,
+    backgroundColor: defaultPalette.brand,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  saveAmountButtonDisabled: {
+    opacity: 0.4,
+  },
+  saveAmountText: {
+    fontSize: fontSize.sm,
+    fontWeight: fontWeight.semibold,
+    color: defaultPalette.surface,
   },
   radioList: {
     gap: spacing.xs,

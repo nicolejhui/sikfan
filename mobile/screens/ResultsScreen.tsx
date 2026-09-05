@@ -9,7 +9,7 @@ import { useNavigation, useRoute } from '@react-navigation/native';
 
 import { defaultPalette, verdictColor, spacing, radius, fontSize, fontWeight } from '../constants/theme';
 import { useMealStore, useGlucoseStore, useHistoryStore } from '../store';
-import { formatDishName, formatPortion, verdictWord } from '../store/types';
+import { formatDishName, formatPortion, verdictWord, componentGrams, componentCarbs } from '../store/types';
 import type { DishComponent } from '../store/types';
 import ConfirmDishSheet from '../components/ConfirmDishSheet';
 import GlucosePad from '../components/GlucosePad';
@@ -47,23 +47,6 @@ const VERDICT_ICON: Record<string, React.ComponentProps<typeof Ionicons>['name']
   steady: 'pulse',
   drop: 'arrow-down',
 };
-
-// FOOD-019: grams/carbs for one decomposed component, derived from the
-// parent dish's own portion_g (the pixel-based estimate) — the decomposer
-// itself never supplies absolute grams, only proportion. Null when the
-// parent dish has no portion_g (component grams then can't be derived; the
-// carbs-per-component figure still can, scaled off proportion alone, so it
-// is computed independently rather than gated on grams being available).
-function componentGrams(component: DishComponent, dishPortionG: number | null): number | null {
-  if (dishPortionG == null) return null;
-  return component.proportion * dishPortionG;
-}
-
-function componentCarbs(component: DishComponent, dishPortionG: number | null): number | null {
-  const grams = componentGrams(component, dishPortionG);
-  if (grams == null) return null;
-  return (component.per_100g.carbs_g * grams) / 100;
-}
 
 function MacroBar({ label, value, max, color }: { label: string; value: number; max: number; color: string }) {
   const pct = max > 0 ? Math.min(100, (value / max) * 100) : 0;
@@ -220,6 +203,10 @@ export default function ResultsScreen() {
     new Map()
   );
   const [swapOrigins, setSwapOrigins] = useState<Map<string, string>>(new Map());
+  // MOB-018: a resize counts with "corrected" for CarbCorrection's aggregate
+  // confirmation line (plans/MOB-018-plan.md Ticket 2), tracked separately
+  // from fixedNames so a pure amount edit doesn't pick up the "fixed" badge.
+  const [resizedNames, setResizedNames] = useState<Set<string>>(new Set());
 
   const slugify = (name: string) => name.trim().toLowerCase();
 
@@ -271,6 +258,7 @@ export default function ResultsScreen() {
     setActiveComponent(null);
     setRemoved(new Map());
     setSwapOrigins(new Map());
+    setResizedNames(new Set());
     autoOpenedRef.current = false;
   }, [mealId]);
 
@@ -305,6 +293,7 @@ export default function ResultsScreen() {
     setAddedNames(new Set());
     setRemoved(new Map());
     setSwapOrigins(new Map());
+    setResizedNames(new Set());
     void refreshAfterCorrection(mealId);
   }, [mealId, refreshAfterCorrection]);
 
@@ -322,6 +311,7 @@ export default function ResultsScreen() {
         | { kind: 'swap'; name: string; fromName: string }
         | { kind: 'remove'; name: string; grams: number | null; carbs: number | null }
         | { kind: 'add'; name: string }
+        | { kind: 'resize'; name: string; fromGrams: number | null; toGrams: number | null }
     ) => {
       if (!mealId) return;
       if (originalCarbsRef.current == null && macros) {
@@ -351,6 +341,8 @@ export default function ResultsScreen() {
         setRemoved((prev) =>
           new Map(prev).set(slugify(meta.name), { name: meta.name, grams: meta.grams, carbs: meta.carbs })
         );
+      } else if (meta.kind === 'resize') {
+        setResizedNames((prev) => new Set(prev).add(meta.name));
       }
 
       void refreshAfterCorrection(mealId);
@@ -674,7 +666,7 @@ export default function ResultsScreen() {
                 unsure={unsure}
                 confirmationText={confirmationText}
                 removedCount={removed.size}
-                correctedCount={fixedNames.size}
+                correctedCount={fixedNames.size + resizedNames.size}
                 onToast={showToast}
                 onCorrected={handleMacroCorrected}
                 onReset={handleMacroReset}

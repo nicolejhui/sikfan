@@ -67,13 +67,13 @@ export interface CorrectMacrosResponse {
   dish: DishResult;
 }
 
-export type IngredientEditAction = 'remove' | 'swap' | 'add' | 'include';
+export type IngredientEditAction = 'remove' | 'swap' | 'add' | 'include' | 'set_amount';
 
 export interface IngredientEdit {
   action: IngredientEditAction;
   component_name: string;
   replacement_name?: string;  // required for "swap"
-  grams?: number;             // required for "add" — positive only
+  grams?: number;             // required for "add" and "set_amount" — positive only
 }
 
 export interface CorrectIngredientsRequest {
