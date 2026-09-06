@@ -21,6 +21,8 @@ interface RequestOptions {
   headers?: Record<string, string>;
 }
 
+const REQUEST_TIMEOUT_MS = 15000;
+
 interface ExtractedError {
   message: string;
   code?: string;
@@ -45,11 +47,25 @@ export async function apiFetch(path: string, options: RequestOptions = {}): Prom
   const headers: Record<string, string> = { ...options.headers };
   if (API_KEY) headers['X-API-Key'] = API_KEY;
 
-  const response = await fetch(`${BASE_URL}${path}`, {
-    method: options.method ?? 'GET',
-    body: options.body,
-    headers,
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  let response: Response;
+  try {
+    response = await fetch(`${BASE_URL}${path}`, {
+      method: options.method ?? 'GET',
+      body: options.body,
+      headers,
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new ApiError(0, 'Request timed out — try again.');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (!response.ok) {
     const { message, code } = await extractError(response);

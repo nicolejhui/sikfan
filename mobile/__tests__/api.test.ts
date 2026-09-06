@@ -1,9 +1,18 @@
-jest.mock('expo-file-system', () => ({
-  cacheDirectory: '/tmp/',
-  downloadAsync: jest.fn(),
-}));
+jest.mock('expo-file-system', () => {
+  class MockFile extends Blob {
+    uri: string;
+    constructor(a: string, b?: string) {
+      super();
+      this.uri = b !== undefined ? `${a}/${b}` : a;
+    }
+  }
+  return {
+    File: Object.assign(MockFile, { downloadFileAsync: jest.fn() }),
+    Paths: { cache: '/tmp' },
+  };
+});
 
-const downloadAsync = require('expo-file-system').downloadAsync as jest.Mock;
+const downloadFileAsync = require('expo-file-system').File.downloadFileAsync as jest.Mock;
 
 let ApiError: typeof import('../api/client').ApiError;
 let submitMeal: typeof import('../api/meals').submitMeal;
@@ -39,7 +48,7 @@ beforeAll(() => {
 
 beforeEach(() => {
   global.fetch = jest.fn();
-  downloadAsync.mockReset();
+  downloadFileAsync.mockReset();
 });
 
 function mockJsonResponse(status: number, body: unknown) {
@@ -105,14 +114,14 @@ test('analyzeGlucose GETs /glucose/{meal_id}', async () => {
 });
 
 test('getMealImage downloads with the API key header and returns the local file URI', async () => {
-  downloadAsync.mockResolvedValue({ uri: 'file:///tmp/meal-meal_1.jpg', status: 200 });
+  downloadFileAsync.mockResolvedValue({ uri: 'file:///tmp/meal-meal_1.jpg' });
 
   const uri = await getMealImage('meal_1');
 
   expect(uri).toBe('file:///tmp/meal-meal_1.jpg');
-  const [url, targetPath, options] = downloadAsync.mock.calls[0];
+  const [url, destination, options] = downloadFileAsync.mock.calls[0];
   expect(url).toBe('https://api.example.com/meal-image/meal_1');
-  expect(targetPath).toBe('/tmp/meal-meal_1.jpg');
+  expect(destination.uri).toBe('/tmp/meal-meal_1.jpg');
   expect(options.headers['X-API-Key']).toBe('test-key');
 });
 
@@ -262,6 +271,31 @@ test('resetCorrections POSTs meal_id/crop_id as JSON to /reset-corrections', asy
   expect(url).toBe('https://api.example.com/reset-corrections');
   expect(options.method).toBe('POST');
   expect(JSON.parse(options.body)).toEqual({ meal_id: 'meal_1', crop_id: 'crop_0' });
+});
+
+test('apiFetch aborts and throws a timeout ApiError when the request never resolves', async () => {
+  jest.useFakeTimers();
+  (global.fetch as jest.Mock).mockImplementation(
+    (_url: string, options: { signal: AbortSignal }) =>
+      new Promise((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => {
+          const err = new Error('Aborted');
+          err.name = 'AbortError';
+          reject(err);
+        });
+      })
+  );
+
+  const pending = pollMealStatus('meal_1');
+  const assertion = expect(pending).rejects.toMatchObject({
+    status: 0,
+    message: 'Request timed out — try again.',
+  });
+
+  await jest.advanceTimersByTimeAsync(15000);
+  await assertion;
+
+  jest.useRealTimers();
 });
 
 test('correctMacros throws ApiError with the server code on a 422 empty_dish-style rejection', async () => {
