@@ -505,11 +505,16 @@ The design's own framing:
       corrections exist) and has a close (X) button beside "Do the carbs look
       right?"
 - [ ] Segmented control: **Too high · Looks right · Too low**
-- [ ] Reason chips filtered by direction, so no nonsensical pair is offered —
-      too high → *Portion was smaller* / *It's mostly broth* / *Not eating the
-      full portion*; too low → *Portion was bigger* / *More food than it looks*
-- [ ] Magnitude chips *A little* / *A lot*; picking a reason pre-selects
-      "little" (`results.jsx:611`)
+- [ ] Magnitude chips *A little* / *A lot* shown for both `too_high` and
+      `too_low`, direction + magnitude only
+- [ ] **(FOOD-023, superseding the reason-chip row originally specified
+      here)** No reason chips — `portion`/`broth`/`hidden` are cut. `too_high`
+      alone carries one checkbox, "Just this meal — I'm not finishing it"
+      (`leftover` scope, not a reason); `too_low` has no extra control. A
+      claim about one ingredient's grams (the old *It's mostly broth* /
+      *More food than it looks* chips) goes through the ingredient sheet's
+      "How much was actually there?" instead, which teaches the portion
+      prior too as of FOOD-022
 - [ ] "Undo all corrections" appears once anything is corrected →
       `POST /reset-corrections`. No fix-mode footer link — see rev-2 below
 - [ ] "Undo all corrections" reverts the carb correction **and** any ingredient

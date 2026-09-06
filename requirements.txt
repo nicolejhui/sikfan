@@ -9,3 +9,5 @@ pandas
 scikit-learn
 matplotlib
 requests
+pytest
+pytest-mock

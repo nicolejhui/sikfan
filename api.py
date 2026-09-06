@@ -18,7 +18,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, UploadFile
@@ -50,7 +50,13 @@ from pipeline.glucose_store import save_cgm_reading
 from pipeline.macro_lookup import lookup_macros, select_candidate
 from pipeline.nutrition import CACHE_DIR as _MACRO_CACHE_DIR
 from pipeline.nutrition import _atomic_write as _write_macro_cache_entry
-from pipeline.portion import _FACTORS, save_portion_prior, scale_macros, touch_portion_prior
+from pipeline.portion import (
+    _FACTORS,
+    PRIOR_CONTRIBUTION_TOLERANCE,
+    save_portion_prior,
+    scale_macros,
+    touch_portion_prior,
+)
 from pipeline.segmentation import _get_model, segment_meal
 
 _log = logging.getLogger(__name__)
@@ -340,7 +346,12 @@ class CorrectMacrosRequest(BaseModel):
     meal_id: str
     crop_id: str
     direction: Literal["too_high", "too_low", "looks_right"]
-    reason: Literal["portion", "broth", "hidden", "leftover"] | None = None
+    # FOOD-023: narrowed from {"portion", "broth", "hidden", "leftover"} —
+    # "broth"/"hidden" moved to the ingredient-edit flow (which now also
+    # teaches the portion prior, via FOOD-022). "leftover" survives as a
+    # scope checkbox, not a reason chip: it says "just this meal", not
+    # "this dish is systematically mis-estimated".
+    reason: Literal["portion", "leftover"] | None = None
     magnitude: Literal["little", "lot"] | None = None
 
 
@@ -1198,6 +1209,62 @@ def _write_corrected(status_path: Path, job: dict, dishes: list[dict]) -> None:
     _write_job_status(status_path, job)
 
 
+def _contribute_prior(dish_entry: dict, dish_name: str) -> Optional[dict]:
+    """FOOD-022: derive this crop's ONE portion-prior contribution from the
+    ratio of its CURRENT portion_g to the pristine baseline scan value, and
+    write it through save_portion_prior()'s supersedes path so N edits to one
+    crop register as one restated claim, not N pieces of evidence (D1/D2).
+
+    Called from both correct_macros (after it applies its _FACTORS-derived
+    portion_g) and correct_ingredients (after it applies its edits) — one
+    write path into one slot per crop, so a session touching both flows
+    can't double-count (D3). Reason is always "portion" (D5); direction is
+    the sign of the ratio.
+
+    Must run AFTER dish_entry['portion_g'] reflects the correction just
+    applied, and AFTER _snapshot_baseline() has run at least once this crop.
+
+    Returns the written prior record, or None when nothing was written:
+    no baseline yet, or a below-tolerance edit with no prior contribution to
+    revise (D6).
+    """
+    baseline = dish_entry.get("_baseline")
+    if baseline is None:
+        return None
+    baseline_portion_g = baseline.get("portion_g")
+    new_portion_g = dish_entry.get("portion_g")
+    if not baseline_portion_g or new_portion_g is None:
+        return None
+
+    prev_contribution = dish_entry.get("_prior_contribution")
+
+    if dish_entry.get("_prior_suppressed"):
+        # A leftover correction on this crop suppresses derived contributions
+        # (FOOD-022 D4) — retract whatever this crop already contributed,
+        # since "I'm not finishing this" and a durable size claim can't both
+        # stand for the same crop. Failing toward not learning is the safe
+        # direction here.
+        if prev_contribution is None:
+            return None
+        record = save_portion_prior(dish_name, 1.0, "portion", "too_high", supersedes=prev_contribution)
+        dish_entry.pop("_prior_contribution", None)
+        return record
+
+    factor = new_portion_g / baseline_portion_g
+
+    if prev_contribution is None and abs(factor - 1.0) < PRIOR_CONTRIBUTION_TOLERANCE:
+        return None
+
+    direction = "too_low" if factor > 1.0 else "too_high"
+    record = save_portion_prior(dish_name, factor, "portion", direction, supersedes=prev_contribution)
+
+    if abs(factor - 1.0) < PRIOR_CONTRIBUTION_TOLERANCE:
+        dish_entry.pop("_prior_contribution", None)  # stepped back to baseline -> retracted
+    else:
+        dish_entry["_prior_contribution"] = factor
+    return record
+
+
 _MACRO_CORRECTION_LOG_PATH = "data/macro_correction_log.jsonl"
 
 
@@ -1355,14 +1422,17 @@ def confirm_dish(body: ConfirmDishRequest):
 def correct_macros(body: CorrectMacrosRequest):
     """Scalar "does this look right?" correction — scales portion_g by a
     factor from pipeline.portion._FACTORS and recomputes macros wholesale.
-    Every correction (looks_right included) is passed to save_portion_prior();
-    the store — not this route — decides whether it persists (FOOD-020 D4)."""
-    if body.direction != "looks_right" and (body.reason is None or body.magnitude is None):
+    FOOD-023: direction + magnitude only, no reason chips — `reason` is now
+    just the "leftover" scope checkbox (too_high only) and is otherwise
+    omitted. `looks_right` and every directional correction still route
+    through _contribute_prior()/save_portion_prior(); the store — not this
+    route — decides whether it persists (FOOD-020 D4)."""
+    if body.direction != "looks_right" and body.magnitude is None:
         raise HTTPException(
             status_code=400,
             detail={
                 "code": "missing_correction_detail",
-                "message": "reason and magnitude are required unless direction is looks_right.",
+                "message": "magnitude is required unless direction is looks_right.",
             },
         )
 
@@ -1404,15 +1474,21 @@ def correct_macros(body: CorrectMacrosRequest):
     factor = _FACTORS[(body.direction, body.magnitude)]
     new_portion_g = round(old_portion_g * factor, 1)
 
-    record = save_portion_prior(dish_name, factor, body.reason, body.direction)
-    prior_state = record.get("prior_state")
-    multiplier_persisted = (
-        record.get("portion_multiplier") if prior_state in ("activated", "compounded") else None
-    )
-
     dish_entry["portion_g"] = new_portion_g
     dish_entry.update(_recompute_dish_macros(dish_name, new_portion_g))
     new_carbs_g = dish_entry["carbs_g"]
+
+    # FOOD-022: the prior CONTRIBUTION is always derived from the resulting
+    # grams vs. the pristine baseline (not from _FACTORS' discrete multiplier
+    # applied to old_portion_g) — this is the same slot correct_ingredients
+    # writes through, so a session touching both flows nets to one claim
+    # (D3). "leftover" describes the meal, not the dish (D4): it suppresses
+    # this crop's contribution rather than teaching a permanent under-count.
+    if body.reason == "leftover":
+        dish_entry["_prior_suppressed"] = True
+    record = _contribute_prior(dish_entry, dish_name)
+    prior_state = record.get("prior_state") if record else "unchanged"
+    multiplier_persisted = record.get("portion_multiplier") if record else None
 
     _write_corrected(status_path, job, dishes)
 
@@ -1638,6 +1714,12 @@ def correct_ingredients(body: CorrectIngredientsRequest):
     dish_entry["carb_coverage"] = folded["carb_coverage"]
     new_carbs_g = dish_entry["carbs_g"]
 
+    # FOOD-022: teach the dish's SIZE, not just its shape — an ingredient
+    # edit changes total grams but taught nothing durable before this. Same
+    # slot correct_macros writes through (D3), so a session touching both
+    # flows nets to one claim rather than double-counting.
+    prior_record = _contribute_prior(dish_entry, dish_name)
+
     _write_corrected(status_path, job, dishes)
 
     # Step 7: persist the edited breakdown so the next scan starts from it —
@@ -1650,14 +1732,18 @@ def correct_ingredients(body: CorrectIngredientsRequest):
     composite_cache_entry["source"] = "composite"
     _write_macro_cache_entry(_MACRO_CACHE_DIR / f"{normalize_dish_name(dish_name)}.json", composite_cache_entry)
 
+    baseline_portion_g = dish_entry.get("_baseline", {}).get("portion_g")
+    contributed_factor = new_portion_g / baseline_portion_g if baseline_portion_g else None
+
     _log_macro_correction({
         "timestamp": datetime.now(timezone.utc).isoformat(), "meal_id": body.meal_id,
         "crop_id": body.crop_id, "dish_name": dish_name, "flow": "ingredient",
-        "direction": None, "reason": None, "magnitude": None, "factor": None,
+        "direction": None, "reason": None, "magnitude": None, "factor": contributed_factor,
         "edits": [e.model_dump() for e in body.edits],
         "old_portion_g": old_portion_g, "new_portion_g": new_portion_g,
         "old_carbs_g": old_carbs_g, "new_carbs_g": new_carbs_g,
-        "multiplier_persisted": None, "prior_state": None,
+        "multiplier_persisted": prior_record.get("portion_multiplier") if prior_record else None,
+        "prior_state": prior_record.get("prior_state") if prior_record else None,
     })
 
     return CorrectIngredientsResponse(
@@ -1704,8 +1790,12 @@ def get_ingredient_candidates(meal_id: str, crop_id: str):
 def reset_corrections(body: ResetCorrectionsRequest):
     """Undo all — restores a dish's macros/portion/components from the
     snapshot taken on its first correction. Reverts an edited decomposition
-    (if any) but deliberately leaves a persisted portion prior in place —
-    see plans/API-013-plan.md, "What Undo all reverts — stated exhaustively"."""
+    (if any). Also retracts this crop's derived portion-prior contribution
+    (FOOD-022): the prior is computed FROM the numbers this route just threw
+    away, so keeping it would preserve a conclusion whose entire evidence was
+    deleted — see plans/FOOD-022-plan.md, "Open decision — what 'Undo all'
+    does to a derived prior" (superseding API-013-plan.md's original
+    always-retain decision, made before a prior could be derived)."""
     status_path, job, dish_entry = _resolve_dish_entry(body.meal_id, body.crop_id)
     dishes = (job.get("result") or {}).get("dishes") or []
     dish_name = dish_entry["name"]
@@ -1749,9 +1839,22 @@ def reset_corrections(body: ResetCorrectionsRequest):
             composite_cache_path.unlink(missing_ok=True)
         decomposition_reverted = True
 
+    # FOOD-022: retract this crop's derived contribution BEFORE the baseline
+    # restore loop below clears _prior_contribution — its evidence (the
+    # corrected numbers) is about to be deleted.
+    prior_contribution = dish_entry.get("_prior_contribution")
+    prior_retracted_record = None
+    if prior_contribution is not None:
+        prior_retracted_record = save_portion_prior(
+            dish_name, 1.0, "portion", "too_high", supersedes=prior_contribution
+        )
+    prior_retained = prior_contribution is None
+
     for key in _BASELINE_DEFAULTS:
         dish_entry[key] = baseline[key]
     dish_entry.pop("_baseline", None)
+    dish_entry.pop("_prior_contribution", None)
+    dish_entry.pop("_prior_suppressed", None)
 
     _write_corrected(status_path, job, dishes)
 
@@ -1761,13 +1864,14 @@ def reset_corrections(body: ResetCorrectionsRequest):
         "direction": None, "reason": None, "magnitude": None, "factor": None, "edits": None,
         "old_portion_g": None, "new_portion_g": dish_entry.get("portion_g"),
         "old_carbs_g": None, "new_carbs_g": dish_entry.get("carbs_g"),
-        "multiplier_persisted": None, "prior_state": "reset",
+        "multiplier_persisted": prior_retracted_record.get("portion_multiplier") if prior_retracted_record else None,
+        "prior_state": prior_retracted_record.get("prior_state") if prior_retracted_record else "reset",
     })
 
     return ResetCorrectionsResponse(
         crop_id=body.crop_id,
         decomposition_reverted=decomposition_reverted,
-        prior_retained=True,
+        prior_retained=prior_retained,
         dish=DishResult(**dish_entry),
     )
 

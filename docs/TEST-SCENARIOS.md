@@ -69,9 +69,29 @@ A pending `too_high` followed by `too_low` replaces the pending evidence and res
 `reason="leftover"` → `prior_state="counted"`. `n_corrections` increments, but `active`
 stays `False` no matter how many times it's repeated, and `_read_multiplier()` stays 1.0.
 
-*Why this test exists:* `leftover` describes the meal in front of the user; `portion`,
-`broth` and `hidden` describe the dish. Confusing the two teaches a permanent
-under-estimate from a one-off event.
+*Why this test exists:* `leftover` is a **scope** ("just this meal"), not a reason —
+`portion` describes the dish. Confusing the two teaches a permanent under-estimate from a
+one-off event. (FOOD-023: `leftover` is now the only chip-like control that survives, and
+it's a checkbox, not a reason chip — see SC-06b/SC-06c below.)
+
+### SC-06b — Omitting the reason is the same as stating it
+> As a user tapping "Too low → A little" with no other controls to fill in, I want that to
+> teach the dish exactly as if I'd said "the portion was different."
+
+`save_portion_prior(dish, factor, None, "too_high")` behaves identically to
+`reason="portion"` — same `prior_state` progression (`pending` then `activated`), same
+`reasons` tally key. `PERSISTED_REASONS` is `{"portion"}`; passing a reason outside
+`{"portion", "leftover"}` still raises `ValueError`.
+
+### SC-06c — Old records with retired reasons still work
+> As someone who corrected a dish before this change, I don't want my learned portion prior
+> to reset just because "hidden"/"broth" aren't offered anymore.
+
+A pre-existing prior record whose `reasons` tally carries `"hidden"` or `"broth"` keys
+(written before FOOD-023) still loads, its `active` multiplier still applies via
+`_read_multiplier()`, and it still accepts and compounds new corrections normally. No
+migration touches these files — nothing reads the `reasons` tally except a verification
+script.
 
 ### SC-07 — Priors expire; evidence doesn't
 > As a user coming back after six months, I want a stale learned portion to stop applying —
@@ -214,6 +234,63 @@ centroid untouched; at 2 it calls `update_centroid` — i.e. the rolling average
 in the store goes through the gate rather than `add_dish()` (which would reset its history).
 A failed crop save or log write degrades to `crop_saved_path: None` / `logged: False` instead
 of raising — recording feedback must never crash the app mid-meal.
+
+---
+
+## 7. Deriving the portion prior from ingredient edits — `pipeline/portion.py` / `api.py`
+
+Background: an ingredient edit (or a scalar tap) changes a dish's total grams. FOOD-022
+derives a portion-prior contribution from that change instead of letting it teach nothing —
+see `plans/FOOD-022-plan.md` for the decision log. Each crop contributes **one** revisable
+claim, computed from `new_portion_g / _baseline.portion_g`, never accumulated per edit.
+
+### SC-23 ⚠️ Stepping the rice up teaches the dish
+> As a user who steps the rice from 210 g to 280 g on the same dish across two separate
+> scans, I want the second scan to start closer to the real total.
+
+`set_amount` raising the total 33% writes `pending` at the grams ratio (`1.33`); a second
+meal doing the same activates the prior at that same ratio.
+
+### SC-24 ⚠️ Three nudges are one claim
+> As a user who nudges an ingredient's amount three times in one sitting, I don't want that
+> read as three pieces of evidence for one restated intent.
+
+Three successive `set_amount` calls on one crop leave `n_corrections == 1` and the pending
+contribution equal to the FINAL ratio against baseline — not the ratios compounded.
+
+### SC-25 ⚠️ Stepping back retracts
+> As a user who raises an ingredient's amount and then puts it back, I want the dish's
+> learned size to return to exactly where it started — not land slightly off.
+
+Raising then restoring the original grams returns the prior to exactly 1.0 (or clears
+pending evidence) and decrements `n_corrections`, whether or not the prior was active.
+
+### SC-26 Ingredient edit + scalar tap in one session = one write
+> As a user who both resizes an ingredient and taps "too low" on the same dish in one
+> sitting, I want that to register as one correction, not two.
+
+An ingredient edit followed by a scalar correction on the same crop revises the same
+`_prior_contribution` slot — `n_corrections` stays at 1, and the net contribution reflects
+the final `portion_g`, not both edits' factors multiplied together.
+
+### SC-27 ⚠️ `leftover` suppresses
+> As a user who says "I didn't finish this" about a dish I also resized, I don't want SikFan
+> to learn a permanently smaller portion from either signal.
+
+A `reason="leftover"` scalar correction retracts any existing derived contribution for that
+crop and blocks further contributions from it for the rest of the session.
+
+### SC-28 Below-tolerance edits write nothing at all
+> As a user who nudges an ingredient by a couple of grams, I don't want that noise treated
+> as a claim about the dish's real size.
+
+An edit whose resulting grams ratio is within 2% of baseline (`PRIOR_CONTRIBUTION_TOLERANCE`)
+writes no prior contribution at all, so long as this crop hadn't already contributed one.
+
+*Why this section exists:* the two learning axes — decomposition (shape) and portion prior
+(size) — used to only both engage via the scalar "too high/too low" flow; an ingredient edit
+taught the model nothing about the dish's real size, so the identical correction had to be
+repeated on every future scan. See "Two axes are in play" in `plans/FOOD-022-plan.md`.
 
 ---
 

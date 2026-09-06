@@ -44,7 +44,11 @@ export interface ConfirmDishResponse {
 // IngredientCandidatesResponse, ResetCorrectionsRequest/Response exactly.
 
 export type CorrectionDirection = 'too_high' | 'too_low' | 'looks_right';
-export type CorrectionReason = 'portion' | 'broth' | 'hidden' | 'leftover';
+// FOOD-023: narrowed from 'portion' | 'broth' | 'hidden' | 'leftover' — the
+// scalar flow is now direction + magnitude only, plus the 'leftover' scope
+// checkbox (too_high only). 'broth'/'hidden' moved to the ingredient-edit
+// flow, which now also teaches the portion prior (FOOD-022).
+export type CorrectionReason = 'portion' | 'leftover';
 export type CorrectionMagnitude = 'little' | 'lot';
 
 export interface CorrectMacrosRequest {

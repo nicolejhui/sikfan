@@ -39,7 +39,7 @@ The mobile app switches on `detail.code` for logic and displays `detail.message`
 | `POST /log-meal` | `no_dishes` | `"confirmed_dishes cannot be empty."` |
 | `POST /confirm-dish` | `missing_corrected_label` | `"corrected_label is required for CORRECT and ADD_NEW actions."` |
 | `POST /confirm-dish` | _(Pydantic 422, not custom)_ | Invalid `action` value rejected automatically by `Literal` type before route logic runs |
-| `POST /correct-macros` | `missing_correction_detail` | `"reason and magnitude are required unless direction is looks_right."` |
+| `POST /correct-macros` | `missing_correction_detail` | `"magnitude is required unless direction is looks_right."` (FOOD-023: `reason` no longer required) |
 | `POST /correct-ingredients` | `missing_replacement_name` | `"replacement_name is required for a swap edit."` |
 | `POST /correct-ingredients` | `missing_grams` | `"grams is required for an add edit."` |
 
@@ -1597,7 +1597,9 @@ Four routes backing the correction design (`results.jsx`, Claude Design project
 undo:
 
 - **Scalar** — "Do the carbs look right?" → Too high / Looks right / Too low →
-  a reason → A little (15%) / A lot (40%).
+  A little (15%) / A lot (40%). **(FOOD-023)** no reason step — `too_high`
+  carries one "Just this meal" checkbox (`leftover` scope), everything else
+  is direction + magnitude only.
 - **Ingredient** — "An ingredient is wrong or missing" → swap a component,
   remove it, or add one the photo missed.
 - **Undo all** — reverts every correction on a dish.
@@ -1620,8 +1622,12 @@ Full design + decision log: `plans/API-013-plan.md`.
 - [ ] **Every** correction is passed to `save_portion_prior()`, `leftover`
       included — the store decides what persists, and this route contains no
       reason branching at all (FOOD-020 D4). `leftover` is counted, never
-      applied; `portion`/`broth`/`hidden` activate a prior only on the second
-      consistent correction (FOOD-020 D5)
+      applied; `portion` activates a prior only on the second consistent
+      correction (FOOD-020 D5). **(FOOD-023, superseding this line as
+      originally written)** the reason is now just `portion` | `leftover` |
+      `None` (defaults to `portion`) — `broth`/`hidden` were cut; a claim
+      about one ingredient's grams belongs in `POST /correct-ingredients`,
+      which learns the portion prior too as of FOOD-022
 - [ ] `looks_right` also calls `save_portion_prior()` (`factor: 1.0`,
       `reason: None`) before returning — it changes no macros, but must not
       short-circuit ahead of the store, or a confirmation can never clear
@@ -1693,7 +1699,7 @@ Full design + decision log: `plans/API-013-plan.md`.
   Separate routes keep every field required, so Pydantic `Literal`s reject bad
   input before route logic runs — the property API-006 already relies on.
 - **The reason decides whether a prior is persisted — but the *store* decides,
-  not this route.** All four reasons change *this* meal identically; they differ
+  not this route.** Both reasons change *this* meal identically; they differ
   entirely in what they imply about future ones. `leftover` is a property of the
   meal, not the dish — persisting it would mean a user who leaves half a bowl
   once silently under-counts that dish forever, and under-counted carbs mean
@@ -1701,10 +1707,18 @@ Full design + decision log: `plans/API-013-plan.md`.
   and one refactor from being silently wrong, so `pipeline/portion.py` owns the
   rule and refuses the write itself (FOOD-020 D4).
 - **`multiplier_persisted` is now `null` more often than the reason table
-  implies.** With two-stage activation (FOOD-020 D5), the *first*
-  `portion`/`broth`/`hidden` correction records evidence without writing a
-  multiplier, so it reports `null` exactly as `leftover` does — distinguishable
-  in the log via `prior_state` (`"pending"` vs `"counted"`).
+  implies.** With two-stage activation (FOOD-020 D5), the *first* `portion`
+  correction records evidence without writing a multiplier, so it reports
+  `null` exactly as `leftover` does — distinguishable in the log via
+  `prior_state` (`"pending"` vs `"counted"`).
+- **(FOOD-023)** `broth` and `hidden` are gone from the reason enum. Both took
+  byte-identical code paths to `portion` (the reason never entered the math)
+  and asked the wrong question anyway — a claim about one ingredient's grams,
+  answered with a uniform scalar on the whole dish. That claim now belongs to
+  `POST /correct-ingredients`'s `set_amount` edit, which converts to absolute
+  grams for one component and (as of FOOD-022) teaches the portion prior from
+  the result. No migration: an existing prior record's `reasons` tally may
+  still carry `"hidden"`/`"broth"` keys and keeps loading and applying fine.
 - **A dish must survive its own edits.** Removing every component divides by
   zero twice over — once renormalizing proportions, once computing
   `macro_coverage` in `fold_components()` — and if both were survived it would

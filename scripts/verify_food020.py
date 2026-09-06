@@ -167,11 +167,11 @@ def main() -> None:
         section("Test 5 — Conflicting directions reset evidence")
         # -------------------------------------------------------------
         save_portion_prior("dumplings", 0.85, "portion", "too_high")
-        rec = save_portion_prior("dumplings", 1 / 0.85, "hidden", "too_low")
+        rec = save_portion_prior("dumplings", 1 / 0.85, "portion", "too_low")
         check("conflicting direction does not activate", "portion_multiplier" not in rec)
         check("pending_direction replaced with the new direction", rec["pending_direction"] == "too_low")
         check("n_corrections reset to 1", rec["n_corrections"] == 1)
-        check("reasons reset to just the new reason", rec["reasons"] == {"hidden": 1})
+        check("reasons reset to just the new reason", rec["reasons"] == {"portion": 1})
 
         # -------------------------------------------------------------
         section("Test 6 — looks_right (D8)")

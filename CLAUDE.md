@@ -174,6 +174,16 @@ ported — the mobile `AddIngredientSheet.tsx` does exact-match only, per FOOD-0
 it remains present upstream as of the MOB-016 rev-2 review (2026-08-30), so a future
 sync of this file must not carry it over.
 
+**Open 2026-09-05 (FOOD-023):** `results.jsx:537`'s macro-correction flow has no reason
+chips at all — "Direction + magnitude only. Anything the scan got wrong at the item level
+... belongs in the breakdown below, not here" — and no `leftover` concept anywhere. The
+repo agrees on cutting the reason chips (done in FOOD-023) but keeps one control the design
+doesn't have: a "Just this meal — I'm not finishing it" checkbox on `too_high`, because
+`leftover` is a scope ("adjust today, teach nothing"), not a reason, and losing it means a
+half-eaten plate becomes training data that permanently under-counts a dish's carbs — i.e.
+under-doses insulin (see `plans/FOOD-023-plan.md` D2). **Open action:** flag the `leftover`
+checkbox upstream to the Design project alongside the `_FACTORS` divergence above.
+
 ## Frozen API Schemas (do not change without versioning)
 
 ### analyze_meal(image_path) → dict

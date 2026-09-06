@@ -17,7 +17,7 @@ Public API:
     estimate_portion(crop_result, dish_name, role=None)   -> dict
     estimate_portions_mixed(crop_result)                  -> dict
     apply_multiplier(dish_name, multiplier)                -> dict
-    save_portion_prior(dish_name, factor, reason, direction) -> dict
+    save_portion_prior(dish_name, factor, reason, direction, supersedes=None) -> dict
     touch_portion_prior(dish_name)                          -> None
 """
 
@@ -118,7 +118,16 @@ PRIORS_DIR = Path("data/portion_priors")
 # describe the MEAL in front of the user right now ("I didn't finish this
 # one plate") and must never influence a future scan of the same dish —
 # enforced here, not by the caller (D4).
-PERSISTED_REASONS = {"portion", "broth", "hidden"}
+#
+# FOOD-023: narrowed from {"portion", "broth", "hidden"} — "broth" and
+# "hidden" took byte-identical code paths to "portion" (the reason never
+# entered the math) and asked the wrong question besides: a claim about one
+# ingredient's grams belongs in the ingredient-edit flow (which now teaches a
+# prior too, via FOOD-022), not a uniform scalar on the whole dish. No
+# migration: an existing prior record's `reasons` tally may still carry
+# "hidden"/"broth" keys from before this change and keeps loading/applying
+# fine — nothing reads that tally except a verification script (D4).
+PERSISTED_REASONS = {"portion"}
 COUNTED_REASONS = {"leftover"}
 
 _MULTIPLIER_MIN, _MULTIPLIER_MAX = 0.5, 2.0
@@ -134,6 +143,12 @@ _FACTORS = {
     ("too_high", "lot"): 0.60,
     ("too_low", "lot"): 1 / 0.60,
 }
+
+# FOOD-022: a grams-ratio contribution within this band of 1.0 is noise, not
+# a claim — below one quarter-serving step on a typical component (D6). Used
+# both by api.py's _contribute_prior() (to skip a first-time write entirely)
+# and here (to recognize a supersede as a retraction rather than a revision).
+PRIOR_CONTRIBUTION_TOLERANCE = 0.02
 
 
 def _now_iso() -> str:
@@ -169,6 +184,7 @@ def save_portion_prior(
     factor: float,
     reason: Optional[str],
     direction: str,
+    supersedes: Optional[float] = None,
 ) -> dict:
     """
     Persist one correction (or confirmation) as evidence about a dish's
@@ -181,17 +197,28 @@ def save_portion_prior(
         factor:    The multiplier this single correction represents (e.g.
                    one of _FACTORS' values), or 1.0 for direction="looks_right".
         reason:    One of PERSISTED_REASONS | COUNTED_REASONS for a
-                   correction; must be None for "looks_right".
+                   correction, or None to default to "portion" (FOOD-023 —
+                   "portion" is the only persisted reason left, so omitting
+                   it is equivalent to stating it). Must be None for
+                   "looks_right".
         direction: "too_high" | "too_low" | "looks_right".
+        supersedes: FOOD-022. The factor this SAME crop already contributed,
+                   if any — passed by api.py's _contribute_prior() to revise
+                   or retract that one contribution rather than accumulate a
+                   second piece of evidence for a single user intent restated
+                   across edits. None (default) reproduces pre-FOOD-022
+                   behavior byte-for-byte — every existing caller is
+                   unaffected. See plans/FOOD-022-plan.md D1-D3.
 
     Returns:
         The written record dict, with a "prior_state" key describing what
         just happened: "counted" | "pending" | "activated" | "compounded" |
-        "cleared" | "confirmed".
+        "cleared" | "confirmed" | "revised" | "retracted".
 
     Raises:
         ValueError: reason/direction combination isn't recognized, or
-                    "looks_right" is given a reason or a non-1.0 factor.
+                    "looks_right" is given a reason, a non-1.0 factor, or a
+                    supersedes value.
     """
     if direction not in ("too_high", "too_low", "looks_right"):
         raise ValueError(f"unknown direction {direction!r}")
@@ -201,6 +228,12 @@ def save_portion_prior(
             raise ValueError("looks_right must not carry a reason")
         if factor != 1.0:
             raise ValueError("looks_right must carry factor=1.0")
+        if supersedes is not None:
+            raise ValueError("looks_right must not carry a supersedes value")
+    elif reason is None:
+        # FOOD-023: "portion" is the only persisted reason left, so a
+        # directional correction with no reason IS a portion claim.
+        reason = "portion"
     elif reason not in PERSISTED_REASONS | COUNTED_REASONS:
         raise ValueError(
             f"unknown reason {reason!r} for direction {direction!r}; "
@@ -227,6 +260,43 @@ def save_portion_prior(
         # An active prior is left untouched — "looks right" about the
         # CORRECTED number confirms the prior is working, not that it
         # should be discarded (D8).
+        _atomic_write(path, record)
+        return record
+
+    if supersedes is not None:
+        # FOOD-022: revise or retract this crop's ONE existing contribution
+        # in place — n_corrections/reasons are NOT touched, because this is
+        # the same claim restated, not new evidence (D2).
+        active = record.get("active", False)
+        pending_direction = record.get("pending_direction")
+        is_retraction = abs(factor - 1.0) < PRIOR_CONTRIBUTION_TOLERANCE
+
+        if is_retraction:
+            if active:
+                current = record.get("portion_multiplier", 1.0)
+                record["portion_multiplier"] = _clamp_multiplier(current / supersedes)
+            elif pending_direction is not None:
+                record.pop("pending_direction", None)
+                record.pop("pending_factor", None)
+                record["n_corrections"] = max(0, record.get("n_corrections", 0) - 1)
+            record["prior_state"] = "retracted"
+        else:
+            if active:
+                current = record.get("portion_multiplier", 1.0)
+                record["portion_multiplier"] = _clamp_multiplier(current / supersedes * factor)
+            elif pending_direction is not None:
+                record["pending_direction"] = direction
+                record["pending_factor"] = factor
+            else:
+                # No tracked evidence to supersede (e.g. a prior file that
+                # predates this crop's contribution) — treat as fresh
+                # evidence rather than silently dropping it.
+                record["n_corrections"] = record.get("n_corrections", 0) + 1
+                record["reasons"][reason] = record["reasons"].get(reason, 0) + 1
+                record["pending_direction"] = direction
+                record["pending_factor"] = factor
+            record["prior_state"] = "revised"
+
         _atomic_write(path, record)
         return record
 

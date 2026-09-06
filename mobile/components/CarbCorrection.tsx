@@ -5,23 +5,15 @@ import { Ionicons } from '@expo/vector-icons';
 import { defaultPalette, spacing, radius, fontSize, fontWeight } from '../constants/theme';
 import { correctMacros, resetCorrections } from '../api/meals';
 import { ApiError } from '../api/client';
-import type { CorrectionDirection, CorrectionMagnitude, CorrectionReason, CorrectMacrosResponse } from '../api/types';
+import type { CorrectionDirection, CorrectionMagnitude, CorrectMacrosResponse } from '../api/types';
 
-// API-013's reason enum is shared across directions; only the label (and
-// which reasons are offered) changes with direction — portion/broth/leftover
-// for "too high", portion/hidden for "too low" (FOOD-020 PERSISTED_REASONS /
-// COUNTED_REASONS).
-const REASONS_BY_DIRECTION: Record<'too_high' | 'too_low', { key: CorrectionReason; label: string }[]> = {
-  too_high: [
-    { key: 'portion', label: 'Portion was smaller' },
-    { key: 'broth', label: "It's mostly broth" },
-    { key: 'leftover', label: 'Not eating the full portion' },
-  ],
-  too_low: [
-    { key: 'portion', label: 'Portion was bigger' },
-    { key: 'hidden', label: 'More food than it looks' },
-  ],
-};
+// FOOD-023: direction + magnitude only — the reason chips are gone. A claim
+// about one ingredient's grams (the old "hidden"/"broth" chips) belongs in
+// the ingredient-edit flow (IngredientSheet's "How much was actually
+// there?"), which now also teaches the portion prior (FOOD-022). The one
+// exception is "leftover", which isn't a reason at all but a SCOPE — "just
+// this meal", not "this dish is systematically mis-estimated" — so it's a
+// checkbox on too_high only, not a chip row.
 
 const MAGNITUDES: { key: CorrectionMagnitude; label: string }[] = [
   { key: 'little', label: 'A little' },
@@ -79,7 +71,7 @@ export default function CarbCorrection({
 }: CarbCorrectionProps) {
   const [correcting, setCorrecting] = useState(false);
   const [direction, setDirection] = useState<CorrectionDirection | null>(null);
-  const [reason, setReason] = useState<CorrectionReason | null>(null);
+  const [leftoverOnly, setLeftoverOnly] = useState(false);
   const [magnitude, setMagnitude] = useState<CorrectionMagnitude | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -87,13 +79,13 @@ export default function CarbCorrection({
   const closePanel = useCallback(() => {
     setCorrecting(false);
     setDirection(null);
-    setReason(null);
+    setLeftoverOnly(false);
     setMagnitude(null);
     setError(null);
   }, []);
 
   const fireDirectionCorrection = useCallback(
-    async (dir: 'too_high' | 'too_low', r: CorrectionReason, mag: CorrectionMagnitude) => {
+    async (dir: 'too_high' | 'too_low', mag: CorrectionMagnitude, isLeftover: boolean) => {
       setSubmitting(true);
       setError(null);
       try {
@@ -101,7 +93,7 @@ export default function CarbCorrection({
           meal_id: mealId,
           crop_id: cropId,
           direction: dir,
-          reason: r,
+          reason: isLeftover ? 'leftover' : 'portion',
           magnitude: mag,
         });
         onCorrected(buildConfirmationText(res));
@@ -110,7 +102,6 @@ export default function CarbCorrection({
         setError(message);
         // Revert the selection rather than leaving a chip highlighted for a
         // correction that never actually applied (GlucosePad's pattern).
-        setReason(null);
         setMagnitude(null);
       } finally {
         setSubmitting(false);
@@ -125,7 +116,7 @@ export default function CarbCorrection({
       setError(null);
       if (dir === 'looks_right') {
         setDirection('looks_right');
-        setReason(null);
+        setLeftoverOnly(false);
         setMagnitude(null);
         void (async () => {
           setSubmitting(true);
@@ -144,32 +135,29 @@ export default function CarbCorrection({
         return;
       }
       setDirection(dir);
-      setReason(null);
+      setLeftoverOnly(false);
       setMagnitude(null);
     },
     [submitting, mealId, cropId, onCorrected, closePanel]
   );
 
-  const handleReasonPress = useCallback(
-    (r: CorrectionReason) => {
-      // Selecting a reason only updates local state — the correction isn't
-      // submitted until a magnitude is also chosen (handleMagnitudePress).
-      // Firing here too used to send two separate persisted corrections for
-      // one user gesture, which double- (or with any back-and-forth,
-      // multi-) counts as evidence toward FOOD-020's learned portion prior.
-      if (submitting || direction === null || direction === 'looks_right') return;
-      setReason(r);
-    },
-    [submitting, direction]
-  );
+  const handleLeftoverToggle = useCallback(() => {
+    // Toggling the checkbox only updates local state — the correction isn't
+    // submitted until a magnitude is also chosen (handleMagnitudePress).
+    // Firing here too would send two separate persisted corrections for one
+    // user gesture, which double- (or with any back-and-forth, multi-)
+    // counts as evidence toward FOOD-020's learned portion prior.
+    if (submitting || direction !== 'too_high') return;
+    setLeftoverOnly((v) => !v);
+  }, [submitting, direction]);
 
   const handleMagnitudePress = useCallback(
     (mag: CorrectionMagnitude) => {
-      if (submitting || direction === null || direction === 'looks_right' || reason === null) return;
+      if (submitting || direction === null || direction === 'looks_right') return;
       setMagnitude(mag);
-      void fireDirectionCorrection(direction, reason, mag);
+      void fireDirectionCorrection(direction, mag, leftoverOnly);
     },
-    [submitting, direction, reason, fireDirectionCorrection]
+    [submitting, direction, leftoverOnly, fireDirectionCorrection]
   );
 
   const handleUndoAll = useCallback(async () => {
@@ -187,9 +175,6 @@ export default function CarbCorrection({
       setSubmitting(false);
     }
   }, [submitting, mealId, cropId, onReset, onToast, closePanel]);
-
-  const reasonOptions =
-    direction === 'too_high' || direction === 'too_low' ? REASONS_BY_DIRECTION[direction] : [];
 
   return (
     <View>
@@ -260,25 +245,21 @@ export default function CarbCorrection({
             })}
           </View>
 
-          {reasonOptions.length > 0 && (
+          {(direction === 'too_high' || direction === 'too_low') && (
             <>
-              <Text style={styles.sectionLabel}>What's off?</Text>
-              <View style={styles.chipRow}>
-                {reasonOptions.map((opt) => {
-                  const selected = reason === opt.key;
-                  return (
-                    <TouchableOpacity
-                      key={opt.key}
-                      style={[styles.chip, selected && styles.chipSelected]}
-                      onPress={() => handleReasonPress(opt.key)}
-                      disabled={submitting}
-                      activeOpacity={0.8}
-                    >
-                      <Text style={[styles.chipText, selected && styles.chipTextSelected]}>{opt.label}</Text>
-                    </TouchableOpacity>
-                  );
-                })}
-              </View>
+              {direction === 'too_high' && (
+                <TouchableOpacity
+                  style={styles.checkboxRow}
+                  onPress={handleLeftoverToggle}
+                  disabled={submitting}
+                  activeOpacity={0.8}
+                >
+                  <View style={[styles.checkboxBox, leftoverOnly && styles.checkboxBoxChecked]}>
+                    {leftoverOnly && <Ionicons name="checkmark" size={12} color="#fff" />}
+                  </View>
+                  <Text style={styles.checkboxLabel}>Just this meal — I'm not finishing it</Text>
+                </TouchableOpacity>
+              )}
 
               <Text style={styles.sectionLabel}>By how much?</Text>
               <View style={styles.chipRow}>
@@ -431,6 +412,31 @@ const styles = StyleSheet.create({
     color: defaultPalette.inkFaint,
     marginTop: spacing.sm,
     marginBottom: spacing.xs,
+  },
+  checkboxRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: spacing.sm,
+    gap: spacing.xs,
+  },
+  checkboxBox: {
+    width: 18,
+    height: 18,
+    borderRadius: 4,
+    borderWidth: 1.5,
+    borderColor: defaultPalette.hair,
+    backgroundColor: defaultPalette.surface,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  checkboxBoxChecked: {
+    backgroundColor: defaultPalette.brand,
+    borderColor: defaultPalette.brand,
+  },
+  checkboxLabel: {
+    fontSize: fontSize.xs,
+    fontWeight: fontWeight.medium,
+    color: defaultPalette.inkSoft,
   },
   chipRow: {
     flexDirection: 'row',
