@@ -15,11 +15,15 @@ import re
 import shutil
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
+import cv2
+import numpy as np
+import torch
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -57,13 +61,24 @@ from pipeline.portion import (
     scale_macros,
     touch_portion_prior,
 )
-from pipeline.segmentation import _get_model, segment_meal
+from pipeline.segmentation import _MAX_LONG_EDGE, _get_model, segment_meal
 
 _log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Startup helpers
 # ---------------------------------------------------------------------------
+
+def _write_downscaled_original(image_bytes: bytes, dest: Path) -> None:
+    """Decode, cap the long edge at `_MAX_LONG_EDGE`, and write as JPEG (API-015 D4)."""
+    array = np.frombuffer(image_bytes, dtype=np.uint8)
+    image = cv2.imdecode(array, cv2.IMREAD_COLOR)
+    h, w = image.shape[:2]
+    if max(h, w) > _MAX_LONG_EDGE:
+        scale = _MAX_LONG_EDGE / max(h, w)
+        image = cv2.resize(image, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
+    cv2.imwrite(str(dest), image)
+
 
 def _cleanup_old_crops(days: int = 7) -> None:
     """Delete data/crops/{meal_id}/ directories older than TTL days."""
@@ -115,6 +130,18 @@ _store: EmbeddingStore | None = None
 _models_loaded: bool = False
 _chromadb_ready: bool = False
 
+# API-015: a single-worker pool serializes scans instead of letting concurrent
+# requests stack their FastSAM/CLIP memory peaks on top of each other.
+_analysis_executor = ThreadPoolExecutor(max_workers=1)
+
+# Kept deliberately separate from _analysis_executor. The stored-original
+# downscale is awaited *inside* the /analyze-meal request, while _run_analysis
+# occupies its worker for seconds as a background task. Sharing one worker
+# between them made scan N+1's request block until scan N's analysis finished,
+# so /analyze-meal stopped returning immediately. A decode+resize is ~50 MB and
+# short-lived, so it does not need the memory serialization.
+_io_executor = ThreadPoolExecutor(max_workers=2)
+
 
 # ---------------------------------------------------------------------------
 # Lifespan — model loading and directory setup
@@ -143,6 +170,7 @@ async def lifespan(app: FastAPI):
     try:
         _get_model()          # loads FastSAM-s.pt → pipeline.segmentation singleton
         _get_clip()           # loads CLIP ViT-B/32 → pipeline.embedding_store singleton (device auto-detected)
+        torch.set_num_threads(2)  # match shared-cpu-2x (API-015)
         _models_loaded = True
     except Exception:
         pass  # health will return 503 with models_loaded: false
@@ -654,9 +682,13 @@ def _run_analysis(meal_id: str, image_path: Path, status_path: Path) -> None:
 
 
 async def _run_analysis_bg(meal_id: str, image_path: Path, status_path: Path) -> None:
-    """Async wrapper: offloads the CPU/MPS-heavy _run_analysis to a thread."""
+    """Async wrapper: offloads the CPU/MPS-heavy _run_analysis to a thread.
+
+    Uses the single-worker `_analysis_executor` (API-015) so concurrent scans
+    serialize instead of stacking their FastSAM/CLIP memory peaks.
+    """
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _run_analysis, meal_id, image_path, status_path)
+    await loop.run_in_executor(_analysis_executor, _run_analysis, meal_id, image_path, status_path)
 
 
 # ---------------------------------------------------------------------------
@@ -686,9 +718,16 @@ async def analyze_meal_route(background_tasks: BackgroundTasks, file: UploadFile
     image_path.write_bytes(image_bytes)
 
     # Persist original for GET /meal-image/{meal_id} (survives on Fly.io volume).
+    # Downscaled to the same long-edge cap as segmentation (API-015 D4) — the
+    # feedback loop saves the in-memory *crop*, not this file, so there is no
+    # accuracy/training-data impact. Decode/resize is pushed to the shared
+    # single-worker executor so a 12 MP JPEG doesn't block the event loop.
     meal_dir = Path("data/meals") / meal_id
     meal_dir.mkdir(parents=True, exist_ok=True)
-    (meal_dir / "original.jpg").write_bytes(image_bytes)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        _io_executor, _write_downscaled_original, image_bytes, meal_dir / "original.jpg"
+    )
 
     # Write initial job status (pending, logged: false)
     _write_job_status(status_path, {

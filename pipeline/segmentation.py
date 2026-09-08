@@ -4,6 +4,7 @@ FOOD-004: FastSAM blob detection on a single meal photo.
 Returns per-region crops so each food item can be classified independently.
 """
 
+import gc
 import math
 
 import cv2
@@ -23,6 +24,8 @@ _MIN_AREA_PCT = 0.015
 _MAX_ASPECT_RATIO = 4.0
 _NMS_IOU_THRESHOLD = 0.4
 _MAX_CROPS = 20
+_MAX_LONG_EDGE = 1536
+_MAX_DET = 100
 
 
 def _get_model(model_path: str = "FastSAM-s.pt") -> FastSAM:
@@ -105,6 +108,8 @@ def segment_meal(
     max_aspect_ratio: float = _MAX_ASPECT_RATIO,
     nms_iou_threshold: float = _NMS_IOU_THRESHOLD,
     max_crops: int = _MAX_CROPS,
+    max_long_edge: int = _MAX_LONG_EDGE,
+    max_det: int = _MAX_DET,
     verbose: bool = False,
 ) -> list[dict]:
     """
@@ -117,6 +122,10 @@ def segment_meal(
         max_aspect_ratio: Discard crops with bw/bh or bh/bw above this (default 4.0).
         nms_iou_threshold: IoU threshold for non-maximum suppression (default 0.4).
         max_crops: Maximum number of crops to return (default 20).
+        max_long_edge: Downscale the image so its longer edge is at most this many
+            pixels before segmentation (default 1536). Bounds FastSAM's retina-mask
+            memory, which scales with input resolution, not the model's imgsz.
+        max_det: Maximum number of masks FastSAM returns per image (default 100).
         verbose: Print per-stage crop counts when True.
 
     Returns:
@@ -129,21 +138,35 @@ def segment_meal(
         Returns an empty list if no regions pass the filters.
     """
     model = _get_model(model_path)
-    results = model(image_path, device=_DEVICE, retina_masks=True, imgsz=1024, conf=0.4, iou=0.9)
+
+    # Decode once here; hand the (possibly downscaled) array to the model
+    # instead of the path, so ultralytics doesn't decode the file a second time.
+    image_bgr = cv2.imread(image_path)
+    h0, w0 = image_bgr.shape[:2]
+    if max(h0, w0) > max_long_edge:
+        scale = max_long_edge / max(h0, w0)
+        image_bgr = cv2.resize(
+            image_bgr, (round(w0 * scale), round(h0 * scale)), interpolation=cv2.INTER_AREA
+        )
+
+    results = model(
+        image_bgr, device=_DEVICE, retina_masks=True, imgsz=1024, conf=0.4, iou=0.9, max_det=max_det
+    )
 
     if results[0].masks is None:
         if verbose:
             print("  FastSAM raw masks:        0")
         return []
 
-    masks = results[0].masks.data.cpu().numpy()  # shape: (N, H, W)
+    # Bool, not float32 — masks are only ever used via `> 0` comparisons below,
+    # and this is 1 byte/px instead of 4 (see API-015).
+    masks = (results[0].masks.data > 0).cpu().numpy()  # shape: (N, H, W)
 
     if verbose:
         print(f"  FastSAM raw masks:        {len(masks)}")
 
     # BGR → RGB immediately after imread; all downstream work stays in RGB
-    image = cv2.imread(image_path)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
     h, w = image.shape[:2]
     min_pixels = h * w * min_area_pct
@@ -165,6 +188,16 @@ def segment_meal(
             "mask_pixels": mask_pixels,
             "image_pixels": h * w,
         })
+
+    # Release the mask tensor and the predictor's retained results before
+    # returning — otherwise the last scan's full-res data stays referenced
+    # on the module-level singleton indefinitely (API-015 root cause #4).
+    del masks
+    predictor = getattr(model, "predictor", None)
+    if predictor is not None and hasattr(predictor, "results"):
+        predictor.results = None
+    del results
+    gc.collect()
 
     crops = _apply_filters(
         crops,

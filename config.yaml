@@ -3,6 +3,8 @@ segmentation:
   max_aspect_ratio: 4.0
   nms_iou_threshold: 0.4
   max_crops: 20
+  max_long_edge: 1536      # API-015: downscale before FastSAM to bound retina-mask memory
+  max_det: 100              # API-015: cap masks per scan; still far above the 20-crop cap
 
 component_detection:
   kmeans_k: 4                    # color palette size for complexity heuristic — tune against real photos
