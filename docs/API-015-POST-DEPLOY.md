@@ -1,0 +1,103 @@
+# API-015 — Post-Deploy Checklist
+
+Follow-ups for the per-scan memory fix (`plans/API-015-plan.md`). Written 2026-09-07,
+before the deploy that ships: pre-segmentation downscale (`max_long_edge=1536`),
+`max_det=100`, bool masks, predictor-results release, single-worker analysis pool,
+downscaled stored originals, `MALLOC_ARENA_MAX=2`.
+
+---
+
+## 1. Verify immediately after deploy
+
+Do these in order. Items 1-3 are the ones that would show a bad deploy.
+
+- [ ] **Health.** `curl https://sikfan-api.fly.dev/health` — expect
+      `models_loaded: true` and `chromadb_ready: true`. A 503 here means FastSAM/CLIP
+      or ChromaDB failed to load, which the `lifespan` block swallows silently.
+- [ ] **One scan, end to end, from the real iPhone.** Confirm dish names, macros, and
+      the glucose projection all still render. This is the first time the downscale
+      path runs on a true 12 MP capture.
+- [ ] **Memory returns to baseline *between* scans**, not just survives one.
+      `fly status` / `fly logs` before a scan, right after, and ~30s later. The whole
+      point of releasing `predictor.results` + `MALLOC_ARENA_MAX=2` is that RSS comes
+      back down. If it ratchets up scan over scan, the release isn't working —
+      that's the regression to catch.
+- [ ] **`/analyze-meal` still returns immediately.** Fire two scans back to back. The
+      second must return its `meal_id` right away, not block until the first finishes.
+      This is what the `_io_executor` split fixed; if it regresses, the resize is back
+      on the analysis pool.
+- [ ] **`GET /meal-image/{meal_id}` looks right** in the app at 1536px — this deploy is
+      the first to store a downscaled original.
+- [ ] **Peak memory headroom.** At 1536/100 a scan adds ~2.4 GB over a ~1 GB baseline:
+      ~3.4 GB against a 4 GB machine. Thin. If Fly reports OOM or heavy swap on a real
+      12 MP photo, jump to §4.
+
+## 2. Do not do these
+
+- **Do not lower `max_det` below 100.** Measured on all 9 corpus images (plan D9):
+  100 is byte-identical to the old default of 300, but 32 loses *whole dishes* —
+  `8A88401B` went `dried_tofu_sticks x2` -> nothing, `E292AC74` lost
+  `dried_tofu_sticks`, `assorted_breakfast` lost `steamed_bun_stuffed`. `max_det`
+  truncates by model confidence **before** the area filter runs. It cannot buy memory.
+- **Do not lower `memory = "4gb"`** until §1's headroom check has run against real
+  12 MP photos for a few days.
+- **Do not lower `max_long_edge` below 1536** without the §3 accuracy gate. The
+  pipeline is measurably resolution-sensitive (plan D10).
+
+## 3. Open — the resolution accuracy gate
+
+Still unsatisfied. `max_long_edge=1536` is unvalidated on real data.
+
+- [ ] Shoot ~5 meal photos on the **actual iPhone**, AirDrop to the Mac.
+      **This deploy downscales stored originals to 1536, so the Fly volume will never
+      hold full-res photos — they must come off the phone directly.**
+- [ ] `python scripts/resolution_sweep.py --source-dir <dir>` and compare dish names
+      and confidence scores at 4032 / 2048 / 1536 / 1024.
+- [ ] If 1536 shows drift, raise to 2048 and re-check headroom. If 1024 is clean, take
+      it — it drops the per-scan add from ~2.4 GB to ~1.3 GB.
+
+Notes on the tooling, so the first sweep's mistake isn't repeated:
+- The script now **warns** when inputs are at or below the smallest cap being swept.
+  The original sweep was invalid because every input was already ≤1024px, so all four
+  resolutions processed identical pixels.
+- `--device` defaults to `cpu` to mirror Fly. On MPS the float32 mask tensor sits in
+  GPU memory and never enters `ru_maxrss`, understating production ~4x.
+- `--synthetic` is valid for **memory only**. Upscaling invents no detail, so it
+  cannot judge accuracy.
+
+## 4. Deferred — drop `retina_masks` (the real fix)
+
+`retina_masks=True` forces masks to the *original* photo's dimensions. The pipeline
+extracts only a bounding box and a pixel count from them, so that precision is
+allocated and discarded. Turning it off puts masks at the 1024 letterbox (~2.25x
+smaller than a 1536 cap) while `results[0].boxes.xyxy` is **already** in original
+coordinates, so crop bounds lose nothing.
+
+Deliberately **not** bundled with this deploy — it lands in the portion -> carbs ->
+insulin path.
+
+**The hazard:** without retina, mask pixels are counted in letterbox space *including
+the gray padding bars*, while `image_pixels` is original-space. That inflates the
+denominator in `_pixel_bucket()`'s `mask_pixels / image_pixels`, making every dish look
+like a smaller fraction of the plate -> smaller portion bucket -> fewer grams ->
+**under-counted carbs -> under-dosed insulin**.
+
+Requirements for that ticket:
+- Handle the letterbox padding explicitly in the ratio; do not assume it away.
+- Validate on `portion_g` before/after across the corpus, **not** just dish names —
+  the current sweep script compares names and would not catch this.
+- Only then re-measure memory.
+
+## 5. Smaller open items
+
+- [ ] **`4E98C01F` classifies zero dishes** at every `max_det` including the 300
+      baseline. Pre-existing, not caused by API-015, but it is a real miss sitting in
+      the corpus. Worth a look at what that image is.
+- [ ] **Upload latency.** `CameraScreen.tsx:58` `takePictureAsync()` takes no options
+      and the gallery path uses `quality: 1`, so the phone uploads ~12 MP over
+      cellular. Server memory no longer cares, but the user waits. A capture-time
+      resize needs `expo-image-manipulator` (a new native dep — run
+      `/mobile_ticket_check`, and see CLAUDE.md on MOB-005 dependency drift).
+      Track as a mobile ticket; the server must keep its own downscale regardless.
+- [ ] **`outputs/synthetic_sweep/`** holds upscaled test images generated during
+      benchmarking. Safe to delete.
