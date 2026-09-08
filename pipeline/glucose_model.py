@@ -47,6 +47,19 @@ _META_PATH = _MODEL_DIR / "training_metadata.json"
 
 _DEFAULT_MIN_CARB_COVERAGE = 0.70
 
+# Cache the joblib bundle across requests — reloading it from disk on every
+# predict_curve() call is unnecessary I/O/allocation churn. Keyed by mtime so
+# a retrain (train_model() writes a fresh file) invalidates it automatically.
+_bundle_cache: dict = {}
+
+
+def _load_bundle():
+    mtime = _MODEL_PATH.stat().st_mtime
+    if _bundle_cache.get("mtime") != mtime:
+        _bundle_cache["bundle"] = joblib.load(_MODEL_PATH)
+        _bundle_cache["mtime"] = mtime
+    return _bundle_cache["bundle"]
+
 
 def _load_min_carb_coverage(config_path: str = "config.yaml") -> float:
     """Read glucose_training.min_carb_coverage from config.yaml (FOOD-019 D6)."""
@@ -389,7 +402,7 @@ def predict_glucose_curve(meal_macros: dict, pre_meal_glucose: int,
     if not _MODEL_PATH.exists():
         raise RuntimeError("Model not yet trained — run train_model() first")
 
-    bundle = joblib.load(_MODEL_PATH)
+    bundle = _load_bundle()
     scaler = bundle["scaler"]
     model = bundle["model"]
 

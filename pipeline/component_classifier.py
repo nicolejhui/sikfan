@@ -23,23 +23,10 @@ import numpy as np
 import torch
 from PIL import Image
 
+from pipeline.embedding_store import _get_clip
+
 # Auto-detect device: MPS on Apple Silicon, CPU elsewhere (e.g. Fly.io Linux)
 _DEVICE: str = "mps" if torch.backends.mps.is_available() else "cpu"
-
-# ---------------------------------------------------------------------------
-# CLIP lazy singleton
-# ---------------------------------------------------------------------------
-
-_clip_model = None
-_clip_preprocess = None
-
-
-def _get_clip(device: str):
-    global _clip_model, _clip_preprocess
-    if _clip_model is None:
-        _clip_model, _clip_preprocess = clip.load("ViT-B/32", device=device)
-        _clip_model.eval()
-    return _clip_model, _clip_preprocess
 
 
 # ---------------------------------------------------------------------------
