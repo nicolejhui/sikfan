@@ -103,6 +103,7 @@ export default function ResultsScreen() {
   const [thumbnailBroken, setThumbnailBroken] = useState(false);
 
   const prediction = useGlucoseStore((s) => s.prediction);
+  const baselinePrediction = useGlucoseStore((s) => s.baselinePrediction);
   const storeVerdict = useGlucoseStore((s) => s.verdict);
   const predictionStatus = useGlucoseStore((s) => s.predictionStatus);
   const fetchPrediction = useGlucoseStore((s) => s.fetchPrediction);
@@ -400,6 +401,14 @@ export default function ResultsScreen() {
   const colors = verdictColor(verdict);
 
   const curveData = prediction?.curve.map((p) => ({ x: p.minutes, y: p.predicted_bg })) ?? [];
+  // API-014: dashed pre-correction projection, present only when a
+  // correction actually moved the model's inputs (see MOB-019-plan.md).
+  const ghostCurveData = baselinePrediction?.curve.map((p) => ({ x: p.minutes, y: p.predicted_bg })) ?? [];
+  const baselineDelta = baselinePrediction?.outcome.delta_from_baseline;
+  const showWasDelta =
+    baselineDelta != null &&
+    prediction != null &&
+    Math.round(baselineDelta) !== Math.round(prediction.outcome.delta_from_baseline);
   const bandData = prediction?.curve.map((p) => ({
     x: p.minutes,
     y: p.confidence_upper,
@@ -571,7 +580,21 @@ export default function ResultsScreen() {
                 {prediction.outcome.delta_from_baseline >= 0 ? '+' : ''}
                 {Math.round(prediction.outcome.delta_from_baseline)}
               </Text>
+              {showWasDelta && (
+                <Text style={styles.verdictWasDelta}>
+                  was {baselineDelta! >= 0 ? '+' : ''}{Math.round(baselineDelta!)}
+                </Text>
+              )}
             </View>
+
+            {prediction.model_confidence === 'low' && (
+              <View style={styles.glucoseLowConfidenceNotice}>
+                <Ionicons name="alert-circle-outline" size={14} color={defaultPalette.warn.fg} />
+                <Text style={styles.glucoseLowConfidenceText}>
+                  This projection is a rough estimate — these macros are outside what the model has learned from so far.
+                </Text>
+              </View>
+            )}
 
             <View style={styles.chartCard}>
               <VictoryChart width={chartWidth} height={CHART_HEIGHT} padding={{ top: 12, bottom: 28, left: 40, right: 12 }}>
@@ -587,6 +610,12 @@ export default function ResultsScreen() {
                   data={bandData}
                   style={{ data: { fill: colors.fg, fillOpacity: 0.2, stroke: 'transparent' } }}
                 />
+                {ghostCurveData.length > 0 && (
+                  <VictoryLine
+                    data={ghostCurveData}
+                    style={{ data: { stroke: defaultPalette.inkFaint, strokeWidth: 2, strokeDasharray: '4,4' } }}
+                  />
+                )}
                 <VictoryLine
                   data={curveData}
                   style={{ data: { stroke: colors.fg, strokeWidth: 2 } }}
@@ -606,6 +635,13 @@ export default function ResultsScreen() {
                 )}
               </VictoryChart>
             </View>
+
+            {ghostCurveData.length > 0 && (
+              <View style={styles.ghostLegendRow}>
+                <View style={styles.ghostLegendSwatch} />
+                <Text style={styles.ghostLegendText}>Dashed line is the original estimate</Text>
+              </View>
+            )}
 
             <View style={styles.statStrip}>
               <View style={styles.statItem}>
@@ -1058,9 +1094,47 @@ const styles = StyleSheet.create({
     marginLeft: spacing.sm,
     flex: 1,
   },
+  glucoseLowConfidenceNotice: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: spacing.xs,
+    backgroundColor: defaultPalette.warn.tint,
+    borderWidth: 1,
+    borderColor: defaultPalette.warn.ring,
+    borderRadius: radius.lg,
+    padding: spacing.md,
+    marginBottom: spacing.md,
+  },
+  glucoseLowConfidenceText: {
+    flex: 1,
+    fontSize: fontSize.xs,
+    color: defaultPalette.warn.deep,
+  },
   verdictDelta: {
     fontSize: fontSize.lg,
     fontWeight: fontWeight.bold,
+  },
+  verdictWasDelta: {
+    fontSize: fontSize.xs,
+    color: defaultPalette.inkFaint,
+    marginLeft: spacing.xs,
+  },
+  ghostLegendRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    marginBottom: spacing.md,
+  },
+  ghostLegendSwatch: {
+    width: 14,
+    height: 0,
+    borderTopWidth: 2,
+    borderColor: defaultPalette.inkFaint,
+    borderStyle: 'dashed',
+  },
+  ghostLegendText: {
+    fontSize: fontSize.xs,
+    color: defaultPalette.inkFaint,
   },
   chartCard: {
     backgroundColor: defaultPalette.surface,

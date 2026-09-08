@@ -13,6 +13,7 @@ interface GlucoseState {
   preMealGlucose: number | null;
   preMealTrend: string | null;
   prediction: GlucosePrediction | null;
+  baselinePrediction: GlucosePrediction | null;
   verdict: Verdict | null;
   readings: ActualReading[];
   actuals: GlucoseActuals | null;
@@ -26,7 +27,8 @@ interface GlucoseActions {
   setPrediction: (
     prediction: GlucosePrediction,
     preMealGlucose: number,
-    preMealTrend: string
+    preMealTrend: string,
+    baselinePrediction: GlucosePrediction | null
   ) => void;
   startPolling: (mealId: string) => void;
   stopPolling: () => void;
@@ -47,6 +49,7 @@ const initial: GlucoseState = {
   preMealGlucose: null,
   preMealTrend: null,
   prediction: null,
+  baselinePrediction: null,
   verdict: null,
   readings: [],
   actuals: null,
@@ -60,9 +63,10 @@ export const useGlucoseStore = create<GlucoseState & GlucoseActions>()(
   immer((set, get) => ({
     ...initial,
 
-    setPrediction: (prediction, preMealGlucose, preMealTrend) =>
+    setPrediction: (prediction, preMealGlucose, preMealTrend, baselinePrediction) =>
       set((s) => {
         s.prediction = prediction;
+        s.baselinePrediction = baselinePrediction;
         s.verdict = prediction.outcome.label;
         s.preMealGlucose = preMealGlucose;
         s.preMealTrend = preMealTrend;
@@ -113,7 +117,12 @@ export const useGlucoseStore = create<GlucoseState & GlucoseActions>()(
       set((s) => { s.predictionStatus = 'loading'; });
       try {
         const res = await analyzeGlucose(mealId);
-        get().setPrediction(res.prediction, res.pre_meal_glucose, res.pre_meal_trend);
+        get().setPrediction(
+          res.prediction,
+          res.pre_meal_glucose,
+          res.pre_meal_trend,
+          res.baseline_prediction
+        );
         set((s) => { s.predictionStatus = 'ready'; });
       } catch (err) {
         if (err instanceof ApiError && err.code === 'no_pre_meal_glucose') {

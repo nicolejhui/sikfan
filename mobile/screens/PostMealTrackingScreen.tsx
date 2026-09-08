@@ -3,6 +3,7 @@ import { View, Text, StyleSheet, ScrollView, TouchableOpacity, useWindowDimensio
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useRoute } from '@react-navigation/native';
 import { VictoryChart, VictoryLine, VictoryArea, VictoryAxis, VictoryScatter } from 'victory-native';
+import { Ionicons } from '@expo/vector-icons';
 
 import { defaultPalette, verdictColor, spacing, radius, fontSize, fontWeight } from '../constants/theme';
 import { useGlucoseStore, useHistoryStore } from '../store';
@@ -124,6 +125,15 @@ export default function PostMealTrackingScreen() {
           </Text>
         </View>
 
+        {prediction?.model_confidence === 'low' && (
+          <View style={styles.glucoseLowConfidenceNotice}>
+            <Ionicons name="alert-circle-outline" size={14} color={defaultPalette.warn.fg} />
+            <Text style={styles.glucoseLowConfidenceText}>
+              This projection is a rough estimate — these macros are outside what the model has learned from so far.
+            </Text>
+          </View>
+        )}
+
         {showSummary ? (
           <View style={styles.statStrip}>
             <View style={styles.statItem}>
@@ -202,6 +212,22 @@ const styles = StyleSheet.create({
     height: 8,
     borderRadius: radius.full,
     marginRight: spacing.sm,
+  },
+  glucoseLowConfidenceNotice: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: spacing.xs,
+    backgroundColor: defaultPalette.warn.tint,
+    borderWidth: 1,
+    borderColor: defaultPalette.warn.ring,
+    borderRadius: radius.lg,
+    padding: spacing.md,
+    marginBottom: spacing.md,
+  },
+  glucoseLowConfidenceText: {
+    flex: 1,
+    fontSize: fontSize.xs,
+    color: defaultPalette.warn.deep,
   },
   statusText: {
     fontSize: fontSize.sm,

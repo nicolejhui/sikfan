@@ -184,6 +184,13 @@ half-eaten plate becomes training data that permanently under-counts a dish's ca
 under-doses insulin (see `plans/FOOD-023-plan.md` D2). **Open action:** flag the `leftover`
 checkbox upstream to the Design project alongside the `_FACTORS` divergence above.
 
+**Closed 2026-09-07 (MOB-019):** the repo has **no undo affordance on the glucose curve**
+(`results.jsx`'s `ProjectionChangeNote` has one) — undo lives only in the macro correction
+flow's "Undo all corrections" (see API-014-plan.md D4 rationale). `ProjectionChangeNote`'s
+`reasons` / `before` / `after` props are dead upstream (accepted, never rendered) — a future
+sync of `results.jsx` must not carry them over. **Open action:** flag both upstream to the
+Design project alongside the `_FACTORS` and `leftover` divergences above.
+
 ## Frozen API Schemas (do not change without versioning)
 
 ### analyze_meal(image_path) → dict
@@ -200,6 +207,10 @@ retyped — no version bump needed per this section's own rule):**
   `plans/FOOD-019-plan.md`'s API-012 "Known scope boundary" for why a
   freshly-scanned dish (even one hitting an already-cached composite entry)
   doesn't yet surface these.
+- `fiber_g: float | None` on `DishResult` (GLUC-013, 2026-09-06) — fixes a
+  train/serve skew where fiber was silently pinned to 0.0 at inference,
+  collapsing every glucose prediction to the training-average curve
+  regardless of input. See `plans/GLUC-013-plan.md`.
 
 ### analyze_glucose(meal_id) → dict
 Stable since GLUC-009. Full shape:
@@ -235,7 +246,17 @@ Stable since GLUC-009. Full shape:
     "retrain_triggered": bool
 }
 ```
-Schema changes after GLUC-009 require incrementing the API version in Epic 8.
+**Additive fields since (all optional/defaulted, no existing field renamed or
+retyped — no version bump needed per this section's own rule):**
+- `baseline_prediction: GlucosePrediction | None` (API-014, 2026-09-07) — the
+  pre-correction projection, derived server-side from each dish's `_baseline`
+  snapshot. Present only on the preview path (`GET /glucose/{meal_id}` before
+  the meal is logged) and only when a correction actually moved the model's
+  feature inputs; `None` otherwise, and always `None` post-log (corrections
+  are pre-log only, FOOD-016a). See `plans/API-014-plan.md`.
+
+Schema changes beyond an additive field of this shape require incrementing the
+API version in Epic 8.
 
 ## Glucose Prediction — Pre-log Anchor (confirmed 2026-08-06)
 Four user stories confirmed with Nicole, driving `API-010`, `API-011`, and

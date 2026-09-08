@@ -72,7 +72,7 @@ def generate_overlay(meal_id: str) -> dict:
 
     # --- Prediction ---
     macros = _extract_macros(meal)
-    predicted_curve = predict_glucose_curve(macros, pre_glucose, pre_trend)
+    predicted_curve = predict_glucose_curve(macros, pre_glucose, pre_trend)["curve"]
 
     # Arrays for plotting
     pred_minutes = np.array([p["minutes"] for p in predicted_curve])

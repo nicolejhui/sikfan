@@ -58,17 +58,24 @@ const mockPrediction: GlucosePrediction = {
 };
 
 test('setPrediction stores prediction and verdict', () => {
-  useGlucoseStore.getState().setPrediction(mockPrediction, 110, 'flat');
+  useGlucoseStore.getState().setPrediction(mockPrediction, 110, 'flat', null);
   const s = useGlucoseStore.getState();
   expect(s.verdict).toBe('spike');
   expect(s.preMealGlucose).toBe(110);
   expect(s.prediction?.predicted_peak_bg).toBe(145);
 });
 
+test('setPrediction stores baselinePrediction', () => {
+  const mockBaseline: GlucosePrediction = { ...mockPrediction, predicted_peak_bg: 120 };
+  useGlucoseStore.getState().setPrediction(mockPrediction, 110, 'flat', mockBaseline);
+  expect(useGlucoseStore.getState().baselinePrediction?.predicted_peak_bg).toBe(120);
+});
+
 test('reset clears glucoseStore', () => {
-  useGlucoseStore.getState().setPrediction(mockPrediction, 110, 'flat');
+  useGlucoseStore.getState().setPrediction(mockPrediction, 110, 'flat', null);
   useGlucoseStore.getState().reset();
   expect(useGlucoseStore.getState().verdict).toBeNull();
+  expect(useGlucoseStore.getState().baselinePrediction).toBeNull();
 });
 
 // glucoseStore.fetchPrediction / submitManualGlucose (MOB-012)
@@ -80,6 +87,7 @@ const mockGlucoseResponse = {
   pre_meal_glucose: 110,
   pre_meal_trend: 'flat',
   prediction: mockPrediction,
+  baseline_prediction: null,
   actuals: null,
   retrain_triggered: false,
   image_url: '/meal-image/meal_001',
@@ -92,6 +100,17 @@ test('fetchPrediction sets ready + prediction on success', async () => {
   expect(s.predictionStatus).toBe('ready');
   expect(s.preMealGlucose).toBe(110);
   expect(s.prediction?.predicted_peak_bg).toBe(145);
+});
+
+test('fetchPrediction writes baseline_prediction, including back to null on undo', async () => {
+  const mockBaseline: GlucosePrediction = { ...mockPrediction, predicted_peak_bg: 120 };
+  mockAnalyzeGlucose.mockResolvedValue({ ...mockGlucoseResponse, baseline_prediction: mockBaseline });
+  await useGlucoseStore.getState().fetchPrediction('meal_001');
+  expect(useGlucoseStore.getState().baselinePrediction?.predicted_peak_bg).toBe(120);
+
+  mockAnalyzeGlucose.mockResolvedValue(mockGlucoseResponse); // baseline_prediction: null
+  await useGlucoseStore.getState().fetchPrediction('meal_001');
+  expect(useGlucoseStore.getState().baselinePrediction).toBeNull();
 });
 
 test('fetchPrediction sets needs_manual_entry on no_pre_meal_glucose', async () => {

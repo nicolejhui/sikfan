@@ -126,7 +126,7 @@ def _extract_macros(meal: dict) -> dict:
     dishes = meal.get("dishes", [])
     return {
         "total_carbs_g":   float(meal.get("total_carbs_g", 0)),
-        "total_fiber_g":   sum(float(d["macros"].get("fiber_g",   0)) for d in dishes),
+        "total_fiber_g":   sum(float(d["macros"].get("fiber_g") or 0) for d in dishes),
         "total_fat_g":     sum(float(d["macros"].get("fat_g",     0)) for d in dishes),
         "total_protein_g": sum(float(d["macros"].get("protein_g", 0)) for d in dishes),
     }
@@ -144,9 +144,13 @@ def _model_confidence() -> str:
 
 def _build_prediction(macros: dict, pre_glucose: int, pre_trend: str) -> dict:
     """Shared curve/outcome assembly used by both the logged and preview paths (API-010)."""
-    curve = predict_glucose_curve(macros, pre_glucose, pre_trend)
+    result = predict_glucose_curve(macros, pre_glucose, pre_trend)
+    curve = result["curve"]
     peak_point = max(curve, key=lambda p: p["predicted_bg"])
-    model_confidence = _model_confidence()
+    # GLUC-013 section 4: an out-of-support input (the GPR extrapolating past
+    # its training range) forces "low" regardless of meals_used — a frozen or
+    # extrapolated curve must never present itself as a confident one.
+    model_confidence = "low" if result["out_of_support"] else _model_confidence()
     outcome = classify_glucose_outcome(curve, pre_glucose)
     outcome["confidence"] = model_confidence
     return {
@@ -265,6 +269,7 @@ def analyze_glucose(meal_id: str) -> dict:
         "pre_meal_glucose": pre_glucose,
         "pre_meal_trend": pre_trend,
         "prediction": prediction,
+        "baseline_prediction": None,
         "actuals": actuals,
         "retrain_triggered": retrain_triggered,
     }
@@ -303,15 +308,33 @@ def analyze_glucose_preview(meal_id: str) -> dict:
     meal_timestamp = job["created_at"]
     result_dishes = job["result"].get("dishes", [])
 
-    # DishResult (job_status shape) carries no fiber_g field — total_fiber_g
-    # is 0.0 here same as the logged path effectively always is too, since
-    # /log-meal's macros dict has never included fiber_g either. Not a new
-    # gap introduced by the preview path; see plans/API-010-plan.md.
+    # GLUC-013: total_fiber_g is now summed from DishResult.fiber_g like the
+    # other three macros, instead of being hardcoded to 0.0 — that hardcode
+    # was the root cause of the frozen-curve bug (see plans/GLUC-013-plan.md).
+    # A dish with no fiber value (missing or a dish predating this field)
+    # defaults to 0.0 rather than propagating None into the feature vector.
     macros = {
         "total_carbs_g":   float(job["result"].get("total_carbs_g", 0.0)),
-        "total_fiber_g":   0.0,
+        "total_fiber_g":   sum(float(d.get("fiber_g") or 0.0) for d in result_dishes),
         "total_fat_g":     sum(float(d.get("fat_g", 0.0)) for d in result_dishes),
         "total_protein_g": sum(float(d.get("protein_g", 0.0)) for d in result_dishes),
+    }
+
+    # API-014: build the pre-correction feature vector the same way, reading
+    # each dish's _baseline snapshot where a correction has touched it (falls
+    # back to the dish's current values otherwise) — a multi-dish meal with
+    # only one corrected dish mixes baseline and current per-dish correctly.
+    def _baseline_field(d: dict, field: str) -> float:
+        baseline = d.get("_baseline")
+        if baseline is not None and baseline.get(field) is not None:
+            return float(baseline[field])
+        return float(d.get(field) or 0.0)
+
+    baseline_macros = {
+        "total_carbs_g":   sum(_baseline_field(d, "carbs_g") for d in result_dishes),
+        "total_fiber_g":   sum(_baseline_field(d, "fiber_g") for d in result_dishes),
+        "total_fat_g":     sum(_baseline_field(d, "fat_g") for d in result_dishes),
+        "total_protein_g": sum(_baseline_field(d, "protein_g") for d in result_dishes),
     }
 
     cgm = get_pre_meal_glucose(meal_timestamp)
@@ -320,6 +343,15 @@ def analyze_glucose_preview(meal_id: str) -> dict:
     pre_glucose, pre_trend = int(cgm["glucose_mgdl"]), cgm["trend"]
 
     prediction = _build_prediction(macros, pre_glucose, pre_trend)
+
+    # Emit baseline_prediction only when the model's inputs actually differ
+    # (API-014 D3) — an exact predicate on determinism, not a heuristic.
+    _EPSILON = 0.05
+    baseline_prediction = None
+    if any(
+        abs(baseline_macros[k] - macros[k]) > _EPSILON for k in macros
+    ):
+        baseline_prediction = _build_prediction(baseline_macros, pre_glucose, pre_trend)
 
     dishes = [
         {"name": d["name"], "carbs_g": float(d.get("carbs_g", 0.0))}
@@ -334,6 +366,7 @@ def analyze_glucose_preview(meal_id: str) -> dict:
         "pre_meal_glucose": pre_glucose,
         "pre_meal_trend": pre_trend,
         "prediction": prediction,
+        "baseline_prediction": baseline_prediction,
         "actuals": None,
         "retrain_triggered": False,
     }

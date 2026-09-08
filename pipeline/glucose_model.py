@@ -11,8 +11,14 @@ Feature indices (used in both build_training_data and predict_glucose_curve):
   3: total_protein_g
   4: pre_meal_glucose    (mg/dL)
   5: pre_meal_trend      (encoded: -2=falling_rapidly, -1=falling, 0=flat, 1=rising, 2=rising_rapidly)
-  6: hour_of_day         (0–23)
-  7: carb_to_fiber_ratio (total_carbs_g / max(total_fiber_g, 0.1))
+
+GLUC-013 removed `hour_of_day` and `carb_to_fiber_ratio` (formerly indices
+6-7) — both were a train/serve skew: `hour_of_day` used the meal's own hour
+at training time but `datetime.now().hour` at inference, and
+`carb_to_fiber_ratio` was computed against a fiber value that was always
+0.0 at inference (both serving paths hardcoded it), blowing the ratio
+~10sigma outside the training distribution and collapsing every prediction
+to the GPR's prior-mean curve. See plans/GLUC-013-plan.md.
 """
 
 import json
@@ -105,6 +111,11 @@ _TREND_MAP = {
 }
 _TIME_GRID = list(range(0, 185, 5))  # [0, 5, 10, ..., 180] — 37 points
 
+_FEATURE_NAMES = [
+    "total_carbs_g", "total_fiber_g", "total_fat_g", "total_protein_g",
+    "pre_meal_glucose", "pre_meal_trend",
+]
+
 # Canonical key aliases — accept both short-form and prefixed keys from mobile app
 _KEY_ALIASES = {
     "carbs_g": "total_carbs_g",
@@ -165,23 +176,21 @@ def _interpolate_to_grid(readings: list[dict]) -> np.ndarray:
 
 
 def _build_feature_vector(macros: dict, pre_meal_glucose: float, pre_meal_trend: str) -> list[float]:
-    """Build the 8-element feature vector from normalized macros + pre-meal state."""
+    """Build the 6-element feature vector from normalized macros + pre-meal state."""
     carbs = float(macros.get("total_carbs_g", 0))
     fiber = float(macros.get("total_fiber_g", 0))
     fat = float(macros.get("total_fat_g", 0))
     protein = float(macros.get("total_protein_g", 0))
     trend_encoded = float(_TREND_MAP.get(pre_meal_trend, 0))
-    hour = float(datetime.now().hour)  # used only in predict path; overridden in build_training_data
-    carb_fiber_ratio = carbs / max(fiber, 0.1)
 
-    return [carbs, fiber, fat, protein, float(pre_meal_glucose), trend_encoded, hour, carb_fiber_ratio]
+    return [carbs, fiber, fat, protein, float(pre_meal_glucose), trend_encoded]
 
 
 def build_training_data() -> tuple[np.ndarray, np.ndarray]:
     """Load meal logs + CGM windows, return (X_features, y_curves).
 
     Returns:
-        X: shape (n_meals, 8)  — feature matrix
+        X: shape (n_meals, 6)  — feature matrix
         y: shape (n_meals, 37) — BG curve at 5-min intervals for 180 min
     """
     meals = get_meal_logs()
@@ -210,10 +219,8 @@ def build_training_data() -> tuple[np.ndarray, np.ndarray]:
         fat = float(meal.get("total_fat_g", 0))
         protein = float(meal.get("total_protein_g", 0))
         trend_encoded = float(_TREND_MAP.get(pre_trend, 0))
-        hour = float(datetime.fromisoformat(meal["timestamp"]).hour)
-        carb_fiber_ratio = carbs / max(fiber, 0.1)
 
-        features = [carbs, fiber, fat, protein, float(pre_glucose), trend_encoded, hour, carb_fiber_ratio]
+        features = [carbs, fiber, fat, protein, float(pre_glucose), trend_encoded]
 
         readings = meal["cgm_window"]["readings"]
         curve = _interpolate_to_grid(readings)
@@ -319,9 +326,20 @@ def train_model(min_meals: int = 20) -> dict:
     print(f"  Model MARD:    {model_mard:.1%}")
     print(f"  Baseline MARD: {baseline_mard:.1%}   ← flat-line persistence baseline")
 
-    # Save model bundle
+    # Save model bundle — feature_names/feature_ranges let predict_glucose_curve()
+    # detect a stale bundle from before a feature-set change (GLUC-013) instead
+    # of failing obscurely inside scaler.transform.
+    feature_ranges = {
+        name: [float(X[:, i].min()), float(X[:, i].max())]
+        for i, name in enumerate(_FEATURE_NAMES)
+    }
     _MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    joblib.dump({"scaler": scaler, "model": base_model}, _MODEL_PATH)
+    joblib.dump({
+        "scaler": scaler,
+        "model": base_model,
+        "feature_names": _FEATURE_NAMES,
+        "feature_ranges": feature_ranges,
+    }, _MODEL_PATH)
 
     # Identify last meal by timestamp
     meals = get_meal_logs()
@@ -342,7 +360,7 @@ def train_model(min_meals: int = 20) -> dict:
 
 
 def predict_glucose_curve(meal_macros: dict, pre_meal_glucose: int,
-                          pre_meal_trend: str) -> list[dict]:
+                          pre_meal_trend: str) -> dict:
     """Predict BG curve for a meal.
 
     Args:
@@ -352,8 +370,21 @@ def predict_glucose_curve(meal_macros: dict, pre_meal_glucose: int,
         pre_meal_trend:   One of flat | rising | rising_rapidly | falling | falling_rapidly
 
     Returns:
-        List of 37 dicts at 5-min intervals:
-        {'minutes': int, 'predicted_bg': float, 'confidence_lower': float, 'confidence_upper': float}
+        {
+            "curve": list of 37 dicts at 5-min intervals —
+                {'minutes': int, 'predicted_bg': float, 'confidence_lower': float,
+                 'confidence_upper': float},
+            "out_of_support": bool  # True if any input feature fell outside the
+                                     # bundle's training range by more than a small
+                                     # margin (GLUC-013 section 4) — a frozen
+                                     # prior-mean curve announces itself instead of
+                                     # looking like a confident prediction.
+        }
+
+    Raises:
+        RuntimeError: no trained model, or the bundle's feature schema doesn't
+            match this code's feature set (stale bundle from before a
+            feature-set change — retrain instead of scoring against it).
     """
     if not _MODEL_PATH.exists():
         raise RuntimeError("Model not yet trained — run train_model() first")
@@ -362,6 +393,12 @@ def predict_glucose_curve(meal_macros: dict, pre_meal_glucose: int,
     scaler = bundle["scaler"]
     model = bundle["model"]
 
+    bundle_feature_names = bundle.get("feature_names")
+    if bundle_feature_names != _FEATURE_NAMES:
+        raise RuntimeError(
+            "model was trained on a different feature set — retrain"
+        )
+
     macros = _normalize_macros(meal_macros)
 
     carbs = float(macros.get("total_carbs_g", 0))
@@ -369,19 +406,28 @@ def predict_glucose_curve(meal_macros: dict, pre_meal_glucose: int,
     fat = float(macros.get("total_fat_g", 0))
     protein = float(macros.get("total_protein_g", 0))
     trend_encoded = float(_TREND_MAP.get(pre_meal_trend, 0))
-    hour = float(datetime.now().hour)
-    carb_fiber_ratio = carbs / max(fiber, 0.1)
 
-    raw_features = [carbs, fiber, fat, protein, float(pre_meal_glucose),
-                    trend_encoded, hour, carb_fiber_ratio]
-    feature_names = [
-        "total_carbs_g", "total_fiber_g", "total_fat_g", "total_protein_g",
-        "pre_meal_glucose", "pre_meal_trend", "hour_of_day", "carb_to_fiber_ratio"
-    ]
+    raw_features = [carbs, fiber, fat, protein, float(pre_meal_glucose), trend_encoded]
 
-    for name, val in zip(feature_names, raw_features):
+    for name, val in zip(_FEATURE_NAMES, raw_features):
         if not np.isfinite(val):
             raise ValueError(f"Feature '{name}' is NaN or inf — check input: {meal_macros}")
+
+    out_of_support = False
+    feature_ranges = bundle.get("feature_ranges") or {}
+    for name, val in zip(_FEATURE_NAMES, raw_features):
+        bounds = feature_ranges.get(name)
+        if bounds is None:
+            continue
+        lo, hi = bounds
+        margin = 0.1 * (hi - lo)  # 0 when the training range is a single point
+        if val < lo - margin or val > hi + margin:
+            _log.warning(
+                "predict_glucose_curve: feature '%s'=%.2f is outside training "
+                "range [%.2f, %.2f] (margin %.2f) — marking out-of-support",
+                name, val, lo, hi, margin,
+            )
+            out_of_support = True
 
     X = np.array([raw_features], dtype=float)
     X_scaled = scaler.transform(X)
@@ -393,7 +439,7 @@ def predict_glucose_curve(meal_macros: dict, pre_meal_glucose: int,
         means.append(float(mean[0]))
         stds.append(float(std[0]))
 
-    return [
+    curve = [
         {
             "minutes": t,
             "predicted_bg": means[i],
@@ -402,6 +448,7 @@ def predict_glucose_curve(meal_macros: dict, pre_meal_glucose: int,
         }
         for i, t in enumerate(_TIME_GRID)
     ]
+    return {"curve": curve, "out_of_support": out_of_support}
 
 
 def classify_glucose_outcome(curve: list[dict], pre_meal_glucose: int) -> dict:

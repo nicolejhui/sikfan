@@ -28,6 +28,9 @@ export interface DishResult {
   portion_g: number | null;
   portion_bucket: string | null;  // "small" | "medium" | "large"; null if not estimated
   needs_macro_entry: boolean;  // true if USDA had no match — carbs/macros above are 0, not verified-zero
+  // GLUC-013: additive (2026-09-06), mirrors the frozen DishResult schema.
+  // Deliberately not displayed anywhere yet — see plans/GLUC-013-plan.md D8.
+  fiber_g?: number | null;
   // FOOD-019: populated only when this dish resolved via composite
   // decomposition (after a CORRECT/ADD_NEW correction — see
   // plans/FOOD-019-plan.md API-012 "Known scope boundary"). A dish that
@@ -94,6 +97,7 @@ export interface GlucoseResponse {
   pre_meal_glucose: number;
   pre_meal_trend: string;
   prediction: GlucosePrediction;
+  baseline_prediction: GlucosePrediction | null;
   actuals: GlucoseActuals | null;
   retrain_triggered: boolean;
 }

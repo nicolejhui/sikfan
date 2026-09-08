@@ -208,6 +208,7 @@ class DishResult(BaseModel):
     protein_g: float
     fat_g: float
     calories: float
+    fiber_g: float | None = None  # GLUC-013: additive, 2026-09-06 — see CLAUDE.md Frozen API Schemas
     portion_g: float | None = None
     portion_bucket: str | None = None  # "small" | "medium" | "large"; None if not estimated
     needs_macro_entry: bool = False  # True if USDA had no match — carbs/macros above are 0, not verified-zero
@@ -307,6 +308,7 @@ class GlucoseResponse(BaseModel):
     pre_meal_glucose: int
     pre_meal_trend: str
     prediction: GlucosePrediction
+    baseline_prediction: GlucosePrediction | None = None
     actuals: GlucoseActuals | None
     retrain_triggered: bool
     image_url: str  # "/meal-image/{meal_id}"
@@ -453,6 +455,7 @@ def _build_dish_results(detected_items: list[dict]) -> list[dict]:
                 "protein_g": macros.get("protein_g", 0.0),
                 "fat_g": macros.get("fat_g", 0.0),
                 "calories": macros.get("calories", 0.0),
+                "fiber_g": macros.get("fiber_g"),
                 "portion_g": item.get("portion_g") or None,
                 "portion_bucket": item.get("portion") or None,  # pipeline stores bucket under "portion"
                 "needs_macro_entry": item.get("needs_macro_entry", False),
@@ -469,6 +472,7 @@ def _build_dish_results(detected_items: list[dict]) -> list[dict]:
                     "protein_g": macros.get("protein_g", 0.0),
                     "fat_g": macros.get("fat_g", 0.0),
                     "calories": macros.get("calories", 0.0),
+                    "fiber_g": macros.get("fiber_g"),
                     "portion_g": comp.get("portion_g") or None,
                     "portion_bucket": comp.get("portion_bucket") or None,
                     "needs_macro_entry": comp.get("needs_macro_entry", False),
@@ -779,9 +783,7 @@ def log_meal(body: LogMealRequest):
             "carbs_g": d.get("carbs_g", 0.0),
             "protein_g": d.get("protein_g", 0.0),
             "fat_g": d.get("fat_g", 0.0),
-            # TODO(GLUC-012): fiber_g is never copied from the job-status dish
-            # into this log entry — same class of silent-data-loss bug as
-            # macros_incomplete below, but out of scope here (separate ticket).
+            "fiber_g": d.get("fiber_g") or 0.0,
         }
         dishes.append({"dish_name": name, "portion_size": "medium", "macros": macros})
         total_carbs += macros["carbs_g"]
@@ -953,6 +955,10 @@ def get_glucose(meal_id: str):
         pre_meal_glucose=result["pre_meal_glucose"],
         pre_meal_trend=result["pre_meal_trend"],
         prediction=GlucosePrediction(**result["prediction"]),
+        baseline_prediction=(
+            GlucosePrediction(**result["baseline_prediction"])
+            if result.get("baseline_prediction") else None
+        ),
         actuals=actuals,
         retrain_triggered=result["retrain_triggered"],
         image_url=f"/meal-image/{result['meal_id']}",
@@ -1054,6 +1060,7 @@ def _recompute_dish_macros(corrected_label: str, portion_g: float | None) -> dic
         if scaled is None:
             return {
                 "carbs_g": 0.0, "protein_g": 0.0, "fat_g": 0.0, "calories": 0.0,
+                "fiber_g": 0.0,
                 "needs_macro_entry": True,
                 "components": composite["components"],
                 "macro_coverage": composite["macro_coverage"],
@@ -1064,6 +1071,7 @@ def _recompute_dish_macros(corrected_label: str, portion_g: float | None) -> dic
             "protein_g": scaled["protein_g"],
             "fat_g": scaled["fat_g"],
             "calories": scaled["calories"],
+            "fiber_g": scaled["fiber_g"],
             # Only a dish where NO component resolved via USDA is treated as
             # unresolved — a partially-estimated composite still has a real
             # (if partly estimated) carb total, unlike a genuine no_results.
@@ -1078,6 +1086,7 @@ def _recompute_dish_macros(corrected_label: str, portion_g: float | None) -> dic
     if needs_macro_entry:
         return {
             "carbs_g": 0.0, "protein_g": 0.0, "fat_g": 0.0, "calories": 0.0,
+            "fiber_g": 0.0,
             "needs_macro_entry": True,
             "components": None, "macro_coverage": 1.0, "carb_coverage": 1.0,
         }
@@ -1094,6 +1103,7 @@ def _recompute_dish_macros(corrected_label: str, portion_g: float | None) -> dic
     if scaled is None:
         return {
             "carbs_g": 0.0, "protein_g": 0.0, "fat_g": 0.0, "calories": 0.0,
+            "fiber_g": 0.0,
             "needs_macro_entry": True,
             "components": None, "macro_coverage": 1.0, "carb_coverage": 1.0,
         }
@@ -1102,6 +1112,7 @@ def _recompute_dish_macros(corrected_label: str, portion_g: float | None) -> dic
         "protein_g": scaled["protein_g"],
         "fat_g": scaled["fat_g"],
         "calories": scaled["calories"],
+        "fiber_g": scaled["fiber_g"],
         "needs_macro_entry": False,
         "components": None, "macro_coverage": 1.0, "carb_coverage": 1.0,
     }
@@ -1141,6 +1152,7 @@ def _resolve_dish_entry(meal_id: str, crop_id: str) -> tuple[Path, dict, dict]:
 # 1.0/False; an explicit None does not).
 _BASELINE_DEFAULTS = {
     "portion_g": None, "carbs_g": 0.0, "protein_g": 0.0, "fat_g": 0.0, "calories": 0.0,
+    "fiber_g": None,
     "components": None, "macro_coverage": 1.0, "carb_coverage": 1.0, "needs_macro_entry": False,
 }
 
