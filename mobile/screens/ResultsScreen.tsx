@@ -435,6 +435,12 @@ export default function ResultsScreen() {
   // "complete" and renders nothing extra, silently.
   const compositeDishes = dishes.filter((d) => d.components && d.components.length > 0);
   const totalComponents = compositeDishes.reduce((n, d) => n + (d.components?.length ?? 0), 0);
+  // MOB-015: every dish gets a visible row — a dish with no `.components`
+  // (never decomposed) previously had no rendering path at all, hiding its
+  // carbs from the breakdown even though the header total already included
+  // them. See plans/MOB-015-plan.md.
+  const simpleDishes = dishes.filter((d) => !d.components || d.components.length === 0);
+  const showDishNames = dishes.length > 1;
   const estimatedDishes = dishes.filter(
     (d) => !d.needs_macro_entry && (d.macro_coverage ?? 1) > 0 && (d.macro_coverage ?? 1) < 1
   );
@@ -709,9 +715,11 @@ export default function ResultsScreen() {
               />
             )}
 
-            {compositeDishes.length > 0 && (
+            {(compositeDishes.length > 0 || simpleDishes.length > 0) && (
               <View style={styles.breakdownToggle}>
-                <Text style={styles.breakdownToggleText}>{`Breakdown · ${totalComponents + removed.size} items`}</Text>
+                <Text style={styles.breakdownToggleText}>{`Breakdown · ${
+                  totalComponents + simpleDishes.length + removed.size
+                } items`}</Text>
                 <TouchableOpacity onPress={toggleBreakdown} hitSlop={8}>
                   <Ionicons
                     name={showBreakdown ? 'chevron-up' : 'chevron-down'}
@@ -732,14 +740,57 @@ export default function ResultsScreen() {
               <Text style={styles.candidatesLoadingText}>Loading suggestions…</Text>
             )}
 
-            {showBreakdown && compositeDishes.map((dish) => {
+            {showBreakdown && dishes.map((dish) => {
               // MOB-015: a multi-dish meal can only have its primary dish's
-              // crop_id corrected until dish 2+ becomes visible.
+              // crop_id corrected until multi-dish correction is wired
+              // separately (see plans/MOB-015-plan.md D4).
               const dishEditable = !loggedMeal && dish.crop_id === cropId && dish.portion_g != null;
+              const isComposite = !!dish.components && dish.components.length > 0;
+              const dishUncertain = dish.status !== 'CONFIDENT';
+
+              if (!isComposite) {
+                // MOB-015: a non-composite dish has no `.components` to
+                // decompose into rows, so it renders itself as a single row
+                // using its own portion_g/carbs_g — already on DishResult,
+                // no new server fields needed.
+                return (
+                  <View key={dish.crop_id} style={styles.breakdownGroup}>
+                    <View style={[styles.componentRow, dishEditable && styles.componentRowBrand]}>
+                      <Text style={styles.componentName} numberOfLines={1}>{formatDishName(dish.name)}</Text>
+                      {dish.portion_g != null && (
+                        <Text style={styles.componentGrams}>{Math.round(dish.portion_g)}g</Text>
+                      )}
+                      <Text style={styles.componentCarbs}>{Math.round(dish.carbs_g)}g carbs</Text>
+                      {dishUncertain && (
+                        <View style={styles.uncertainBadge}>
+                          <Text style={styles.uncertainBadgeText}>uncertain</Text>
+                        </View>
+                      )}
+                      {dishEditable && (
+                        <TouchableOpacity
+                          onPress={() => sheetRef.current?.present()}
+                          hitSlop={8}
+                          style={styles.componentTrailingIcon}
+                        >
+                          <Ionicons name="chevron-forward" size={15} color={defaultPalette.inkFaint} />
+                        </TouchableOpacity>
+                      )}
+                    </View>
+                  </View>
+                );
+              }
+
               return (
               <View key={dish.crop_id} style={styles.breakdownGroup}>
-                {compositeDishes.length > 1 && (
-                  <Text style={styles.breakdownDishName} numberOfLines={1}>{formatDishName(dish.name)}</Text>
+                {showDishNames && (
+                  <View style={styles.breakdownDishNameRow}>
+                    <Text style={styles.breakdownDishName} numberOfLines={1}>{formatDishName(dish.name)}</Text>
+                    {dishUncertain && (
+                      <View style={styles.uncertainBadge}>
+                        <Text style={styles.uncertainBadgeText}>uncertain</Text>
+                      </View>
+                    )}
+                  </View>
                 )}
                 {(dish.components ?? []).map((component, idx) => {
                   const grams = componentGrams(component, dish.portion_g);
@@ -1238,11 +1289,29 @@ const styles = StyleSheet.create({
   breakdownGroup: {
     marginTop: spacing.sm,
   },
+  breakdownDishNameRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    marginBottom: spacing.xs / 2,
+  },
   breakdownDishName: {
     fontSize: fontSize.xs,
     fontWeight: fontWeight.medium,
     color: defaultPalette.inkFaint,
-    marginBottom: spacing.xs / 2,
+  },
+  uncertainBadge: {
+    backgroundColor: defaultPalette.warn.tint,
+    borderWidth: 1,
+    borderColor: defaultPalette.warn.ring,
+    borderRadius: radius.full,
+    paddingHorizontal: spacing.xs,
+    paddingVertical: 2,
+  },
+  uncertainBadgeText: {
+    fontSize: fontSize.xs,
+    color: defaultPalette.warn.deep,
+    fontWeight: fontWeight.medium,
   },
   componentRow: {
     flexDirection: 'row',

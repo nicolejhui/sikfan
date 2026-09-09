@@ -17,11 +17,23 @@ Do these in order. Items 1-3 are the ones that would show a bad deploy.
 - [ ] **One scan, end to end, from the real iPhone.** Confirm dish names, macros, and
       the glucose projection all still render. This is the first time the downscale
       path runs on a true 12 MP capture.
-- [ ] **Memory returns to baseline *between* scans**, not just survives one.
-      `fly status` / `fly logs` before a scan, right after, and ~30s later. The whole
-      point of releasing `predictor.results` + `MALLOC_ARENA_MAX=2` is that RSS comes
-      back down. If it ratchets up scan over scan, the release isn't working —
-      that's the regression to catch.
+- [x] **Memory returns to baseline *between* scans**, not just survives one.
+      **VERIFIED 2026-09-09** (API-016 `/health` instrumentation, six 12 MP iPhone
+      scans on a single process, no restarts, no OOM):
+
+      | after | `memory_current_mb` | `memory_peak_mb` |
+      |---|---|---|
+      | baseline (models loaded, no scan) | 1285.8 | 1948.8 |
+      | 3 scans | 1450.5 — flat across 12 samples / 6 min | 1948.8 |
+      | 4 scans | 1426.7 | 1948.8 |
+      | 6 scans | 1457.2 | 1948.8 |
+
+      `current` oscillates in a 1426-1457 MB band and never trends upward; the 4th
+      scan ended *below* the idle level preceding it, and the final read was taken
+      21s after the last scan. `peak` never moved off its boot-time value across all
+      six scans. That is the no-ratchet signature — `predictor.results` release +
+      `MALLOC_ARENA_MAX=2` are working. The ~165 MB above baseline is a reused
+      working set, not accumulated residue.
 - [ ] **`/analyze-meal` still returns immediately.** Fire two scans back to back. The
       second must return its `meal_id` right away, not block until the first finishes.
       This is what the `_io_executor` split fixed; if it regresses, the resize is back
@@ -61,9 +73,27 @@ Do these in order. Items 1-3 are the ones that would show a bad deploy.
       **Still open:** this item's own ratchet check (below) hasn't been run against
       real 12 MP captures yet — the field exists now, but the measurement itself is
       unverified until the protocol above is executed post-deploy.
-- [ ] **Peak memory headroom.** At 1536/100 a scan adds ~2.4 GB over a ~1 GB baseline:
-      ~3.4 GB against a 4 GB machine. Thin. If Fly reports OOM or heavy swap on a real
-      12 MP photo, jump to §4.
+- [x] **Peak memory headroom.** **The pre-deploy estimate was pessimistic by a wide
+      margin — measured 2026-09-09, and both of its inputs were wrong:**
+      - Estimated: ~2.4 GB added per scan over a ~1 GB baseline = ~3.4 GB / 4 GB.
+      - Measured: steady-state baseline is **~1.29 GB**, and six scans never pushed
+        RSS above the **1948.8 MB** high-water mark set during *startup*. Per-scan add
+        is therefore bounded by ~663 MB and is probably well under it.
+      - **Model loading, not scanning, is the largest single allocation this process
+        makes** — boot transiently peaks ~660 MB above steady state.
+      - Real headroom: **~2.1 GB free**, not the ~600 MB feared.
+
+      Caveat on the bound: because the boot peak (1948.8) exceeds anything the scans
+      reached, it *masks* the per-scan peak. We know scans stay under 1.95 GB; we
+      cannot tell from `ru_maxrss` alone whether a scan peaks at 1.9 GB or 1.4 GB.
+      Narrowing that needs per-scan instrumentation, which API-016 deliberately did
+      not build.
+
+      **Consequence for §2 and §3:** the memory pressure that motivated the 1536 cap
+      and `max_det=100` tuning is much less acute than assumed. This does *not* license
+      lowering `max_det` (§2's accuracy finding is independent and still binding), but
+      it does mean **raising** `max_long_edge` to 2048 is affordable if §3's accuracy
+      sweep favours it — which was previously treated as a memory-constrained tradeoff.
 
 ## 2. Do not do these
 
