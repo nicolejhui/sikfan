@@ -28,6 +28,39 @@ Do these in order. Items 1-3 are the ones that would show a bad deploy.
       on the analysis pool.
 - [ ] **`GET /meal-image/{meal_id}` looks right** in the app at 1536px — this deploy is
       the first to store a downscaled original.
+- [x] **How to read memory without shell access.** `fly ssh console` is blocked by the
+      permission classifier as production shell access, so `/proc/meminfo` is off the
+      table. **Done (API-016):** `/health` now reports `memory_current_mb` and
+      `memory_peak_mb` — peak via `resource.getrusage(RUSAGE_SELF).ru_maxrss` and
+      current via `/proc/self/statm`, both stdlib, no new dependency. Peak gives the
+      OOM ceiling; current tells you whether memory comes back down between scans,
+      which machine-level graphs smear out. `memory_current_mb` is `null` on macOS
+      (no `/proc`) — that's the degrade path working, not a bug. See
+      `plans/API-016-plan.md`.
+
+      **Protocol** (D9: Fly's ~70s idle auto-stop resets both fields on a cold start,
+      so any before/after spanning a restart is meaningless — pin the process first):
+      ```bash
+      # terminal 1 — keepalive, bounded to ~20 min so it can't hold a 4 GB machine
+      # up indefinitely
+      for i in $(seq 40); do curl -s -o /dev/null https://sikfan-api.fly.dev/health; sleep 30; done
+
+      # terminal 2 — baseline, one scan from the iPhone, then:
+      curl -s https://sikfan-api.fly.dev/health | jq   # immediately after
+      curl -s https://sikfan-api.fly.dev/health | jq   # ~30s later
+      ```
+      Repeat for three scans. Confirm `fly status -a sikfan-api` LAST UPDATED hasn't
+      moved (a restart invalidates the run). Pass: `memory_current_mb` returns to near
+      baseline each time. Fail (ratchet): it steps up scan over scan — see §4.
+
+      Grafana at fly-metrics.net remains useful as machine-level corroboration, not
+      the primary instrument (it smears current/peak together, per D9's sawtooth
+      caveat above). Pair with `glucose_model_ready` from
+      docs/GLUCOSE-PROD-BOOTSTRAP.md so one `/health` call answers both questions.
+
+      **Still open:** this item's own ratchet check (below) hasn't been run against
+      real 12 MP captures yet — the field exists now, but the measurement itself is
+      unverified until the protocol above is executed post-deploy.
 - [ ] **Peak memory headroom.** At 1536/100 a scan adds ~2.4 GB over a ~1 GB baseline:
       ~3.4 GB against a 4 GB machine. Thin. If Fly reports OOM or heavy swap on a real
       12 MP photo, jump to §4.
@@ -101,3 +134,16 @@ Requirements for that ticket:
       Track as a mobile ticket; the server must keep its own downscale regardless.
 - [ ] **`outputs/synthetic_sweep/`** holds upscaled test images generated during
       benchmarking. Safe to delete.
+
+---
+
+## 6. Found after deploying (2026-09-07)
+
+- **Glucose 422s are unrelated to API-015.** `GET /glucose/{meal_id}` fails a cold-start
+  guard because the trained model has never reached the Fly volume, and no path exists to
+  put it there. Full write-up and options in **docs/GLUCOSE-PROD-BOOTSTRAP.md**.
+- **The volume shadows the image**, so `scripts/predeploy.sh` is a no-op in production —
+  the embeddings snapshot has never reached the running app either. Same doc.
+- **Retraining is not usage-gated.** Manual glucose entry cannot produce a trainable CGM
+  window, so accumulating production meals will not improve the model. See that doc's
+  "When to retrain" section before planning around it.

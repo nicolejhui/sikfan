@@ -12,7 +12,9 @@ import json
 import logging
 import os
 import re
+import resource
 import shutil
+import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -216,6 +218,30 @@ class HealthResponse(BaseModel):
     status: str           # "ok" | "degraded"
     models_loaded: bool
     chromadb_ready: bool
+    memory_current_mb: float | None = None   # None where /proc is unavailable (e.g. macOS)
+    memory_peak_mb: float | None = None      # process high-water mark (ru_maxrss)
+
+
+def _memory_stats() -> tuple[float | None, float | None]:
+    """Return (current_mb, peak_mb) process RSS. See plans/API-016-plan.md D2-D4."""
+    ru_maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # ru_maxrss is KB on Linux, bytes on macOS (D2).
+    divisor = 1024 if sys.platform == "linux" else 1024 * 1024
+    peak_mb = round(ru_maxrss / divisor, 1)
+
+    current_mb: float | None = None
+    try:
+        with open("/proc/self/statm") as f:
+            resident_pages = int(f.read().split()[1])  # field 1 (D4)
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        current_mb = round(resident_pages * page_size / (1024 * 1024), 1)
+    except (OSError, ValueError, IndexError):
+        # No /proc (e.g. macOS), or a short/malformed read. Degrade, never raise:
+        # this runs inside Fly's health check, so an exception here pulls the app
+        # out of the load balancer (D3).
+        current_mb = None
+
+    return current_mb, peak_mb
 
 
 # --- POST /analyze-meal ---
@@ -450,10 +476,13 @@ class ResetCorrectionsResponse(BaseModel):
 def health():
     """Health check — unauthenticated so Fly.io's built-in check can reach it."""
     ok = _models_loaded and _chromadb_ready
+    current_mb, peak_mb = _memory_stats()
     resp = HealthResponse(
         status="ok" if ok else "degraded",
         models_loaded=_models_loaded,
         chromadb_ready=_chromadb_ready,
+        memory_current_mb=current_mb,
+        memory_peak_mb=peak_mb,
     )
     if not ok:
         raise HTTPException(status_code=503, detail=resp.model_dump())
