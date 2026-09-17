@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 
 # Make project root importable when running as `python scripts/verify_food013.py`
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 
 # ---------------------------------------------------------------------------

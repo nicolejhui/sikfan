@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 
 # Ensure project root is on sys.path so `pipeline` package is importable
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from PIL import Image
 
