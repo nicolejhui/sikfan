@@ -17,6 +17,7 @@ __pycache__/
 # Local config
 .claude/settings.local.json
 CLAUDE.md
+docs/
 .env
 .env.*
 !.env.example
